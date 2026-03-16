@@ -387,6 +387,8 @@ LITELLM_FALLBACK_MODELS=anthropic/claude-3-5-sonnet-20241022,openai/qwen-plus
 
 访问 `http://127.0.0.1:8000` 即可使用。
 
+> 在云服务器上部署后，不知道浏览器该输入什么地址？请看 [云服务器 Web 界面访问指南](docs/deploy-webui-cloud.md)。
+
 > 也可以使用 `python main.py --serve` (等效命令)
 
 ## 🗺️ Roadmap

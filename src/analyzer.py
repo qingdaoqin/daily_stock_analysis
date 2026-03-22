@@ -14,444 +14,39 @@ import json
 import logging
 import math
 import time
-from collections import Counter
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 
-try:
-    import litellm
-    from litellm import Router
-except Exception:  # pragma: no cover - optional dependency
-    litellm = None
-    Router = None
-
-try:
-    from json_repair import repair_json
-except Exception:  # pragma: no cover - optional dependency
-    repair_json = None
+import litellm
+from json_repair import repair_json
+from litellm import Router
 
 from src.agent.llm_adapter import get_thinking_extra_body
-from src.config import Config, get_config, get_api_keys_for_model, extra_litellm_params, get_configured_llm_models
-from src.core.trading_calendar import get_market_for_stock
+from src.agent.skills.defaults import CORE_TRADING_SKILL_POLICY_ZH
+from src.config import (
+    Config,
+    extra_litellm_params,
+    get_api_keys_for_model,
+    get_config,
+    get_configured_llm_models,
+    resolve_news_window_days,
+)
 from src.storage import persist_llm_usage
 from src.data.stock_mapping import STOCK_NAME_MAP
+from src.report_language import (
+    get_signal_level,
+    get_no_data_text,
+    get_placeholder_text,
+    get_unknown_text,
+    infer_decision_type_from_advice,
+    localize_chip_health,
+    localize_confidence_level,
+    normalize_report_language,
+)
 from src.schemas.report_schema import AnalysisReportSchema
+from src.market_context import get_market_role, get_market_guidelines
 
 logger = logging.getLogger(__name__)
-
-
-_BUY_SIGNAL_HINTS = {
-    "buy", "strong_buy", "long", "bullish",
-    "买入", "加仓", "强烈买入", "看多", "强烈看多",
-}
-_SELL_SIGNAL_HINTS = {
-    "sell", "strong_sell", "short", "bearish",
-    "卖出", "减仓", "强烈卖出", "看空", "强烈看空",
-}
-_HOLD_SIGNAL_HINTS = {
-    "hold", "neutral", "wait", "watch",
-    "持有", "观望", "震荡", "中性",
-}
-_SIGNAL_LEVEL_BY_ADVICE = {
-    "强烈买入": ("强烈买入", "💚", "强买"),
-    "买入": ("买入", "🟢", "买入"),
-    "加仓": ("买入", "🟢", "买入"),
-    "持有": ("持有", "🟡", "持有"),
-    "观望": ("观望", "⚪", "观望"),
-    "减仓": ("减仓", "🟠", "减仓"),
-    "卖出": ("卖出", "🔴", "卖出"),
-    "强烈卖出": ("卖出", "🔴", "卖出"),
-}
-
-
-def _canonical_decision_signal(value: Any) -> str:
-    """Normalize model-facing decision labels into buy/hold/sell."""
-    if not isinstance(value, str):
-        return ""
-    text = value.strip().lower()
-    if not text:
-        return ""
-    if text in _BUY_SIGNAL_HINTS:
-        return "buy"
-    if text in _SELL_SIGNAL_HINTS:
-        return "sell"
-    if text in _HOLD_SIGNAL_HINTS:
-        return "hold"
-    return ""
-
-
-def _signal_from_operation_advice(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    text = value.strip()
-    if not text:
-        return ""
-    if any(keyword in text for keyword in ("买入", "加仓", "做多")):
-        return "buy"
-    if any(keyword in text for keyword in ("卖出", "减仓", "止盈", "止损")):
-        return "sell"
-    if any(keyword in text for keyword in ("持有", "观望", "等待")):
-        return "hold"
-    return _canonical_decision_signal(text)
-
-
-def _split_operation_advice_tokens(value: Any) -> List[str]:
-    if not isinstance(value, str):
-        return []
-    tokens: List[str] = []
-    normalized = (
-        value.replace("／", "/")
-        .replace("|", "/")
-        .replace("，", "/")
-        .replace(",", "/")
-        .replace("、", "/")
-    )
-    for part in normalized.split("/"):
-        token = part.strip()
-        if token:
-            tokens.append(token)
-    return tokens
-
-
-def _signal_from_trend_prediction(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    text = value.strip()
-    if not text:
-        return ""
-    if "看空" in text or "bearish" in text.lower():
-        return "sell"
-    if "看多" in text or "bullish" in text.lower():
-        return "buy"
-    if any(keyword in text for keyword in ("震荡", "中性", "盘整")):
-        return "hold"
-    return _canonical_decision_signal(text)
-
-
-def _signal_from_sentiment_score(score: int) -> str:
-    if score >= 60:
-        return "buy"
-    if score <= 39:
-        return "sell"
-    return "hold"
-
-
-def _coerce_sentiment_score_value(value: Any, default: int = 50) -> int:
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default
-
-
-def _clamp_sentiment_score_to_signal(score: int, signal: str) -> int:
-    return _clamp_sentiment_score_to_signal_with_bias(score, signal, "neutral")
-
-
-def _clamp_sentiment_score_to_signal_with_bias(score: int, signal: str, hold_bias: str = "neutral") -> int:
-    hold_bands = {
-        "bullish": (52, 59),
-        "neutral": (46, 54),
-        "bearish": (40, 47),
-    }
-    bands = {
-        # Upper bound extended from 79 → 100 to allow "强烈买入" (score >= 80)
-        "buy": (60, 100),
-        "hold": hold_bands.get(hold_bias, hold_bands["neutral"]),
-        "sell": (0, 39),
-    }
-    low, high = bands.get(signal, (0, 100))
-    return max(low, min(high, score))
-
-
-def _canonical_operation_advice(signal: str) -> str:
-    return _canonical_operation_advice_with_bias(signal, "neutral")
-
-
-def _canonical_operation_advice_with_bias(signal: str, hold_bias: str = "neutral") -> str:
-    if signal == "hold":
-        return "观望" if hold_bias == "bearish" else "持有"
-    mapping = {
-        "buy": "买入",
-        "sell": "减仓/卖出",
-    }
-    return mapping.get(signal, "观望")
-
-
-def _canonical_trend_prediction(signal: str) -> str:
-    return _canonical_trend_prediction_with_bias(signal, "neutral")
-
-
-def _canonical_trend_prediction_with_bias(signal: str, hold_bias: str = "neutral") -> str:
-    if signal == "hold":
-        hold_mapping = {
-            "bullish": "震荡偏多",
-            "neutral": "震荡",
-            "bearish": "震荡偏空",
-        }
-        return hold_mapping.get(hold_bias, "震荡")
-    mapping = {
-        "buy": "看多",
-        "sell": "看空",
-    }
-    return mapping.get(signal, "震荡")
-
-
-def _canonical_signal_type(signal: str) -> str:
-    return _canonical_signal_type_with_bias(signal, "neutral")
-
-
-def _canonical_signal_type_with_bias(signal: str, hold_bias: str = "neutral") -> str:
-    if signal == "hold":
-        hold_mapping = {
-            "bullish": "持有待机",
-            "neutral": "持有观望",
-            "bearish": "谨慎观望",
-        }
-        return hold_mapping.get(hold_bias, "持有观望")
-    mapping = {
-        "buy": "买入信号",
-        "sell": "卖出信号",
-    }
-    return mapping.get(signal, "持有观望")
-
-
-def get_result_signal_level(result: "AnalysisResult") -> Tuple[str, str, str]:
-    """Return stable display tuple from advice/decision_type/score.
-
-    Display layers should trust the machine-stable ``decision_type`` before
-    score fallback, while still preserving explicit advice when it is known.
-    """
-    advice = getattr(result, "operation_advice", "")
-    score = _coerce_sentiment_score_value(getattr(result, "sentiment_score", 50), 50)
-    decision_signal = _canonical_decision_signal(getattr(result, "decision_type", ""))
-    advice_tokens = _split_operation_advice_tokens(advice)
-
-    if advice in _SIGNAL_LEVEL_BY_ADVICE:
-        return _SIGNAL_LEVEL_BY_ADVICE[advice]
-
-    if advice_tokens:
-        recognized_tokens = [token for token in advice_tokens if token in _SIGNAL_LEVEL_BY_ADVICE]
-        if recognized_tokens:
-            if decision_signal == "buy":
-                if "强烈买入" in recognized_tokens:
-                    return _SIGNAL_LEVEL_BY_ADVICE["强烈买入"]
-                return _SIGNAL_LEVEL_BY_ADVICE["买入"]
-            if decision_signal == "sell":
-                if "强烈卖出" in recognized_tokens or "卖出" in recognized_tokens:
-                    return _SIGNAL_LEVEL_BY_ADVICE["卖出"]
-                return _SIGNAL_LEVEL_BY_ADVICE["减仓"]
-            if decision_signal == "hold":
-                if "持有" in recognized_tokens:
-                    return _SIGNAL_LEVEL_BY_ADVICE["持有"]
-                return _SIGNAL_LEVEL_BY_ADVICE["观望"]
-
-            component_signals = set()
-            for token in recognized_tokens:
-                token_signal = _signal_from_operation_advice(token)
-                if token_signal:
-                    component_signals.add(token_signal)
-            if len(component_signals) == 1:
-                single_signal = next(iter(component_signals))
-                if single_signal == "buy":
-                    return _SIGNAL_LEVEL_BY_ADVICE["买入"]
-                if single_signal == "sell":
-                    if "卖出" in recognized_tokens or "强烈卖出" in recognized_tokens:
-                        return _SIGNAL_LEVEL_BY_ADVICE["卖出"]
-                    return _SIGNAL_LEVEL_BY_ADVICE["减仓"]
-                if "持有" in recognized_tokens:
-                    return _SIGNAL_LEVEL_BY_ADVICE["持有"]
-                return _SIGNAL_LEVEL_BY_ADVICE["观望"]
-
-    if decision_signal == "buy":
-        return _SIGNAL_LEVEL_BY_ADVICE["买入"]
-    if decision_signal == "sell":
-        return _SIGNAL_LEVEL_BY_ADVICE["卖出"]
-    if decision_signal == "hold":
-        trend_text = str(getattr(result, "trend_prediction", "") or "")
-        if "偏空" in trend_text:
-            return _SIGNAL_LEVEL_BY_ADVICE["观望"]
-        return _SIGNAL_LEVEL_BY_ADVICE["持有"]
-
-    if score >= 80:
-        return _SIGNAL_LEVEL_BY_ADVICE["强烈买入"]
-    if score >= 65:
-        return _SIGNAL_LEVEL_BY_ADVICE["买入"]
-    if score >= 55:
-        return _SIGNAL_LEVEL_BY_ADVICE["持有"]
-    if score >= 45:
-        return _SIGNAL_LEVEL_BY_ADVICE["观望"]
-    if score >= 35:
-        return _SIGNAL_LEVEL_BY_ADVICE["减仓"]
-    return _SIGNAL_LEVEL_BY_ADVICE["卖出"]
-
-
-def _default_position_advice_for_signal(signal: str) -> Dict[str, str]:
-    return _default_position_advice_for_signal_with_bias(signal, "neutral")
-
-
-def _default_position_advice_for_signal_with_bias(signal: str, hold_bias: str = "neutral") -> Dict[str, str]:
-    if signal == "hold":
-        hold_mapping = {
-            "bullish": {
-                "no_position": "暂不追价，等回踩支撑位或下一次确认后再考虑介入。",
-                "has_position": "可继续持有，回踩关键支撑不破则耐心观察。",
-            },
-            "neutral": {
-                "no_position": "先观察，等待趋势和消息进一步明朗。",
-                "has_position": "控制仓位，等待新的方向选择。",
-            },
-            "bearish": {
-                "no_position": "暂不开新仓，等待风险释放或重新企稳。",
-                "has_position": "以防守为主，跌破关键位优先减仓。",
-            },
-        }
-        return hold_mapping.get(hold_bias, hold_mapping["neutral"])
-    mapping = {
-        "buy": {
-            "no_position": "可等待回踩支撑位后分批试仓，避免一次性追高。",
-            "has_position": "可继续持有，回踩关键位不破再考虑加仓。",
-        },
-        "sell": {
-            "no_position": "暂不参与，等待风险充分释放后再评估。",
-            "has_position": "优先控制回撤，按计划减仓或离场。",
-        },
-    }
-    return mapping.get(signal, _default_position_advice_for_signal_with_bias("hold", hold_bias))
-
-
-def _resolve_consistent_signal(signals: List[str]) -> Tuple[str, bool]:
-    valid_signals = [signal for signal in signals if signal in {"buy", "hold", "sell"}]
-    if not valid_signals:
-        return "hold", False
-
-    counts = Counter(valid_signals)
-    top_count = max(counts.values())
-    winners = [signal for signal, count in counts.items() if count == top_count]
-    if len(winners) == 1:
-        final_signal = winners[0]
-    else:
-        final_signal = "hold"
-
-    has_conflict = len(set(valid_signals)) > 1
-    if "buy" in valid_signals and "sell" in valid_signals:
-        final_signal = "hold"
-        has_conflict = True
-
-    return final_signal, has_conflict
-
-
-def _derive_hold_bias(
-    signals: List[str],
-    *,
-    trend_prediction: str = "",
-) -> str:
-    valid_signals = [signal for signal in signals if signal in {"buy", "hold", "sell"}]
-    buy_count = valid_signals.count("buy")
-    sell_count = valid_signals.count("sell")
-    if buy_count > sell_count:
-        return "bullish"
-    if sell_count > buy_count:
-        return "bearish"
-    trend_text = str(trend_prediction or "").strip()
-    if "偏多" in trend_text:
-        return "bullish"
-    if "偏空" in trend_text:
-        return "bearish"
-    return "neutral"
-
-
-def _resolve_signal_state(
-    *,
-    decision_signal: str,
-    operation_signal: str,
-    trend_signal: str,
-    score_signal: str,
-    raw_trend_prediction: str = "",
-) -> Tuple[str, bool, str]:
-    """Resolve the stable buy/hold/sell state from top-level signal fields.
-
-    Directional actions still need support from trend or score. When the model
-    emits a weak directional action such as ``buy + 50分 + 震荡``, we downgrade
-    to hold instead of mechanically trusting the action field.
-    """
-    action_signal = decision_signal or operation_signal
-    opposite_pairs = {("buy", "sell"), ("sell", "buy")}
-    hard_conflict = False
-
-    if decision_signal and operation_signal and (decision_signal, operation_signal) in opposite_pairs:
-        hard_conflict = True
-    elif action_signal and trend_signal and (action_signal, trend_signal) in opposite_pairs:
-        hard_conflict = True
-    elif action_signal and score_signal and (action_signal, score_signal) in opposite_pairs:
-        hard_conflict = True
-
-    soft_conflict = False
-    if not hard_conflict and action_signal in {"buy", "sell"}:
-        support_signals = [signal for signal in (trend_signal, score_signal) if signal]
-        directional_support = any(signal == action_signal for signal in support_signals)
-        if support_signals and not directional_support:
-            soft_conflict = True
-
-    has_conflict = hard_conflict or soft_conflict
-    if has_conflict and action_signal in {"buy", "sell"}:
-        final_signal = "hold"
-    elif action_signal:
-        final_signal = action_signal
-    else:
-        final_signal, has_conflict = _resolve_consistent_signal([
-            trend_signal,
-            score_signal,
-        ])
-
-    hold_bias = "neutral"
-    if final_signal == "hold":
-        hold_bias = _derive_hold_bias(
-            [
-                decision_signal,
-                operation_signal,
-                trend_signal,
-                score_signal,
-            ],
-            trend_prediction=raw_trend_prediction,
-        )
-
-    return final_signal, has_conflict, hold_bias
-
-
-def _normalize_dashboard_signal_fields(
-    dashboard: Any,
-    signal: str,
-    *,
-    has_conflict: bool,
-    hold_bias: str = "neutral",
-) -> Any:
-    if not isinstance(dashboard, dict):
-        return dashboard
-
-    dashboard["decision_type"] = signal
-    core = dashboard.get("core_conclusion")
-    if not isinstance(core, dict):
-        core = {}
-        dashboard["core_conclusion"] = core
-
-    core["signal_type"] = _canonical_signal_type_with_bias(signal, hold_bias)
-    if has_conflict or not isinstance(core.get("position_advice"), dict):
-        core["position_advice"] = _default_position_advice_for_signal_with_bias(signal, hold_bias)
-    if has_conflict:
-        hold_summary = {
-            "bullish": ("多空有分歧，当前先持有等待更优买点", "本周内"),
-            "neutral": ("信号存在分歧，当前以观望为主", "不急"),
-            "bearish": ("上行动能不足，当前先观望或偏防守", "今日内"),
-        }
-        summary, time_sensitivity = {
-            "buy": ("趋势偏强，但应等待更优买点", "本周内"),
-            "hold": hold_summary.get(hold_bias, hold_summary["neutral"]),
-            "sell": ("风险偏高，优先减仓防守", "立即行动"),
-        }.get(signal, hold_summary["neutral"])
-        core["one_sentence"] = summary
-        core["time_sensitivity"] = time_sensitivity
-
-    return dashboard
 
 
 def check_content_integrity(result: "AnalysisResult") -> Tuple[bool, List[str]]:
@@ -490,20 +85,21 @@ def check_content_integrity(result: "AnalysisResult") -> Tuple[bool, List[str]]:
 
 def apply_placeholder_fill(result: "AnalysisResult", missing_fields: List[str]) -> None:
     """Fill missing mandatory fields with placeholders (in-place). Module-level for pipeline."""
+    placeholder = get_placeholder_text(getattr(result, "report_language", "zh"))
     for field in missing_fields:
         if field == "sentiment_score":
             result.sentiment_score = 50
         elif field == "operation_advice":
-            result.operation_advice = result.operation_advice or "待补充"
+            result.operation_advice = result.operation_advice or placeholder
         elif field == "analysis_summary":
-            result.analysis_summary = result.analysis_summary or "待补充"
+            result.analysis_summary = result.analysis_summary or placeholder
         elif field == "dashboard.core_conclusion.one_sentence":
             if not result.dashboard:
                 result.dashboard = {}
             if "core_conclusion" not in result.dashboard:
                 result.dashboard["core_conclusion"] = {}
             result.dashboard["core_conclusion"]["one_sentence"] = (
-                result.dashboard["core_conclusion"].get("one_sentence") or "待补充"
+                result.dashboard["core_conclusion"].get("one_sentence") or placeholder
             )
         elif field == "dashboard.intelligence.risk_alerts":
             if not result.dashboard:
@@ -519,7 +115,7 @@ def apply_placeholder_fill(result: "AnalysisResult", missing_fields: List[str]) 
                 result.dashboard["battle_plan"] = {}
             if "sniper_points" not in result.dashboard["battle_plan"]:
                 result.dashboard["battle_plan"]["sniper_points"] = {}
-            result.dashboard["battle_plan"]["sniper_points"]["stop_loss"] = "待补充"
+            result.dashboard["battle_plan"]["sniper_points"]["stop_loss"] = placeholder
 
 
 # ---------- chip_structure fallback (Issue #589) ----------
@@ -528,19 +124,13 @@ _CHIP_KEYS: tuple = ("profit_ratio", "avg_cost", "concentration", "chip_health")
 
 
 def _is_value_placeholder(v: Any) -> bool:
-    """True if value is empty or placeholder (N/A, 数据缺失, etc.).
-
-    Note: numeric 0 is NOT treated as placeholder — 0 can be a valid value
-    (e.g. bias_ma5 = 0.0%, MACD bar = 0).
-    For chip_structure fields, use ``_is_chip_value_placeholder()`` which
-    additionally treats numeric 0 as placeholder.
-    """
+    """True if value is empty or placeholder (N/A, 数据缺失, etc.)."""
     if v is None:
         return True
-    if isinstance(v, (int, float)):
-        return False
+    if isinstance(v, (int, float)) and v == 0:
+        return True
     s = str(v).strip().lower()
-    return s in ("", "n/a", "na", "数据缺失", "未知")
+    return s in ("", "n/a", "na", "数据缺失", "未知", "data unavailable", "unknown", "tbd")
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -558,18 +148,18 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
-def _derive_chip_health(profit_ratio: float, concentration_90: float) -> str:
+def _derive_chip_health(profit_ratio: float, concentration_90: float, language: str = "zh") -> str:
     """Derive chip_health from profit_ratio and concentration_90."""
     if profit_ratio >= 0.9:
-        return "警惕"  # 获利盘极高
+        return localize_chip_health("警惕", language)  # 获利盘极高
     if concentration_90 >= 0.25:
-        return "警惕"  # 筹码分散
+        return localize_chip_health("警惕", language)  # 筹码分散
     if concentration_90 < 0.15 and 0.3 <= profit_ratio < 0.9:
-        return "健康"  # 集中且获利比例适中
-    return "一般"
+        return localize_chip_health("健康", language)  # 集中且获利比例适中
+    return localize_chip_health("一般", language)
 
 
-def _build_chip_structure_from_data(chip_data: Any) -> Dict[str, Any]:
+def _build_chip_structure_from_data(chip_data: Any, language: str = "zh") -> Dict[str, Any]:
     """Build chip_structure dict from ChipDistribution or dict."""
     if hasattr(chip_data, "profit_ratio"):
         pr = _safe_float(chip_data.profit_ratio)
@@ -580,26 +170,13 @@ def _build_chip_structure_from_data(chip_data: Any) -> Dict[str, Any]:
         pr = _safe_float(d.get("profit_ratio"))
         ac = d.get("avg_cost")
         c90 = _safe_float(d.get("concentration_90"))
-    chip_health = _derive_chip_health(pr, c90)
+    chip_health = _derive_chip_health(pr, c90, language=language)
     return {
         "profit_ratio": f"{pr:.1%}",
         "avg_cost": ac if (ac is not None and _safe_float(ac) != 0.0) else "N/A",
         "concentration": f"{c90:.2%}",
         "chip_health": chip_health,
     }
-
-
-def _is_chip_value_placeholder(v: Any) -> bool:
-    """Like _is_value_placeholder but also treats numeric 0 as placeholder.
-
-    For chip_structure fields the LLM outputs ``0`` when it has no data,
-    so zero should be treated as "needs to be filled from real data source".
-    """
-    if _is_value_placeholder(v):
-        return True
-    if isinstance(v, (int, float)) and v == 0:
-        return True
-    return False
 
 
 def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> None:
@@ -614,11 +191,14 @@ def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> N
         dp = dash.get("data_perspective") or {}
         dash["data_perspective"] = dp
         cs = dp.get("chip_structure") or {}
-        filled = _build_chip_structure_from_data(chip_data)
+        filled = _build_chip_structure_from_data(
+            chip_data,
+            language=getattr(result, "report_language", "zh"),
+        )
         # Start from a copy of cs to preserve any extra keys the LLM may have added
         merged = dict(cs)
         for k in _CHIP_KEYS:
-            if _is_chip_value_placeholder(merged.get(k)):
+            if _is_value_placeholder(merged.get(k)):
                 merged[k] = filled[k]
         if merged != cs:
             dp["chip_structure"] = merged
@@ -666,10 +246,7 @@ def fill_price_position_if_needed(
             rq = realtime_quote if isinstance(realtime_quote, dict) else (
                 realtime_quote.to_dict() if hasattr(realtime_quote, "to_dict") else {}
             )
-            # current_price == 0 is always invalid (stock price cannot be zero),
-            # so treat it as placeholder even though generic _is_value_placeholder
-            # no longer considers numeric 0 as placeholder.
-            if _is_value_placeholder(computed.get("current_price")) or computed.get("current_price") == 0:
+            if _is_value_placeholder(computed.get("current_price")):
                 computed["current_price"] = rq.get("price")
 
         filled = False
@@ -760,6 +337,7 @@ class AnalysisResult:
     operation_advice: str  # 操作建议：买入/加仓/持有/减仓/卖出/观望
     decision_type: str = "hold"  # 决策类型：buy/hold/sell（用于统计）
     confidence_level: str = "中"  # 置信度：高/中/低
+    report_language: str = "zh"  # 报告输出语言：zh/en
 
     # ========== 决策仪表盘 (新增) ==========
     dashboard: Optional[Dict[str, Any]] = None  # 完整的决策仪表盘数据
@@ -808,7 +386,6 @@ class AnalysisResult:
 
     # ========== 历史对比（Report Engine P0）==========
     query_id: Optional[str] = None  # 本次分析 query_id，用于历史对比时排除本次记录
-    calibration_info: Optional[Dict[str, Any]] = None  # 回测校准/进化信息（如有）
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -820,6 +397,7 @@ class AnalysisResult:
             'operation_advice': self.operation_advice,
             'decision_type': self.decision_type,
             'confidence_level': self.confidence_level,
+            'report_language': self.report_language,
             'dashboard': self.dashboard,  # 决策仪表盘数据
             'trend_analysis': self.trend_analysis,
             'short_term_outlook': self.short_term_outlook,
@@ -845,7 +423,6 @@ class AnalysisResult:
             'current_price': self.current_price,
             'change_pct': self.change_pct,
             'model_used': self.model_used,
-            'calibration_info': self.calibration_info,
         }
 
     def get_core_conclusion(self) -> str:
@@ -883,77 +460,24 @@ class AnalysisResult:
 
     def get_emoji(self) -> str:
         """根据操作建议返回对应 emoji"""
-        return get_result_signal_level(self)[1]
+        _, emoji, _ = get_signal_level(
+            self.operation_advice,
+            self.sentiment_score,
+            self.report_language,
+        )
+        return emoji
 
     def get_confidence_stars(self) -> str:
         """返回置信度星级"""
-        star_map = {'高': '⭐⭐⭐', '中': '⭐⭐', '低': '⭐'}
-        return star_map.get(self.confidence_level, '⭐⭐')
-
-
-def normalize_analysis_result_signals(result: AnalysisResult) -> AnalysisResult:
-    """Normalize an existing AnalysisResult into a self-consistent signal state.
-
-    Used by non-JSON downgrade paths and by agent-mode conversion so every
-    runtime path shares the same decision/advice/trend/dashboard contract.
-    """
-    raw_score = _coerce_sentiment_score_value(getattr(result, "sentiment_score", 50), 50)
-    raw_trend_prediction = getattr(result, "trend_prediction", "震荡")
-    raw_operation_advice = getattr(result, "operation_advice", "持有")
-    raw_decision_type = getattr(result, "decision_type", "")
-
-    decision_signal = _canonical_decision_signal(raw_decision_type)
-    operation_signal = _signal_from_operation_advice(raw_operation_advice)
-    trend_signal = _signal_from_trend_prediction(raw_trend_prediction)
-    score_signal = _signal_from_sentiment_score(raw_score)
-
-    action_signal = decision_signal or operation_signal
-    final_signal, has_conflict, hold_bias = _resolve_signal_state(
-        decision_signal=decision_signal,
-        operation_signal=operation_signal,
-        trend_signal=trend_signal,
-        score_signal=score_signal,
-        raw_trend_prediction=raw_trend_prediction,
-    )
-
-    normalized_score = raw_score
-    if raw_score < 0 or raw_score > 100 or has_conflict or score_signal not in ("", final_signal):
-        normalized_score = _clamp_sentiment_score_to_signal_with_bias(
-            max(0, min(100, raw_score)),
-            final_signal,
-            hold_bias,
-        )
-
-    normalized_trend_prediction = raw_trend_prediction
-    canonical_trend = _canonical_trend_prediction_with_bias(final_signal, hold_bias)
-    if (
-        has_conflict
-        or trend_signal not in ("", final_signal)
-        or (final_signal == "hold" and hold_bias != "neutral" and str(raw_trend_prediction).strip() != canonical_trend)
-    ):
-        normalized_trend_prediction = canonical_trend
-
-    normalized_operation_advice = raw_operation_advice
-    canonical_advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
-    if (
-        not action_signal
-        or has_conflict
-        or operation_signal not in ("", final_signal)
-        or (final_signal == "hold" and hold_bias != "neutral" and str(raw_operation_advice).strip() != canonical_advice)
-    ):
-        normalized_operation_advice = canonical_advice
-
-    result.sentiment_score = normalized_score
-    result.trend_prediction = normalized_trend_prediction
-    result.operation_advice = normalized_operation_advice
-    result.decision_type = final_signal
-    result.dashboard = _normalize_dashboard_signal_fields(
-        result.dashboard,
-        final_signal,
-        has_conflict=has_conflict,
-        hold_bias=hold_bias,
-    )
-    return result
+        star_map = {
+            "高": "⭐⭐⭐",
+            "high": "⭐⭐⭐",
+            "中": "⭐⭐",
+            "medium": "⭐⭐",
+            "低": "⭐",
+            "low": "⭐",
+        }
+        return star_map.get(str(self.confidence_level or "").strip().lower(), "⭐⭐")
 
 
 class GeminiAnalyzer:
@@ -977,53 +501,11 @@ class GeminiAnalyzer:
     # 核心模块：核心结论 + 数据透视 + 舆情情报 + 作战计划
     # ========================================
 
-    SYSTEM_PROMPT = """你是一位专注于趋势交易的全球股票投资分析师，负责为 A 股、港股和美股生成专业的【决策仪表盘】分析报告。
+    SYSTEM_PROMPT = """你是一位专注于趋势交易的{market_placeholder}投资分析师，负责生成专业的【决策仪表盘】分析报告。
 
-## 市场适配原则（必须严格遵守）
+{guidelines_placeholder}
 
-- 先阅读提示中的【市场规则与政策权重】区块，再决定该标的使用 A 股、港股还是美股逻辑，严禁混用。
-- A股：优先使用交易所/巨潮公告、业绩预告、监管动态、资金流和产业政策，国内政策本身就是核心变量。
-- 港股：优先使用 HKEX 公告、业绩公告、配股/回购/分红安排，再结合南向资金和内地业务暴露判断。
-- 美股：优先使用 SEC 披露、财报电话会、公司指引、诉讼与估值；只有当 `China exposure` 明确时，才提高中国政策权重。
-- 若提示中写明“中国政策权重低/谨慎使用”，不得把中国政策当成核心结论来源。
-
-## 核心交易理念（必须严格遵守）
-
-### 1. 入场纪律与交易约束（按市场区别处理）
-- **乖离率公式**：(现价 - MA5) / MA5 × 100%
-- A股：存在涨跌停、T+1 和做空限制；乖离率 < 2% 为最佳买点，2-5% 可小仓介入，> 5% 默认观望；不要把涨停追入当成默认可执行方案
-- 港股：不存在 A股式涨跌停限制，可结合公告确认位、区间突破回测位或均线支撑入场；> 6% 应提示“不宜重仓追价”
-- 美股：不存在 A股式涨跌停/T+1 约束，趋势跟踪、breakout retest、earnings gap hold 都可作为有效入场；> 5% 只代表追价风险，不等于自动看空或卖出
-
-### 2. 趋势判断（顺势而为，但不能机械套用）
-- A股：`MA5 > MA10 > MA20` 是买入级信号的重要硬条件
-- 港股：优先看多头排列，同时结合公告催化、回购分红和南向资金
-- 美股：均线趋势重要，但必须和财报、公司指引、估值、行业主线一起判断；不能仅因离均线较远就把强趋势股直接判成看空
-- 均线发散上行优于均线粘合，趋势强度要看均线间距是否扩大
-
-### 3. 效率优先（筹码结构）
-- 关注筹码集中度：90%集中度 < 15% 表示筹码集中
-- 获利比例分析：70-90% 获利盘时需警惕获利回吐
-- 平均成本与现价关系：现价高于平均成本 5-15% 为健康
-
-### 4. 买点偏好（按市场选择，不得机械套用）
-- A股：最佳买点仍是缩量回踩 MA5 / MA10；若临近涨停或成交约束明显，不要给激进追单方案
-- 港股：可使用 MA10 / MA20 回踩、公告确认位、区间突破回测位或前低防守位，不强制 MA5 / MA10 模板
-- 美股：可使用 breakout retest、earnings gap hold、前高突破确认、VWAP / 关键均线回踩或波动收敛再进，不强制 MA5 / MA10 模板
-
-### 5. 风险排查重点
-- A股：减持公告、业绩预亏、监管处罚、大额解禁、产业政策变化
-- 港股：profit warning、配股摊薄、融资安排、回购变化、监管调查
-- 美股：SEC 重大披露、guidance 下修、insider selling、诉讼/调查、关税/出口管制
-
-### 6. 估值关注（PE/PB）
-- 分析时请关注市盈率（PE）是否合理
-- PE 明显偏高时（如远超行业平均或历史均值），需在风险点中说明
-- 高成长股可适当容忍较高 PE，但需有业绩支撑
-
-### 7. 强势趋势股放宽
-- 强势趋势股（多头排列且趋势强度高、量能配合）可适当放宽乖离率要求
-- 此类股票可轻仓追踪，但仍需设置止损，不盲目追高
+""" + CORE_TRADING_SKILL_POLICY_ZH + """
 
 ## 输出格式：决策仪表盘 JSON
 
@@ -1033,7 +515,7 @@ class GeminiAnalyzer:
 {
     "stock_name": "股票中文名称",
     "sentiment_score": 0-100整数,
-    "trend_prediction": "强烈看多/看多/震荡偏多/震荡/震荡偏空/看空/强烈看空",
+    "trend_prediction": "强烈看多/看多/震荡/看空/强烈看空",
     "operation_advice": "买入/加仓/持有/减仓/卖出/观望",
     "decision_type": "buy/hold/sell",
     "confidence_level": "高/中/低",
@@ -1041,7 +523,7 @@ class GeminiAnalyzer:
     "dashboard": {
         "core_conclusion": {
             "one_sentence": "一句话核心结论（30字以内，直接告诉用户做什么）",
-            "signal_type": "买入信号/持有待机/持有观望/谨慎观望/卖出信号/风险警告",
+            "signal_type": "🟢买入信号/🟡持有观望/🔴卖出信号/⚠️风险警告",
             "time_sensitivity": "立即行动/今日内/本周内/不急",
             "position_advice": {
                 "no_position": "空仓者建议：具体操作指引",
@@ -1075,7 +557,7 @@ class GeminiAnalyzer:
                 "profit_ratio": 获利比例,
                 "avg_cost": 平均成本,
                 "concentration": 筹码集中度,
-                "chip_health": "健康/一般/警惕/不适用"
+                "chip_health": "健康/一般/警惕"
             }
         },
 
@@ -1089,9 +571,9 @@ class GeminiAnalyzer:
 
         "battle_plan": {
             "sniper_points": {
-                "ideal_buy": "理想买入点：A股可写MA5附近；港美股可写关键回踩位/突破确认位/VWAP附近",
-                "secondary_buy": "次优买入点：A股可写MA10附近；港美股可写区间回测位/公告确认位/前高回踩位",
-                "stop_loss": "止损位：A股可写跌破MA20；港美股可写前低/缺口回补/ATR或波动阈值",
+                "ideal_buy": "理想买入点：XX元（在MA5附近）",
+                "secondary_buy": "次优买入点：XX元（在MA10附近）",
+                "stop_loss": "止损位：XX元（跌破MA20或X%）",
                 "take_profit": "目标位：XX元（前高/整数关口）"
             },
             "position_strategy": {
@@ -1100,12 +582,12 @@ class GeminiAnalyzer:
                 "risk_control": "风控策略描述"
             },
             "action_checklist": [
-            "通过/警示/否决 检查项1：趋势结构成立（A股看多头排列；港美股可看趋势延续/突破确认）",
-            "通过/警示/否决 检查项2：入场位与波动匹配（非A股不强制 MA5/MA10）",
-            "通过/警示/否决 检查项3：量能/成交活跃度配合",
-            "通过/警示/否决 检查项4：官方披露无重大利空",
-            "通过/警示/否决 检查项5：筹码或持仓结构可接受",
-            "通过/警示/否决 检查项6：估值或事件催化支持"
+                "✅/⚠️/❌ 检查项1：多头排列",
+                "✅/⚠️/❌ 检查项2：乖离率合理（强势趋势可放宽）",
+                "✅/⚠️/❌ 检查项3：量能配合",
+                "✅/⚠️/❌ 检查项4：无重大利空",
+                "✅/⚠️/❌ 检查项5：筹码健康",
+                "✅/⚠️/❌ 检查项6：PE估值合理"
             ]
         }
     },
@@ -1137,37 +619,36 @@ class GeminiAnalyzer:
 ## 评分标准
 
 ### 强烈买入（80-100分）：
-- 通过：A股满足多头排列；港美股满足趋势延续或突破确认
-- 通过：入场位与市场波动相匹配，而非单纯追价
-- 通过：缩量回调、放量突破或公告/财报催化确认
-- 通过：筹码集中健康
-- 通过：消息面有利好催化
+- ✅ 多头排列：MA5 > MA10 > MA20
+- ✅ 低乖离率：<2%，最佳买点
+- ✅ 缩量回调或放量突破
+- ✅ 筹码集中健康
+- ✅ 消息面有利好催化
 
 ### 买入（60-79分）：
-- 通过：多头排列或弱势多头
-- 通过：A股/港股乖离率 <5%；美股若催化明确且趋势延续，可放宽，但必须写清“回踩更优，不宜追高”
-- 通过：量能正常
-- 说明：允许一项次要条件不满足
+- ✅ 多头排列或弱势多头
+- ✅ 乖离率 <5%
+- ✅ 量能正常
+- ⚪ 允许一项次要条件不满足
 
 ### 观望（40-59分）：
-- 警示：A股/港股乖离率 >5% 为强警示；美股 >5% 只代表追价风险，不直接等同看空
-- 警示：均线缠绕趋势不明
-- 警示：有风险事件
+- ⚠️ 乖离率 >5%（追高风险）
+- ⚠️ 均线缠绕趋势不明
+- ⚠️ 有风险事件
 
 ### 卖出/减仓（0-39分）：
-- 否决：空头排列
-- 否决：关键趋势位/缺口/前低被破坏
-- 否决：放量下跌
-- 否决：重大利空
+- ❌ 空头排列
+- ❌ 跌破MA20
+- ❌ 放量下跌
+- ❌ 重大利空
 
 ## 决策仪表盘核心原则
 
 1. **核心结论先行**：一句话说清该买该卖
 2. **分持仓建议**：空仓者和持仓者给不同建议
 3. **精确狙击点**：必须给出具体价格，不说模糊的话
-4. **检查清单可视化**：用 通过/警示/否决 明确显示每项检查结果
-5. **风险优先级**：舆情中的风险点要醒目标出
-6. **字段一致性**：`decision_type`、`operation_advice`、`trend_prediction`、`sentiment_score` 必须互相一致；若多空分歧，请用 `hold + 震荡偏多/震荡/震荡偏空` 表达，不得输出“看空但买入”之类冲突组合"""
+4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
+5. **风险优先级**：舆情中的风险点要醒目标出"""
 
     def __init__(self, api_key: Optional[str] = None):
         """Initialize LLM Analyzer via LiteLLM.
@@ -1181,6 +662,36 @@ class GeminiAnalyzer:
         if not self._litellm_available:
             logger.warning("No LLM configured (LITELLM_MODEL / API keys), AI analysis will be unavailable")
 
+    def _get_analysis_system_prompt(self, report_language: str, stock_code: str = "") -> str:
+        """Build the analyzer system prompt with output-language guidance."""
+        lang = normalize_report_language(report_language)
+        market_role = get_market_role(stock_code, lang)
+        market_guidelines = get_market_guidelines(stock_code, lang)
+        base_prompt = self.SYSTEM_PROMPT.replace(
+            "{market_placeholder}", market_role
+        ).replace(
+            "{guidelines_placeholder}", market_guidelines
+        )
+        if lang == "en":
+            return base_prompt + """
+
+## Output Language (highest priority)
+
+- Keep all JSON keys unchanged.
+- `decision_type` must remain `buy|hold|sell`.
+- All human-readable JSON values must be written in English.
+- Use the common English company name when you are confident; otherwise keep the original listed company name instead of inventing one.
+- This includes `stock_name`, `trend_prediction`, `operation_advice`, `confidence_level`, nested dashboard text, checklist items, and all narrative summaries.
+"""
+        return base_prompt + """
+
+## 输出语言（最高优先级）
+
+- 所有 JSON 键名保持不变。
+- `decision_type` 必须保持为 `buy|hold|sell`。
+- 所有面向用户的人类可读文本值必须使用中文。
+"""
+
     def _has_channel_config(self, config: Config) -> bool:
         """Check if multi-channel config (channels / YAML / legacy model_list) is active."""
         return bool(config.llm_model_list) and not all(
@@ -1189,9 +700,6 @@ class GeminiAnalyzer:
 
     def _init_litellm(self) -> None:
         """Initialize litellm Router from channels / YAML / legacy keys."""
-        if litellm is None or Router is None:
-            logger.warning("Analyzer LLM: litellm not installed")
-            return
         config = get_config()
         litellm_model = config.litellm_model
         if not litellm_model:
@@ -1255,47 +763,13 @@ class GeminiAnalyzer:
         """Check if LiteLLM is properly configured with at least one API key."""
         return self._router is not None or self._litellm_available
 
-    def _get_model_retry_policy(self, model: str, config: Config) -> Tuple[int, float]:
-        """Return retry/backoff settings for the current model."""
-        provider = (model.split("/", 1)[0] if "/" in model else model).strip().lower()
-        if provider in {"gemini", "vertex_ai"}:
-            return (
-                max(0, int(getattr(config, "gemini_max_retries", 0) or 0)),
-                max(0.0, float(getattr(config, "gemini_retry_delay", 0.0) or 0.0)),
-            )
-        return 0, 0.0
-
-    def _is_retryable_llm_error(self, error: Exception) -> bool:
-        """Best-effort detection for transient LLM failures worth retrying."""
-        for attr_name in ("status_code", "code"):
-            value = getattr(error, attr_name, None)
-            if str(value).strip() == "429":
-                return True
-
-        response = getattr(error, "response", None)
-        response_status = getattr(response, "status_code", None)
-        if str(response_status).strip() == "429":
-            return True
-
-        text = str(error).lower()
-        retryable_markers = (
-            "429",
-            "resource_exhausted",
-            "rate limit",
-            "ratelimit",
-            "too many requests",
-            "quota",
-            "temporarily unavailable",
-            "service unavailable",
-            "timeout",
-            "timed out",
-            "deadline exceeded",
-            "connection reset",
-            "connection aborted",
-        )
-        return any(marker in text for marker in retryable_markers)
-
-    def _call_litellm(self, prompt: str, generation_config: dict) -> Tuple[str, str, Dict[str, Any]]:
+    def _call_litellm(
+        self,
+        prompt: str,
+        generation_config: dict,
+        *,
+        system_prompt: Optional[str] = None,
+    ) -> Tuple[str, str, Dict[str, Any]]:
         """Call LLM via litellm with fallback across configured models.
 
         When channels/YAML are configured, every model goes through the Router
@@ -1325,76 +799,55 @@ class GeminiAnalyzer:
         use_channel_router = self._has_channel_config(config)
 
         last_error = None
+        effective_system_prompt = system_prompt or self.SYSTEM_PROMPT
         for model in models_to_try:
-            max_retries, retry_delay = self._get_model_retry_policy(model, config)
-            attempt = 0
+            try:
+                model_short = model.split("/")[-1] if "/" in model else model
+                call_kwargs: Dict[str, Any] = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": effective_system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
+                extra = get_thinking_extra_body(model_short)
+                if extra:
+                    call_kwargs["extra_body"] = extra
 
-            while True:
-                try:
-                    model_short = model.split("/")[-1] if "/" in model else model
-                    call_kwargs: Dict[str, Any] = {
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": self.SYSTEM_PROMPT},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": temperature,
-                        "max_tokens": max_tokens,
-                    }
-                    extra = get_thinking_extra_body(model_short)
-                    if extra:
-                        call_kwargs["extra_body"] = extra
+                _router_model_names = set(get_configured_llm_models(config.llm_model_list))
+                if use_channel_router and self._router and model in _router_model_names:
+                    # Channel / YAML path: Router manages key + base_url per model
+                    response = self._router.completion(**call_kwargs)
+                elif self._router and model == config.litellm_model and not use_channel_router:
+                    # Legacy path: Router only for primary model multi-key
+                    response = self._router.completion(**call_kwargs)
+                else:
+                    # Legacy/direct-env path: direct call (also handles direct-env
+                    # providers like groq/ or bedrock/ that are not in the Router
+                    # model_list even when channel mode is active)
+                    keys = get_api_keys_for_model(model, config)
+                    if keys:
+                        call_kwargs["api_key"] = keys[0]
+                    call_kwargs.update(extra_litellm_params(model, config))
+                    response = litellm.completion(**call_kwargs)
 
-                    _router_model_names = set(get_configured_llm_models(config.llm_model_list))
-                    if use_channel_router and self._router and model in _router_model_names:
-                        # Channel / YAML path: Router manages key + base_url per model
-                        response = self._router.completion(**call_kwargs)
-                    elif self._router and model == config.litellm_model and not use_channel_router:
-                        # Legacy path: Router only for primary model multi-key
-                        response = self._router.completion(**call_kwargs)
-                    else:
-                        # Legacy/direct-env path: direct call (also handles direct-env
-                        # providers like groq/ or bedrock/ that are not in the Router
-                        # model_list even when channel mode is active)
-                        keys = get_api_keys_for_model(model, config)
-                        if keys:
-                            call_kwargs["api_key"] = keys[0]
-                        call_kwargs.update(extra_litellm_params(model, config))
-                        response = litellm.completion(**call_kwargs)
+                if response and response.choices and response.choices[0].message.content:
+                    usage: Dict[str, Any] = {}
+                    if response.usage:
+                        usage = {
+                            "prompt_tokens": response.usage.prompt_tokens or 0,
+                            "completion_tokens": response.usage.completion_tokens or 0,
+                            "total_tokens": response.usage.total_tokens or 0,
+                        }
+                    return (response.choices[0].message.content, model, usage)
+                raise ValueError("LLM returned empty response")
 
-                    if response and response.choices and response.choices[0].message.content:
-                        usage: Dict[str, Any] = {}
-                        if response.usage:
-                            usage = {
-                                "prompt_tokens": response.usage.prompt_tokens or 0,
-                                "completion_tokens": response.usage.completion_tokens or 0,
-                                "total_tokens": response.usage.total_tokens or 0,
-                            }
-                        return (response.choices[0].message.content, model, usage)
-                    raise ValueError("LLM returned empty response")
-
-                except Exception as e:
-                    last_error = e
-                    if self._is_retryable_llm_error(e) and attempt < max_retries:
-                        backoff_seconds = retry_delay * (2 ** attempt) if retry_delay > 0 else 0.0
-                        logger.warning(
-                            "[LiteLLM] %s transient failure, retry %s/%s in %.1fs: %s",
-                            model,
-                            attempt + 1,
-                            max_retries,
-                            backoff_seconds,
-                            e,
-                        )
-                        if backoff_seconds > 0:
-                            time.sleep(backoff_seconds)
-                        attempt += 1
-                        continue
-
-                    if attempt > 0:
-                        logger.warning(f"[LiteLLM] {model} failed after {attempt} retry(s): {e}")
-                    else:
-                        logger.warning(f"[LiteLLM] {model} failed: {e}")
-                    break
+            except Exception as e:
+                logger.warning(f"[LiteLLM] {model} failed: {e}")
+                last_error = e
+                continue
 
         raise Exception(f"All LLM models failed (tried {len(models_to_try)} model(s)). Last error: {last_error}")
 
@@ -1455,6 +908,8 @@ class GeminiAnalyzer:
         """
         code = context.get('code', 'Unknown')
         config = get_config()
+        report_language = normalize_report_language(getattr(config, "report_language", "zh"))
+        system_prompt = self._get_analysis_system_prompt(report_language, stock_code=code)
         
         # 请求前增加延时（防止连续请求触发限流）
         request_delay = config.gemini_request_delay
@@ -1478,19 +933,20 @@ class GeminiAnalyzer:
                 code=code,
                 name=name,
                 sentiment_score=50,
-                trend_prediction='震荡',
-                operation_advice='持有',
-                confidence_level='低',
-                analysis_summary='AI 分析功能未启用（未配置 API Key）',
-                risk_warning='请配置 LLM API Key（GEMINI_API_KEY/ANTHROPIC_API_KEY/OPENAI_API_KEY）后重试',
+                trend_prediction='Sideways' if report_language == "en" else '震荡',
+                operation_advice='Hold' if report_language == "en" else '持有',
+                confidence_level='Low' if report_language == "en" else '低',
+                analysis_summary='AI analysis is unavailable because no API key is configured.' if report_language == "en" else 'AI 分析功能未启用（未配置 API Key）',
+                risk_warning='Configure an LLM API key (GEMINI_API_KEY/ANTHROPIC_API_KEY/OPENAI_API_KEY) and retry.' if report_language == "en" else '请配置 LLM API Key（GEMINI_API_KEY/ANTHROPIC_API_KEY/OPENAI_API_KEY）后重试',
                 success=False,
-                error_message='LLM API Key 未配置',
+                error_message='LLM API key is not configured' if report_language == "en" else 'LLM API Key 未配置',
                 model_used=None,
+                report_language=report_language,
             )
         
         try:
             # 格式化输入（包含技术面数据和新闻）
-            prompt = self._format_prompt(context, name, news_context)
+            prompt = self._format_prompt(context, name, news_context, report_language=report_language)
             
             config = get_config()
             model_name = config.litellm_model or "unknown"
@@ -1519,7 +975,11 @@ class GeminiAnalyzer:
 
             while True:
                 start_time = time.time()
-                response_text, model_used, llm_usage = self._call_litellm(current_prompt, generation_config)
+                response_text, model_used, llm_usage = self._call_litellm(
+                    current_prompt,
+                    generation_config,
+                    system_prompt=system_prompt,
+                )
                 elapsed = time.time() - start_time
 
                 # 记录响应信息
@@ -1538,6 +998,7 @@ class GeminiAnalyzer:
                 result.search_performed = bool(news_context)
                 result.market_snapshot = self._build_market_snapshot(context)
                 result.model_used = model_used
+                result.report_language = report_language
 
                 # 内容完整性校验（可选）
                 if not config.report_integrity_enabled:
@@ -1550,6 +1011,7 @@ class GeminiAnalyzer:
                         prompt,
                         response_text,
                         missing_fields,
+                        report_language=report_language,
                     )
                     retry_count += 1
                     logger.info(
@@ -1577,21 +1039,23 @@ class GeminiAnalyzer:
                 code=code,
                 name=name,
                 sentiment_score=50,
-                trend_prediction='震荡',
-                operation_advice='持有',
-                confidence_level='低',
-                analysis_summary=f'分析过程出错: {str(e)[:100]}',
-                risk_warning='分析失败，请稍后重试或手动分析',
+                trend_prediction='Sideways' if report_language == "en" else '震荡',
+                operation_advice='Hold' if report_language == "en" else '持有',
+                confidence_level='Low' if report_language == "en" else '低',
+                analysis_summary=(f'Analysis failed: {str(e)[:100]}' if report_language == "en" else f'分析过程出错: {str(e)[:100]}'),
+                risk_warning='Analysis failed. Please retry later or review manually.' if report_language == "en" else '分析失败，请稍后重试或手动分析',
                 success=False,
                 error_message=str(e),
                 model_used=None,
+                report_language=report_language,
             )
     
     def _format_prompt(
         self, 
         context: Dict[str, Any], 
         name: str,
-        news_context: Optional[str] = None
+        news_context: Optional[str] = None,
+        report_language: str = "zh",
     ) -> str:
         """
         格式化分析提示词（决策仪表盘 v2.0）
@@ -1604,6 +1068,7 @@ class GeminiAnalyzer:
             news_context: 预先搜索的新闻内容
         """
         code = context.get('code', 'Unknown')
+        report_language = normalize_report_language(report_language)
         
         # 优先使用上下文中的股票名称（从 realtime_quote 获取）
         stock_name = context.get('stock_name', name)
@@ -1611,40 +1076,33 @@ class GeminiAnalyzer:
             stock_name = STOCK_NAME_MAP.get(code, f'股票{code}')
             
         today = context.get('today', {})
-        market_context_block = self._build_market_context_block(context)
-        
-        # Determine currency label based on market
-        market = self._resolve_market_context(context).get("market", "cn")
-        currency = {"cn": "元", "hk": "港元", "us": "美元"}.get(market, "元")
+        unknown_text = get_unknown_text(report_language)
+        no_data_text = get_no_data_text(report_language)
         
         # ========== 构建决策仪表盘格式的输入 ==========
         prompt = f"""# 决策仪表盘分析请求
 
-## 股票基础信息
+## 📊 股票基础信息
 | 项目 | 数据 |
 |------|------|
 | 股票代码 | **{code}** |
 | 股票名称 | **{stock_name}** |
-| 分析日期 | {context.get('date', '未知')} |
+| 分析日期 | {context.get('date', unknown_text)} |
 
 ---
 
-{market_context_block}
-
----
-
-## 技术面数据
+## 📈 技术面数据
 
 ### 今日行情
 | 指标 | 数值 |
 |------|------|
-| 收盘价 | {today.get('close', 'N/A')} {currency} |
-| 开盘价 | {today.get('open', 'N/A')} {currency} |
-| 最高价 | {today.get('high', 'N/A')} {currency} |
-| 最低价 | {today.get('low', 'N/A')} {currency} |
+| 收盘价 | {today.get('close', 'N/A')} 元 |
+| 开盘价 | {today.get('open', 'N/A')} 元 |
+| 最高价 | {today.get('high', 'N/A')} 元 |
+| 最低价 | {today.get('low', 'N/A')} 元 |
 | 涨跌幅 | {today.get('pct_chg', 'N/A')}% |
-| 成交量 | {self._format_volume(today.get('volume'), market)} |
-| 成交额 | {self._format_amount(today.get('amount'), currency)} |
+| 成交量 | {self._format_volume(today.get('volume'))} |
+| 成交额 | {self._format_amount(today.get('amount'))} |
 
 ### 均线系统（关键判断指标）
 | 均线 | 数值 | 说明 |
@@ -1652,29 +1110,71 @@ class GeminiAnalyzer:
 | MA5 | {today.get('ma5', 'N/A')} | 短期趋势线 |
 | MA10 | {today.get('ma10', 'N/A')} | 中短期趋势线 |
 | MA20 | {today.get('ma20', 'N/A')} | 中期趋势线 |
-| 均线形态 | {context.get('ma_status', '未知')} | 多头/空头/缠绕 |
+| 均线形态 | {context.get('ma_status', unknown_text)} | 多头/空头/缠绕 |
 """
         
         # 添加实时行情数据（量比、换手率等）
         if 'realtime' in context:
             rt = context['realtime']
-            session_label = context.get('session_label', '')
             prompt += f"""
 ### 实时行情增强数据
-> **数据时效**：{session_label}
-
 | 指标 | 数值 | 解读 |
 |------|------|------|
-| 当前价格 | {rt.get('price', 'N/A')} {currency} | |
+| 当前价格 | {rt.get('price', 'N/A')} 元 | |
 | **量比** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
 | **换手率** | **{rt.get('turnover_rate', 'N/A')}%** | |
 | 市盈率(动态) | {rt.get('pe_ratio', 'N/A')} | |
 | 市净率 | {rt.get('pb_ratio', 'N/A')} | |
-| 总市值 | {self._format_amount(rt.get('total_mv'), currency)} | |
-| 流通市值 | {self._format_amount(rt.get('circ_mv'), currency)} | |
+| 总市值 | {self._format_amount(rt.get('total_mv'))} | |
+| 流通市值 | {self._format_amount(rt.get('circ_mv'))} | |
 | 60日涨跌幅 | {rt.get('change_60d', 'N/A')}% | 中期表现 |
 """
-        
+
+        # 添加财报与分红（价值投资口径）
+        fundamental_context = context.get("fundamental_context") if isinstance(context, dict) else None
+        earnings_block = (
+            fundamental_context.get("earnings", {})
+            if isinstance(fundamental_context, dict)
+            else {}
+        )
+        earnings_data = (
+            earnings_block.get("data", {})
+            if isinstance(earnings_block, dict)
+            else {}
+        )
+        financial_report = (
+            earnings_data.get("financial_report", {})
+            if isinstance(earnings_data, dict)
+            else {}
+        )
+        dividend_metrics = (
+            earnings_data.get("dividend", {})
+            if isinstance(earnings_data, dict)
+            else {}
+        )
+        if isinstance(financial_report, dict) or isinstance(dividend_metrics, dict):
+            financial_report = financial_report if isinstance(financial_report, dict) else {}
+            dividend_metrics = dividend_metrics if isinstance(dividend_metrics, dict) else {}
+            ttm_yield = dividend_metrics.get("ttm_dividend_yield_pct", "N/A")
+            ttm_cash = dividend_metrics.get("ttm_cash_dividend_per_share", "N/A")
+            ttm_count = dividend_metrics.get("ttm_event_count", "N/A")
+            report_date = financial_report.get("report_date", "N/A")
+            prompt += f"""
+### 财报与分红（价值投资口径）
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| 最近报告期 | {report_date} | 来自结构化财报字段 |
+| 营业收入 | {financial_report.get('revenue', 'N/A')} | |
+| 归母净利润 | {financial_report.get('net_profit_parent', 'N/A')} | |
+| 经营现金流 | {financial_report.get('operating_cash_flow', 'N/A')} | |
+| ROE | {financial_report.get('roe', 'N/A')} | |
+| 近12个月每股现金分红 | {ttm_cash} | 仅现金分红、税前口径 |
+| TTM 股息率 | {ttm_yield} | 公式：近12个月每股现金分红 / 当前价格 × 100% |
+| TTM 分红事件数 | {ttm_count} | |
+
+> 若上述字段为 N/A 或缺失，请明确写“数据缺失，无法判断”，禁止编造。
+"""
+
         # 添加筹码分布数据
         if 'chip' in context:
             chip = context['chip']
@@ -1684,39 +1184,27 @@ class GeminiAnalyzer:
 | 指标 | 数值 | 健康标准 |
 |------|------|----------|
 | **获利比例** | **{profit_ratio:.1%}** | 70-90%时警惕 |
-| 平均成本 | {chip.get('avg_cost', 'N/A')} {currency} | 现价应高于5-15% |
+| 平均成本 | {chip.get('avg_cost', 'N/A')} 元 | 现价应高于5-15% |
 | 90%筹码集中度 | {chip.get('concentration_90', 0):.2%} | <15%为集中 |
 | 70%筹码集中度 | {chip.get('concentration_70', 0):.2%} | |
-| 筹码状态 | {chip.get('chip_status', '未知')} | |
+| 筹码状态 | {chip.get('chip_status', unknown_text)} | |
 """
         
         # 添加趋势分析结果（基于交易理念的预判）
         if 'trend_analysis' in context:
             trend = context['trend_analysis']
-            market = self._resolve_market_context(context).get("market", "cn")
-            bias_value = float(trend.get('bias_ma5', 0) or 0)
-            ma_alignment_hint = {
-                "cn": "MA5>MA10>MA20 为买入级硬条件",
-                "hk": "优先看趋势结构，再结合公告催化和关键支撑位",
-                "us": "优先看趋势延续/突破确认，再结合财报、市场环境和估值",
-            }.get(market, "按市场规则判断趋势结构")
-            if market == "us":
-                bias_warning = "追价风险较高，宜等回踩/突破确认" if bias_value > 5 else "可结合趋势跟踪判断"
-            elif market == "hk":
-                bias_warning = "不宜重仓追价，宜等公告或回踩确认" if bias_value > 6 else "可结合公告/量价判断"
-            else:
-                bias_warning = "超过5%，严禁追高！" if bias_value > 5 else "安全范围"
+            bias_warning = "🚨 超过5%，严禁追高！" if trend.get('bias_ma5', 0) > 5 else "✅ 安全范围"
             prompt += f"""
 ### 趋势分析预判（基于交易理念）
 | 指标 | 数值 | 判定 |
 |------|------|------|
-| 趋势状态 | {trend.get('trend_status', '未知')} | |
-| 均线排列 | {trend.get('ma_alignment', '未知')} | {ma_alignment_hint} |
+| 趋势状态 | {trend.get('trend_status', unknown_text)} | |
+| 均线排列 | {trend.get('ma_alignment', unknown_text)} | MA5>MA10>MA20为多头 |
 | 趋势强度 | {trend.get('trend_strength', 0)}/100 | |
 | **乖离率(MA5)** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
 | 乖离率(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
-| 量能状态 | {trend.get('volume_status', '未知')} | {trend.get('volume_trend', '')} |
-| 系统信号 | {trend.get('buy_signal', '未知')} | |
+| 量能状态 | {trend.get('volume_status', unknown_text)} | {trend.get('volume_trend', '')} |
+| 系统信号 | {trend.get('buy_signal', unknown_text)} | |
 | 系统评分 | {trend.get('signal_score', 0)}/100 | |
 
 #### 系统分析理由
@@ -1735,32 +1223,39 @@ class GeminiAnalyzer:
 - 成交量较昨日变化：{volume_change}倍
 - 价格较昨日变化：{context.get('price_change_ratio', 'N/A')}%
 """
-
-        # 添加历史K线数据（用于中期趋势判断：触底反弹 vs 高位回调）
-        history = context.get('history')
-        if history and len(history) > 0:
-            prompt += f"""
-### 近{len(history)}日历史K线（用于判断中期趋势、触底反弹或高位回调）
-| 日期 | 开盘 | 最高 | 最低 | 收盘 | 涨跌幅 |
-|------|------|------|------|------|--------|
-"""
-            for bar in history:
-                pct = bar.get('pct_chg')
-                pct_str = f"{pct:+.2f}%" if pct is not None else "N/A"
-                prompt += f"| {bar.get('date', '')} | {bar.get('open', 'N/A')} | {bar.get('high', 'N/A')} | {bar.get('low', 'N/A')} | {bar.get('close', 'N/A')} | {pct_str} |\n"
-
+        
         # 添加新闻搜索结果（重点区域）
+        news_window_days: Optional[int] = None
+        context_window = context.get("news_window_days")
+        try:
+            if context_window is not None:
+                parsed_window = int(context_window)
+                if parsed_window > 0:
+                    news_window_days = parsed_window
+        except (TypeError, ValueError):
+            news_window_days = None
+
+        if news_window_days is None:
+            prompt_config = get_config()
+            news_window_days = resolve_news_window_days(
+                news_max_age_days=getattr(prompt_config, "news_max_age_days", 3),
+                news_strategy_profile=getattr(prompt_config, "news_strategy_profile", "short"),
+            )
         prompt += """
 ---
 
-## 舆情情报
+## 📰 舆情情报
 """
         if news_context:
             prompt += f"""
-以下是 **{stock_name}({code})** 近7日的新闻搜索结果，请重点提取：
-1. **风险警报**：减持、处罚、利空
-2. **利好催化**：业绩、合同、政策
-3. **业绩预期**：年报预告、业绩快报
+以下是 **{stock_name}({code})** 近{news_window_days}日的新闻搜索结果，请重点提取：
+1. 🚨 **风险警报**：减持、处罚、利空
+2. 🎯 **利好催化**：业绩、合同、政策
+3. 📊 **业绩预期**：年报预告、业绩快报
+4. 🕒 **时间规则（强制）**：
+   - 输出到 `risk_alerts` / `positive_catalysts` / `latest_news` 的每一条都必须带具体日期（YYYY-MM-DD）
+   - 超出近{news_window_days}日窗口的新闻一律忽略
+   - 时间未知、无法确定发布日期的新闻一律忽略
 
 ```
 {news_context}
@@ -1774,9 +1269,9 @@ class GeminiAnalyzer:
         # 注入缺失数据警告
         if context.get('data_missing'):
             prompt += """
-**数据缺失警告**
+⚠️ **数据缺失警告**
 由于接口限制，当前无法获取完整的实时行情和技术指标数据。
-请 **忽略上述表格中的 N/A 数据**，重点依据 **【舆情情报】** 中的新闻进行基本面和情绪面分析。
+请 **忽略上述表格中的 N/A 数据**，重点依据 **【📰 舆情情报】** 中的新闻进行基本面和情绪面分析。
 在回答技术面问题（如均线、乖离率）时，请直接说明“数据缺失，无法判断”，**严禁编造数据**。
 """
 
@@ -1784,13 +1279,13 @@ class GeminiAnalyzer:
         prompt += f"""
 ---
 
-## 分析任务
+## ✅ 分析任务
 
 请为 **{stock_name}({code})** 生成【决策仪表盘】，严格按照 JSON 格式输出。
 """
         if context.get('is_index_etf'):
             prompt += """
-> **指数/ETF 分析约束**：该标的为指数跟踪型 ETF 或市场指数。
+> ⚠️ **指数/ETF 分析约束**：该标的为指数跟踪型 ETF 或市场指数。
 > - 风险分析仅关注：**指数走势、跟踪误差、市场流动性**
 > - 严禁将基金公司的诉讼、声誉、高管变动纳入风险警报
 > - 业绩预期基于**指数成分股整体表现**，而非基金公司财报
@@ -1798,35 +1293,54 @@ class GeminiAnalyzer:
 
 """
         prompt += f"""
-### 重要：输出正确的股票名称格式
+### ⚠️ 重要：输出正确的股票名称格式
 正确的股票名称格式为“股票名称（股票代码）”，例如“贵州茅台（600519）”。
 如果上方显示的股票名称为"股票{code}"或不正确，请在分析开头**明确输出该股票的正确中文全称**。
 
-{self._build_market_focus_questions(context)}
+### 重点关注（必须明确回答）：
+1. ❓ 是否满足 MA5>MA10>MA20 多头排列？
+2. ❓ 当前乖离率是否在安全范围内（<5%）？—— 超过5%必须标注"严禁追高"
+3. ❓ 量能是否配合（缩量回调/放量突破）？
+4. ❓ 筹码结构是否健康？
+5. ❓ 消息面有无重大利空？（减持、处罚、业绩变脸等）
 
 ### 决策仪表盘要求：
 - **股票名称**：必须输出正确的中文全称（如"贵州茅台"而非"股票600519"）
 - **核心结论**：一句话说清该买/该卖/该等
 - **持仓分类建议**：空仓者怎么做 vs 持仓者怎么做
 - **具体狙击点位**：买入价、止损价、目标价（精确到分）
-- **检查清单**：每项用 通过/警示/否决 标记
+- **检查清单**：每项用 ✅/⚠️/❌ 标记
+- **消息面时间合规**：`latest_news`、`risk_alerts`、`positive_catalysts` 不得包含超出近{news_window_days}日或时间未知的信息
 
 请输出完整的 JSON 格式决策仪表盘。"""
+
+        if report_language == "en":
+            prompt += """
+
+### Output language requirements (highest priority)
+- Keep every JSON key exactly as defined above; do not translate keys.
+- `decision_type` must remain `buy`, `hold`, or `sell`.
+- All human-readable JSON values must be in English.
+- This includes `stock_name`, `trend_prediction`, `operation_advice`, `confidence_level`, all nested dashboard text, checklist items, and every summary field.
+- Use the common English company name when you are confident. If not, keep the listed company name rather than inventing one.
+- When data is missing, explain it in English instead of Chinese.
+"""
+        else:
+            prompt += f"""
+
+### 输出语言要求（最高优先级）
+- 所有 JSON 键名必须保持不变，不要翻译键名。
+- `decision_type` 必须保持为 `buy`、`hold`、`sell`。
+- 所有面向用户的人类可读文本值必须使用中文。
+- 当数据缺失时，请使用中文直接说明“{no_data_text}，无法判断”。
+"""
         
         return prompt
     
-    def _format_volume(self, volume: Optional[float], market: str = "cn") -> str:
-        """格式化成交量显示（市场感知）"""
+    def _format_volume(self, volume: Optional[float]) -> str:
+        """格式化成交量显示"""
         if volume is None:
             return 'N/A'
-        if market == "us":
-            if volume >= 1e6:
-                return f"{volume / 1e6:.2f}M shares"
-            elif volume >= 1e3:
-                return f"{volume / 1e3:.2f}K shares"
-            else:
-                return f"{volume:.0f} shares"
-        # cn / hk 使用中文单位
         if volume >= 1e8:
             return f"{volume / 1e8:.2f} 亿股"
         elif volume >= 1e4:
@@ -1834,16 +1348,16 @@ class GeminiAnalyzer:
         else:
             return f"{volume:.0f} 股"
     
-    def _format_amount(self, amount: Optional[float], currency: str = "元") -> str:
-        """格式化成交额显示（支持多币种标签）"""
+    def _format_amount(self, amount: Optional[float]) -> str:
+        """格式化成交额显示"""
         if amount is None:
             return 'N/A'
         if amount >= 1e8:
-            return f"{amount / 1e8:.2f} 亿{currency}"
+            return f"{amount / 1e8:.2f} 亿元"
         elif amount >= 1e4:
-            return f"{amount / 1e4:.2f} 万{currency}"
+            return f"{amount / 1e4:.2f} 万元"
         else:
-            return f"{amount:.0f} {currency}"
+            return f"{amount:.0f} 元"
 
     def _format_percent(self, value: Optional[float]) -> str:
         """格式化百分比显示"""
@@ -1862,68 +1376,6 @@ class GeminiAnalyzer:
             return f"{float(value):.2f}"
         except (TypeError, ValueError):
             return 'N/A'
-
-    @staticmethod
-    def _market_label(market: str) -> str:
-        return {
-            "cn": "A股",
-            "hk": "港股",
-            "us": "美股",
-        }.get(market, market or "未知市场")
-
-    def _resolve_market_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """Return market metadata injected by pipeline, or infer a minimal fallback."""
-        market_context = context.get("market_context")
-        if isinstance(market_context, dict) and market_context.get("market"):
-            return market_context
-        market = get_market_for_stock(context.get("code", "")) or "cn"
-        return {
-            "market": market,
-            "market_label": self._market_label(market),
-        }
-
-    def _build_market_context_block(self, context: Dict[str, Any]) -> str:
-        """Build a compact market-specific guidance block for the analysis prompt."""
-        market_context = self._resolve_market_context(context)
-        lines = [
-            "## 市场规则与政策权重",
-            f"- 当前市场：{market_context.get('market_label', '未知')}",
-            f"- 官方优先源：{market_context.get('official_source_priority', '按市场默认源处理')}",
-            f"- 分析主线：{market_context.get('analysis_focus', '按市场主线处理')}",
-            f"- 政策口径：{market_context.get('policy_scope', '未指定')}",
-        ]
-        china_exposure = market_context.get("china_exposure")
-        if isinstance(china_exposure, dict):
-            lines.append(f"- China exposure：{china_exposure.get('level_label', '未知')}")
-            lines.append(f"- 中国政策权重：{china_exposure.get('policy_weight_label', '谨慎使用')}")
-            lines.append(f"- 判定依据：{china_exposure.get('reasoning', '未提供')}")
-        return "\n".join(lines)
-
-    def _build_market_focus_questions(self, context: Dict[str, Any]) -> str:
-        """Return market-aware checklist questions for the LLM."""
-        market = self._resolve_market_context(context).get("market", "cn")
-        if market == "us":
-            return """### 重点关注（必须明确回答）：
-1. SEC/财报/公司指引是否出现超预期或下修？
-2. `China exposure` 是高/中/低？中国政策是否应该成为核心因子，还是只能低权重引用？
-3. 是否存在 insider selling、诉讼、监管调查、short interest 或 put/call 异动？
-4. 估值与业绩增速是否匹配？消息面会不会改变估值锚？
-5. 技术面是否支持趋势跟踪、breakout retest、earnings gap hold 或回踩再进？不要机械套用 A股 MA5/MA10 模式。"""
-        if market == "hk":
-            return """### 重点关注（必须明确回答）：
-1. HKEX 公告里是否有业绩、profit warning、配股、回购或分红等关键事项？
-2. 公司对内地业务/客户/资产是否敏感？内地政策该给多高权重？
-3. 是否存在融资摊薄、诉讼调查或明显的盈利下修风险？
-4. 行业景气、南向资金和估值是否支持当前仓位判断？
-5. 技术面是否支持区间突破、公告确认位、均线支撑或回测再进？不要机械套用 A股 MA5/MA10 模式。"""
-        return """### 重点关注（必须明确回答）：
-1. 是否满足 MA5>MA10>MA20 多头排列？
-2. 当前乖离率是否在安全范围内（<5%）？超过5%必须标注“严禁追高”
-3. 量能是否配合（缩量回调/放量突破）？
-4. 筹码结构是否健康？
-5. 消息面有无重大利空？（减持、处罚、业绩变脸、政策利空等）
-6. 是否存在涨停/交易约束/T+1 等执行层限制，导致“理论买点”在实盘中未必可成交？
-7. 是否为特殊交易规则股票？ST股涨跌停 ±5%，科创板/创业板 ±20%，北交所 ±30%——乖离率阈值需相应调整。"""
 
     def _build_market_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """构建当日行情快照（展示用）"""
@@ -1949,8 +1401,6 @@ class GeminiAnalyzer:
             except (TypeError, ValueError):
                 change_amount = None
 
-        market = self._resolve_market_context(context).get("market", "cn")
-        currency = {"cn": "元", "hk": "港元", "us": "美元"}.get(market, "元")
         snapshot = {
             "date": context.get('date', '未知'),
             "close": self._format_price(close),
@@ -1961,8 +1411,8 @@ class GeminiAnalyzer:
             "pct_chg": self._format_percent(today.get('pct_chg')),
             "change_amount": self._format_price(change_amount),
             "amplitude": self._format_percent(amplitude),
-            "volume": self._format_volume(today.get('volume'), market),
-            "amount": self._format_amount(today.get('amount'), currency),
+            "volume": self._format_volume(today.get('volume')),
+            "amount": self._format_amount(today.get('amount')),
         }
 
         if realtime:
@@ -1979,8 +1429,26 @@ class GeminiAnalyzer:
         """Delegate to module-level check_content_integrity."""
         return check_content_integrity(result)
 
-    def _build_integrity_complement_prompt(self, missing_fields: List[str]) -> str:
+    def _build_integrity_complement_prompt(self, missing_fields: List[str], report_language: str = "zh") -> str:
         """Build complement instruction for missing mandatory fields."""
+        report_language = normalize_report_language(report_language)
+        if report_language == "en":
+            lines = ["### Completion requirements: fill the missing mandatory fields below and output the full JSON again:"]
+            for f in missing_fields:
+                if f == "sentiment_score":
+                    lines.append("- sentiment_score: integer score from 0 to 100")
+                elif f == "operation_advice":
+                    lines.append("- operation_advice: localized action advice")
+                elif f == "analysis_summary":
+                    lines.append("- analysis_summary: concise analysis summary")
+                elif f == "dashboard.core_conclusion.one_sentence":
+                    lines.append("- dashboard.core_conclusion.one_sentence: one-line decision")
+                elif f == "dashboard.intelligence.risk_alerts":
+                    lines.append("- dashboard.intelligence.risk_alerts: risk alert list (can be empty)")
+                elif f == "dashboard.battle_plan.sniper_points.stop_loss":
+                    lines.append("- dashboard.battle_plan.sniper_points.stop_loss: stop-loss level")
+            return "\n".join(lines)
+
         lines = ["### 补全要求：请在上方分析基础上补充以下必填内容，并输出完整 JSON："]
         for f in missing_fields:
             if f == "sentiment_score":
@@ -2002,13 +1470,18 @@ class GeminiAnalyzer:
         base_prompt: str,
         previous_response: str,
         missing_fields: List[str],
+        report_language: str = "zh",
     ) -> str:
         """Build retry prompt using the previous response as the complement baseline."""
-        complement = self._build_integrity_complement_prompt(missing_fields)
+        complement = self._build_integrity_complement_prompt(missing_fields, report_language=report_language)
         previous_output = previous_response.strip()
+        if normalize_report_language(report_language) == "en":
+            prefix = "### The previous output is below. Complete the missing fields based on that output and return the full JSON again. Do not omit existing fields:"
+        else:
+            prefix = "### 上一次输出如下，请在该输出基础上补齐缺失字段，并重新输出完整 JSON。不要省略已有字段："
         return "\n\n".join([
             base_prompt,
-            "### 上一次输出如下，请在该输出基础上补齐缺失字段，并重新输出完整 JSON。不要省略已有字段：",
+            prefix,
             previous_output,
             complement,
         ])
@@ -2030,6 +1503,7 @@ class GeminiAnalyzer:
         如果解析失败，尝试智能提取或返回默认结果
         """
         try:
+            report_language = normalize_report_language(getattr(get_config(), "report_language", "zh"))
             # 清理响应文本：移除 markdown 代码块标记
             cleaned_text = response_text
             if '```json' in cleaned_text:
@@ -2066,69 +1540,26 @@ class GeminiAnalyzer:
                 if ai_stock_name and (name.startswith('股票') or name == code or 'Unknown' in name):
                     name = ai_stock_name
 
-                # 解析所有字段，优先做一致性校验，避免出现“看空但买入”之类互相打架的结论
-                raw_score = _coerce_sentiment_score_value(data.get('sentiment_score', 50))
-                raw_trend_prediction = data.get('trend_prediction', '震荡')
-                raw_operation_advice = data.get('operation_advice', '持有')
-                raw_decision_type = data.get('decision_type', '')
-
-                decision_signal = _canonical_decision_signal(raw_decision_type)
-                operation_signal = _signal_from_operation_advice(raw_operation_advice)
-                trend_signal = _signal_from_trend_prediction(raw_trend_prediction)
-                score_signal = _signal_from_sentiment_score(raw_score)
-
-                action_signal = decision_signal or operation_signal
-                final_signal, has_conflict, hold_bias = _resolve_signal_state(
-                    decision_signal=decision_signal,
-                    operation_signal=operation_signal,
-                    trend_signal=trend_signal,
-                    score_signal=score_signal,
-                    raw_trend_prediction=raw_trend_prediction,
-                )
-
-                normalized_score = raw_score
-                if raw_score < 0 or raw_score > 100 or has_conflict or score_signal not in ("", final_signal):
-                    normalized_score = _clamp_sentiment_score_to_signal_with_bias(
-                        max(0, min(100, raw_score)),
-                        final_signal,
-                        hold_bias,
-                    )
-
-                normalized_trend_prediction = raw_trend_prediction
-                canonical_trend = _canonical_trend_prediction_with_bias(final_signal, hold_bias)
-                if (
-                    has_conflict
-                    or trend_signal not in ("", final_signal)
-                    or (final_signal == "hold" and hold_bias != "neutral" and str(raw_trend_prediction).strip() != canonical_trend)
-                ):
-                    normalized_trend_prediction = canonical_trend
-
-                normalized_operation_advice = raw_operation_advice
-                canonical_advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
-                if (
-                    not action_signal
-                    or has_conflict
-                    or operation_signal not in ("", final_signal)
-                    or (final_signal == "hold" and hold_bias != "neutral" and str(raw_operation_advice).strip() != canonical_advice)
-                ):
-                    normalized_operation_advice = canonical_advice
-
-                dashboard = _normalize_dashboard_signal_fields(
-                    dashboard,
-                    final_signal,
-                    has_conflict=has_conflict,
-                    hold_bias=hold_bias,
-                )
+                # 解析所有字段，使用默认值防止缺失
+                # 解析 decision_type，如果没有则根据 operation_advice 推断
+                decision_type = data.get('decision_type', '')
+                if not decision_type:
+                    op = data.get('operation_advice', 'Hold' if report_language == "en" else '持有')
+                    decision_type = infer_decision_type_from_advice(op, default='hold')
                 
                 return AnalysisResult(
                     code=code,
                     name=name,
                     # 核心指标
-                    sentiment_score=normalized_score,
-                    trend_prediction=normalized_trend_prediction,
-                    operation_advice=normalized_operation_advice,
-                    decision_type=final_signal,
-                    confidence_level=data.get('confidence_level', '中'),
+                    sentiment_score=int(data.get('sentiment_score', 50)),
+                    trend_prediction=data.get('trend_prediction', 'Sideways' if report_language == "en" else '震荡'),
+                    operation_advice=data.get('operation_advice', 'Hold' if report_language == "en" else '持有'),
+                    decision_type=decision_type,
+                    confidence_level=localize_confidence_level(
+                        data.get('confidence_level', 'Medium' if report_language == "en" else '中'),
+                        report_language,
+                    ),
+                    report_language=report_language,
                     # 决策仪表盘
                     dashboard=dashboard,
                     # 走势分析
@@ -2149,13 +1580,13 @@ class GeminiAnalyzer:
                     market_sentiment=data.get('market_sentiment', ''),
                     hot_topics=data.get('hot_topics', ''),
                     # 综合
-                    analysis_summary=data.get('analysis_summary', '分析完成'),
+                    analysis_summary=data.get('analysis_summary', 'Analysis completed' if report_language == "en" else '分析完成'),
                     key_points=data.get('key_points', ''),
                     risk_warning=data.get('risk_warning', ''),
                     buy_reason=data.get('buy_reason', ''),
                     # 元数据
                     search_performed=data.get('search_performed', False),
-                    data_sources=data.get('data_sources', '技术面数据'),
+                    data_sources=data.get('data_sources', 'Technical data' if report_language == "en" else '技术面数据'),
                     success=True,
                 )
             else:
@@ -2182,15 +1613,9 @@ class GeminiAnalyzer:
         # 确保布尔值是小写
         json_str = json_str.replace('True', 'true').replace('False', 'false')
         
-        # fix by json-repair when available
-        if callable(repair_json):
-            try:
-                repaired = repair_json(json_str)
-                if isinstance(repaired, str) and repaired.strip():
-                    json_str = repaired
-            except Exception:
-                pass
-
+        # fix by json-repair
+        json_str = repair_json(json_str)
+        
         return json_str
     
     def _parse_text_response(
@@ -2200,67 +1625,36 @@ class GeminiAnalyzer:
         name: str
     ) -> AnalysisResult:
         """从纯文本响应中尽可能提取分析信息"""
-        text = response_text or ""
-        text_lower = text.lower()
-
-        action_buy_keywords = ['买入', '加仓', '建仓', '试仓', 'buy']
-        action_sell_keywords = ['卖出', '减仓', '止盈', '止损', 'sell']
-        hold_keywords = ['持有', '观望', '等待', 'wait', 'hold']
-        positive_keywords = ['看多', '上涨', '突破', '强势', '利好', 'bullish']
-        negative_keywords = ['看空', '下跌', '跌破', '弱势', '利空', 'bearish']
-
-        has_buy_action = any(keyword in text_lower for keyword in action_buy_keywords)
-        has_sell_action = any(keyword in text_lower for keyword in action_sell_keywords)
-        has_hold_action = any(keyword in text_lower for keyword in hold_keywords)
-
-        explicit_action_signal = ""
-        if has_buy_action and not has_sell_action:
-            explicit_action_signal = "buy"
-        elif has_sell_action and not has_buy_action:
-            explicit_action_signal = "sell"
-        elif has_hold_action or (has_buy_action and has_sell_action):
-            explicit_action_signal = "hold"
-
+        report_language = normalize_report_language(getattr(get_config(), "report_language", "zh"))
+        # 尝试识别关键词来判断情绪
+        sentiment_score = 50
+        trend = 'Sideways' if report_language == "en" else '震荡'
+        advice = 'Hold' if report_language == "en" else '持有'
+        
+        text_lower = response_text.lower()
+        
+        # 简单的情绪识别
+        positive_keywords = ['看多', '买入', '上涨', '突破', '强势', '利好', '加仓', 'bullish', 'buy']
+        negative_keywords = ['看空', '卖出', '下跌', '跌破', '弱势', '利空', '减仓', 'bearish', 'sell']
+        
         positive_count = sum(1 for kw in positive_keywords if kw in text_lower)
         negative_count = sum(1 for kw in negative_keywords if kw in text_lower)
-
-        trend_signal = ""
-        if positive_count >= negative_count + 2:
-            trend_signal = "buy"
-        elif negative_count >= positive_count + 2:
-            trend_signal = "sell"
-        elif positive_count or negative_count or has_hold_action:
-            trend_signal = "hold"
-
-        final_signal, _ = _resolve_consistent_signal(
-            [explicit_action_signal, trend_signal]
-        )
-        hold_bias = "neutral"
-        if final_signal == "hold":
-            hold_bias = _derive_hold_bias([explicit_action_signal, trend_signal])
-
-        if final_signal == "buy":
-            sentiment_score = 62
-        elif final_signal == "sell":
-            sentiment_score = 38
+        
+        if positive_count > negative_count + 1:
+            sentiment_score = 65
+            trend = 'Bullish' if report_language == "en" else '看多'
+            advice = 'Buy' if report_language == "en" else '买入'
+            decision_type = 'buy'
+        elif negative_count > positive_count + 1:
+            sentiment_score = 35
+            trend = 'Bearish' if report_language == "en" else '看空'
+            advice = 'Sell' if report_language == "en" else '卖出'
+            decision_type = 'sell'
         else:
-            base_score = {
-                "bullish": 56,
-                "neutral": 50,
-                "bearish": 44,
-            }.get(hold_bias, 50)
-            sentiment_score = _clamp_sentiment_score_to_signal_with_bias(
-                base_score,
-                "hold",
-                hold_bias,
-            )
-
-        trend = _canonical_trend_prediction_with_bias(final_signal, hold_bias)
-        advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
-        decision_type = final_signal
+            decision_type = 'hold'
         
         # 截取前500字符作为摘要
-        summary = text[:500] if text else '无分析结果'
+        summary = response_text[:500] if response_text else ('No analysis result' if report_language == "en" else '无分析结果')
         
         return AnalysisResult(
             code=code,
@@ -2269,12 +1663,13 @@ class GeminiAnalyzer:
             trend_prediction=trend,
             operation_advice=advice,
             decision_type=decision_type,
-            confidence_level='低',
+            confidence_level='Low' if report_language == "en" else '低',
             analysis_summary=summary,
-            key_points='JSON解析失败，已降级为保守文本提取结果，仅供参考',
-            risk_warning='结构化解析失败，结论已按保守逻辑降级，建议结合原文与其他信息判断',
+            key_points='JSON parsing failed; treat this as best-effort output.' if report_language == "en" else 'JSON解析失败，仅供参考',
+            risk_warning='The result may be inaccurate. Cross-check with other information.' if report_language == "en" else '分析结果可能不准确，建议结合其他信息判断',
             raw_response=response_text,
             success=True,
+            report_language=report_language,
         )
     
     def batch_analyze(

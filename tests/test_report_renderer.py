@@ -17,7 +17,7 @@ except ModuleNotFoundError:
     sys.modules["litellm"] = MagicMock()
 
 from src.analyzer import AnalysisResult
-from src.services.report_renderer import render
+from src.services.report_renderer import render, _get_signal_level
 
 
 def _make_result(
@@ -49,6 +49,17 @@ def _make_result(
 
 class TestReportRenderer(unittest.TestCase):
     """Report renderer tests."""
+
+    def test_get_signal_level_supports_compound_sell_advice(self) -> None:
+        result = _make_result(
+            code="TSLA",
+            name="Tesla",
+            sentiment_score=74,
+            operation_advice="减仓/卖出",
+            decision_type="sell",
+        )
+
+        self.assertEqual(_get_signal_level(result), ("卖出", "🔴", "卖出"))
 
     def test_render_markdown_summary_only(self) -> None:
         """Markdown platform renders with summary_only."""

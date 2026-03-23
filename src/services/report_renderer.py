@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from src.analyzer import AnalysisResult
+from src.analyzer import AnalysisResult, get_result_signal_level
 from src.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -21,33 +21,7 @@ logger = logging.getLogger(__name__)
 
 def _get_signal_level(result: AnalysisResult) -> tuple:
     """Return (signal_text, emoji, color_tag) for a result."""
-    advice = result.operation_advice
-    score = result.sentiment_score
-    advice_map = {
-        "强烈买入": ("强烈买入", "💚", "强买"),
-        "买入": ("买入", "🟢", "买入"),
-        "加仓": ("买入", "🟢", "买入"),
-        "持有": ("持有", "🟡", "持有"),
-        "观望": ("观望", "⚪", "观望"),
-        "减仓": ("减仓", "🟠", "减仓"),
-        "卖出": ("卖出", "🔴", "卖出"),
-        "强烈卖出": ("卖出", "🔴", "卖出"),
-    }
-    if advice in advice_map:
-        return advice_map[advice]
-    if score >= 80:
-        return ("强烈买入", "💚", "强买")
-    elif score >= 65:
-        return ("买入", "🟢", "买入")
-    elif score >= 55:
-        return ("持有", "🟡", "持有")
-    elif score >= 45:
-        return ("观望", "⚪", "观望")
-    elif score >= 35:
-        return ("减仓", "🟠", "减仓")
-    elif score < 35:
-        return ("卖出", "🔴", "卖出")
-    return ("观望", "⚪", "观望")
+    return get_result_signal_level(result)
 
 
 def _escape_md(text: str) -> str:

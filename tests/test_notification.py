@@ -221,6 +221,38 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
         self.assertIn("600519", out)
 
     @mock.patch("src.notification.get_config")
+    def test_get_signal_level_prefers_decision_type_before_score_fallback(self, mock_get_config: mock.MagicMock):
+        mock_get_config.return_value = _make_config()
+        service = NotificationService()
+        result = AnalysisResult(
+            code="AAPL",
+            name="Apple",
+            sentiment_score=78,
+            trend_prediction="看空",
+            operation_advice="降低风险",
+            decision_type="sell",
+            analysis_summary="存在明显风险",
+        )
+
+        self.assertEqual(service._get_signal_level(result), ("卖出", "🔴", "卖出"))
+
+    @mock.patch("src.notification.get_config")
+    def test_get_signal_level_understands_compound_operation_advice(self, mock_get_config: mock.MagicMock):
+        mock_get_config.return_value = _make_config()
+        service = NotificationService()
+        result = AnalysisResult(
+            code="TSLA",
+            name="Tesla",
+            sentiment_score=72,
+            trend_prediction="看空",
+            operation_advice="减仓/卖出",
+            decision_type="sell",
+            analysis_summary="应优先防守",
+        )
+
+        self.assertEqual(service._get_signal_level(result), ("卖出", "🔴", "卖出"))
+
+    @mock.patch("src.notification.get_config")
     def test_history_compare_context_uses_cache(self, mock_get_config: mock.MagicMock):
         mock_get_config.return_value = _make_config(report_history_compare_n=3)
         service = NotificationService()

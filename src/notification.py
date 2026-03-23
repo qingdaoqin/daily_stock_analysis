@@ -20,7 +20,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from enum import Enum
 
 from src.config import get_config
-from src.analyzer import AnalysisResult
+from src.analyzer import AnalysisResult, get_result_signal_level
 from src.enums import ReportType
 from bot.models import BotMessage
 from src.utils.data_processing import normalize_model_used
@@ -713,45 +713,16 @@ class NotificationService(
         """
         Get signal level and color based on operation advice.
 
-        Priority: advice string takes precedence over score.
-        Score-based fallback is used only when advice doesn't match
-        any known value.
+        Priority:
+        1. Known advice string
+        2. Compound advice + stable decision_type
+        3. decision_type
+        4. score fallback
 
         Returns:
             (signal_text, emoji, color_tag)
         """
-        advice = result.operation_advice
-        score = result.sentiment_score
-
-        # Advice-first lookup (exact match takes priority)
-        advice_map = {
-            '强烈买入': ('强烈买入', '💚', '强买'),
-            '买入': ('买入', '🟢', '买入'),
-            '加仓': ('买入', '🟢', '买入'),
-            '持有': ('持有', '🟡', '持有'),
-            '观望': ('观望', '⚪', '观望'),
-            '减仓': ('减仓', '🟠', '减仓'),
-            '卖出': ('卖出', '🔴', '卖出'),
-            '强烈卖出': ('卖出', '🔴', '卖出'),
-        }
-        if advice in advice_map:
-            return advice_map[advice]
-
-        # Score-based fallback when advice is unrecognized
-        if score >= 80:
-            return ('强烈买入', '💚', '强买')
-        elif score >= 65:
-            return ('买入', '🟢', '买入')
-        elif score >= 55:
-            return ('持有', '🟡', '持有')
-        elif score >= 45:
-            return ('观望', '⚪', '观望')
-        elif score >= 35:
-            return ('减仓', '🟠', '减仓')
-        elif score < 35:
-            return ('卖出', '🔴', '卖出')
-        else:
-            return ('观望', '⚪', '观望')
+        return get_result_signal_level(result)
     
     def generate_dashboard_report(
         self,

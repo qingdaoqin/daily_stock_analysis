@@ -198,3 +198,33 @@ class TestAnalyzerSchemaFallback(unittest.TestCase):
         self.assertEqual(result.operation_advice, "买入")
         self.assertEqual(result.trend_prediction, "强烈看多")
         self.assertEqual(result.sentiment_score, 88)
+
+    def test_parse_text_response_downgrades_conflicting_plain_text_to_hold(self) -> None:
+        """Plain-text fallback should degrade contradictory signals to a defensive hold."""
+        analyzer = GeminiAnalyzer()
+
+        result = analyzer._parse_text_response(
+            "短线看多但同时提示减仓，建议先等待确认，避免直接追价。",
+            "AAPL",
+            "Apple",
+        )
+
+        self.assertEqual(result.decision_type, "hold")
+        self.assertIn(result.operation_advice, {"持有", "观望"})
+        self.assertIn(result.trend_prediction, {"震荡偏多", "震荡", "震荡偏空"})
+        self.assertTrue(40 <= result.sentiment_score <= 59)
+
+    def test_parse_text_response_keeps_bearish_plain_text_conservative(self) -> None:
+        """Bearish plain-text fallback should prefer the canonical sell advice."""
+        analyzer = GeminiAnalyzer()
+
+        result = analyzer._parse_text_response(
+            "走势偏弱，跌破支撑，建议减仓或卖出，短线看空。",
+            "TSLA",
+            "Tesla",
+        )
+
+        self.assertEqual(result.decision_type, "sell")
+        self.assertEqual(result.operation_advice, "减仓/卖出")
+        self.assertEqual(result.trend_prediction, "看空")
+        self.assertTrue(0 <= result.sentiment_score <= 39)

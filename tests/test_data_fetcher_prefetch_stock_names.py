@@ -102,6 +102,25 @@ class TestPrefetchStockNames(unittest.TestCase):
         hk_fetcher.get_stock_name.assert_called_once_with("0700")
         cn_fetcher.get_stock_name.assert_not_called()
 
+    def test_get_stock_name_does_not_fallback_to_cn_fetchers_for_invalid_us_code(self):
+        manager = DataFetcherManager.__new__(DataFetcherManager)
+        cn_fetcher = MagicMock()
+        cn_fetcher.name = "PytdxFetcher"
+        cn_fetcher.get_stock_name.return_value = "不应该先调用"
+        us_fetcher = MagicMock()
+        us_fetcher.name = "YfinanceFetcher"
+        us_fetcher.get_stock_name.return_value = ""
+        manager._fetchers = [cn_fetcher, us_fetcher]
+        manager.get_realtime_quote = MagicMock()
+
+        with patch.dict("data_provider.base.STOCK_NAME_MAP", {}, clear=True):
+            name = DataFetcherManager.get_stock_name(manager, "APPL", allow_realtime=False)
+
+        self.assertEqual(name, "")
+        manager.get_realtime_quote.assert_not_called()
+        us_fetcher.get_stock_name.assert_called_once_with("APPL")
+        cn_fetcher.get_stock_name.assert_not_called()
+
     def test_pytdx_get_stock_name_reads_all_security_list_pages(self):
         fetcher = PytdxFetcher(hosts=[])
 

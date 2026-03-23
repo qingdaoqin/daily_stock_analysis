@@ -253,6 +253,41 @@ class TestAgentResultConversion(unittest.TestCase):
         )
         self.assertEqual(result.name, "贵州茅台")
 
+    def test_convert_normalizes_conflicting_agent_signals(self):
+        """Agent-mode conversion should normalize conflicting signal fields before rendering."""
+        pipeline = self._make_pipeline()
+
+        from src.agent.executor import AgentResult
+        from src.enums import ReportType
+
+        agent_result = AgentResult(
+            success=True,
+            content="{}",
+            dashboard={
+                "stock_name": "Apple",
+                "sentiment_score": 81,
+                "trend_prediction": "看空",
+                "operation_advice": "买入",
+                "decision_type": "buy",
+                "dashboard": {
+                    "core_conclusion": {
+                        "one_sentence": "建议直接买入",
+                        "signal_type": "买入信号",
+                    }
+                },
+            },
+            provider="gemini",
+        )
+
+        result = pipeline._agent_result_to_analysis_result(
+            agent_result, "AAPL", "Apple", ReportType.SIMPLE, "q-agent-conflict"
+        )
+
+        self.assertEqual(result.decision_type, "hold")
+        self.assertEqual(result.operation_advice, "持有")
+        self.assertEqual(result.trend_prediction, "震荡偏多")
+        self.assertTrue(52 <= result.sentiment_score <= 59)
+
 
 # ============================================================
 # Skill registration in pipeline

@@ -791,44 +791,89 @@ class AnalysisResult:
 
     def get_emoji(self) -> str:
         """根据操作建议返回对应 emoji"""
-        emoji_map = {
-            '买入': '🟢',
-            '加仓': '🟢',
-            '强烈买入': '💚',
-            '持有': '🟡',
-            '观望': '⚪',
-            '减仓': '🟠',
-            '卖出': '🔴',
-            '强烈卖出': '❌',
-        }
-        advice = self.operation_advice or ''
-        # Direct match first
-        if advice in emoji_map:
-            return emoji_map[advice]
-        # Handle compound advice like "卖出/观望" — use the first part
-        for part in advice.replace('/', '|').split('|'):
-            part = part.strip()
-            if part in emoji_map:
-                return emoji_map[part]
-        # Score-based fallback
-        score = self.sentiment_score
-        if score >= 80:
-            return '💚'
-        elif score >= 65:
-            return '🟢'
-        elif score >= 55:
-            return '🟡'
-        elif score >= 45:
-            return '⚪'
-        elif score >= 35:
-            return '🟠'
-        else:
-            return '🔴'
+        return get_result_signal_level(self)[1]
 
     def get_confidence_stars(self) -> str:
         """返回置信度星级"""
         star_map = {'高': '⭐⭐⭐', '中': '⭐⭐', '低': '⭐'}
         return star_map.get(self.confidence_level, '⭐⭐')
+
+
+def normalize_analysis_result_signals(result: AnalysisResult) -> AnalysisResult:
+    """Normalize an existing AnalysisResult into a self-consistent signal state.
+
+    Used by non-JSON downgrade paths and by agent-mode conversion so every
+    runtime path shares the same decision/advice/trend/dashboard contract.
+    """
+    raw_score = _coerce_sentiment_score_value(getattr(result, "sentiment_score", 50), 50)
+    raw_trend_prediction = getattr(result, "trend_prediction", "震荡")
+    raw_operation_advice = getattr(result, "operation_advice", "持有")
+    raw_decision_type = getattr(result, "decision_type", "")
+
+    decision_signal = _canonical_decision_signal(raw_decision_type)
+    operation_signal = _signal_from_operation_advice(raw_operation_advice)
+    trend_signal = _signal_from_trend_prediction(raw_trend_prediction)
+    score_signal = _signal_from_sentiment_score(raw_score)
+
+    action_signal = decision_signal or operation_signal
+    opposite_pairs = {("buy", "sell"), ("sell", "buy")}
+    hard_conflict = False
+
+    if decision_signal and operation_signal and (decision_signal, operation_signal) in opposite_pairs:
+        hard_conflict = True
+    elif action_signal and trend_signal and (action_signal, trend_signal) in opposite_pairs:
+        hard_conflict = True
+    elif action_signal and score_signal and (action_signal, score_signal) in opposite_pairs:
+        hard_conflict = True
+
+    hold_bias = "neutral"
+    if hard_conflict:
+        final_signal = "hold"
+    elif action_signal:
+        final_signal = action_signal
+    else:
+        final_signal, _ = _resolve_consistent_signal([
+            trend_signal,
+            score_signal,
+        ])
+
+    if final_signal == "hold":
+        hold_bias = _derive_hold_bias([
+            decision_signal,
+            operation_signal,
+            trend_signal,
+            score_signal,
+        ])
+
+    normalized_score = raw_score
+    if raw_score < 0 or raw_score > 100 or hard_conflict:
+        normalized_score = _clamp_sentiment_score_to_signal_with_bias(
+            max(0, min(100, raw_score)),
+            final_signal,
+            hold_bias,
+        )
+
+    normalized_trend_prediction = raw_trend_prediction
+    if hard_conflict and trend_signal not in ("", final_signal):
+        normalized_trend_prediction = _canonical_trend_prediction_with_bias(final_signal, hold_bias)
+
+    normalized_operation_advice = raw_operation_advice
+    if not action_signal:
+        normalized_operation_advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
+    elif hard_conflict and operation_signal not in ("", final_signal):
+        normalized_operation_advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
+
+    result.sentiment_score = normalized_score
+    result.trend_prediction = normalized_trend_prediction
+    result.operation_advice = normalized_operation_advice
+    result.decision_type = final_signal
+    result.dashboard = _normalize_dashboard_signal_fields(
+        result.dashboard,
+        final_signal,
+        has_conflict=hard_conflict,
+        hold_bias=hold_bias,
+    )
+    return result
 
 
 class GeminiAnalyzer:

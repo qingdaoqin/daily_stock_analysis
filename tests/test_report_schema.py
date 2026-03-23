@@ -228,3 +228,17 @@ class TestAnalyzerSchemaFallback(unittest.TestCase):
         self.assertEqual(result.operation_advice, "减仓/卖出")
         self.assertEqual(result.trend_prediction, "看空")
         self.assertTrue(0 <= result.sentiment_score <= 39)
+
+    def test_analysis_result_get_emoji_uses_normalized_signal_level(self) -> None:
+        """Compound sell advice should render a sell emoji when decision_type is sell."""
+        result = AnalysisResult(
+            code="TSLA",
+            name="Tesla",
+            sentiment_score=78,
+            trend_prediction="看空",
+            operation_advice="减仓/卖出",
+            decision_type="sell",
+            analysis_summary="应优先防守",
+        )
+
+        self.assertEqual(result.get_emoji(), "🔴")

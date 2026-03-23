@@ -25,7 +25,13 @@ from src.config import get_config, Config
 from src.storage import get_db
 from data_provider import DataFetcherManager
 from data_provider.realtime_types import ChipDistribution
-from src.analyzer import GeminiAnalyzer, AnalysisResult, fill_chip_structure_if_needed, fill_price_position_if_needed
+from src.analyzer import (
+    GeminiAnalyzer,
+    AnalysisResult,
+    fill_chip_structure_if_needed,
+    fill_price_position_if_needed,
+    normalize_analysis_result_signals,
+)
 from src.data.stock_mapping import STOCK_NAME_MAP
 from src.notification import NotificationService, NotificationChannel
 from src.search_service import SearchService
@@ -795,6 +801,7 @@ class StockAnalysisPipeline:
             # methods (get_sniper_points, get_core_conclusion, etc.) expect that inner
             # structure, so we unwrap it here.
             result.dashboard = dash.get("dashboard") or dash
+            result = normalize_analysis_result_signals(result)
         else:
             result.sentiment_score = 50
             result.operation_advice = "观望"

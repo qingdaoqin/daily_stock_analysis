@@ -1226,7 +1226,11 @@ class DataFetcherManager:
             return static_name
 
         # 3. 依次尝试各个数据源
-        for fetcher in self._fetchers:
+        fetchers = list(self._fetchers)
+        if _market_tag(stock_code) == "us":
+            fetchers.sort(key=lambda fetcher: 0 if fetcher.name == "YfinanceFetcher" else 1)
+
+        for fetcher in fetchers:
             if hasattr(fetcher, 'get_stock_name'):
                 try:
                     name = fetcher.get_stock_name(stock_code)

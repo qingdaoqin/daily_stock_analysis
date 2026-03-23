@@ -8,6 +8,9 @@ import sys
 import unittest
 from unittest.mock import MagicMock, call, patch
 
+if "fake_useragent" not in sys.modules:
+    sys.modules["fake_useragent"] = MagicMock()
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from data_provider.base import DataFetcherManager
@@ -60,6 +63,25 @@ class TestPrefetchStockNames(unittest.TestCase):
         manager.get_realtime_quote.assert_not_called()
         remote_fetcher.get_stock_name.assert_not_called()
         self.assertEqual(manager._stock_name_cache["600519"], "贵州茅台")
+
+    def test_get_stock_name_prefers_yfinance_for_us_codes(self):
+        manager = DataFetcherManager.__new__(DataFetcherManager)
+        cn_fetcher = MagicMock()
+        cn_fetcher.name = "AkshareFetcher"
+        cn_fetcher.get_stock_name.return_value = "不应该先调用"
+        us_fetcher = MagicMock()
+        us_fetcher.name = "YfinanceFetcher"
+        us_fetcher.get_stock_name.return_value = "Apple Inc."
+        manager._fetchers = [cn_fetcher, us_fetcher]
+        manager.get_realtime_quote = MagicMock()
+
+        with patch.dict("data_provider.base.STOCK_NAME_MAP", {}, clear=True):
+            name = DataFetcherManager.get_stock_name(manager, "AAPL", allow_realtime=False)
+
+        self.assertEqual(name, "Apple Inc.")
+        manager.get_realtime_quote.assert_not_called()
+        us_fetcher.get_stock_name.assert_called_once_with("AAPL")
+        cn_fetcher.get_stock_name.assert_not_called()
 
     def test_pytdx_get_stock_name_reads_all_security_list_pages(self):
         fetcher = PytdxFetcher(hosts=[])

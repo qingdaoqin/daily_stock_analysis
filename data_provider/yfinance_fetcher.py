@@ -76,7 +76,48 @@ class YfinanceFetcher(BaseFetcher):
 
     def __init__(self):
         """初始化 YfinanceFetcher"""
-        pass
+        self._stock_name_cache: Dict[str, str] = {}
+
+    def get_stock_name(self, stock_code: str) -> str:
+        """
+        获取股票/指数名称。
+
+        主要用于美股与美股指数的非实时名称解析，避免在名称预取路径下
+        先枚举一轮 A 股数据源。
+        """
+        code = stock_code.strip().upper()
+        if not code:
+            return ""
+
+        cached_name = self._stock_name_cache.get(code) or STOCK_NAME_MAP.get(code, "")
+        if is_meaningful_stock_name(cached_name, code):
+            return cached_name
+
+        yf_symbol, index_name = get_us_index_yf_symbol(code)
+        if yf_symbol and is_meaningful_stock_name(index_name, code):
+            self._stock_name_cache[code] = index_name
+            STOCK_NAME_MAP[code] = index_name
+            return index_name
+
+        if not is_us_stock_code(code):
+            return ""
+
+        try:
+            import yfinance as yf
+
+            ticker = yf.Ticker(code)
+            info = ticker.info or {}
+            for field in ("shortName", "longName", "displayName"):
+                candidate = info.get(field, "") if isinstance(info, dict) else ""
+                if is_meaningful_stock_name(candidate, code):
+                    name = str(candidate).strip()
+                    self._stock_name_cache[code] = name
+                    STOCK_NAME_MAP[code] = name
+                    return name
+        except Exception as exc:
+            logger.debug(f"[Yfinance] 获取 {code} 股票名称失败: {exc}")
+
+        return ""
 
     def _convert_stock_code(self, stock_code: str) -> str:
         """

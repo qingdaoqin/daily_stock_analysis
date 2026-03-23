@@ -33,7 +33,7 @@ jobs:
   analyze:
     runs-on: ubuntu-latest
     # 添加超时限制，防止任务卡死
-    timeout-minutes: 30
+    timeout-minutes: 60
     
     steps:
       - name: 随机延迟（避免固定时间访问）
@@ -70,9 +70,11 @@ jobs:
 
           # Gemini AI（主选）
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-3-flash-preview' }}
-          GEMINI_MODEL_FALLBACK: ${{ vars.GEMINI_MODEL_FALLBACK || secrets.GEMINI_MODEL_FALLBACK || 'gemini-2.5-flash' }}
-          GEMINI_REQUEST_DELAY: '3.0'
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-2.5-flash' }}
+          GEMINI_MODEL_FALLBACK: ${{ vars.GEMINI_MODEL_FALLBACK || secrets.GEMINI_MODEL_FALLBACK || 'gemini-2.5-flash-lite' }}
+          GEMINI_REQUEST_DELAY: ${{ vars.GEMINI_REQUEST_DELAY || secrets.GEMINI_REQUEST_DELAY || '5.0' }}
+          GEMINI_MAX_RETRIES: ${{ vars.GEMINI_MAX_RETRIES || secrets.GEMINI_MAX_RETRIES || '3' }}
+          GEMINI_RETRY_DELAY: ${{ vars.GEMINI_RETRY_DELAY || secrets.GEMINI_RETRY_DELAY || '10.0' }}
           
           # AIHubMix（优先于 OPENAI_API_KEY，自动适配 base_url，推荐国内用户）
           AIHUBMIX_KEY: ${{ secrets.AIHUBMIX_KEY }}
@@ -163,7 +165,7 @@ jobs:
           # 运行配置 ⬅️ 新增！
           # ==========================================
           REPORT_TYPE: ${{ vars.REPORT_TYPE || secrets.REPORT_TYPE || 'simple' }}
-          SINGLE_STOCK_NOTIFY: ${{ vars.SINGLE_STOCK_NOTIFY || secrets.SINGLE_STOCK_NOTIFY || 'false' }}
+          SINGLE_STOCK_NOTIFY: ${{ vars.SINGLE_STOCK_NOTIFY || secrets.SINGLE_STOCK_NOTIFY || 'true' }}
           MARKET_REVIEW_ENABLED: ${{ vars.MARKET_REVIEW_ENABLED || secrets.MARKET_REVIEW_ENABLED || 'true' }}
           ANALYSIS_DELAY: ${{ vars.ANALYSIS_DELAY || secrets.ANALYSIS_DELAY || '0' }}
           TRADING_DAY_CHECK_ENABLED: ${{ vars.TRADING_DAY_CHECK_ENABLED || secrets.TRADING_DAY_CHECK_ENABLED || 'true' }}
@@ -208,6 +210,10 @@ jobs:
           echo "【AI 配置】"
           echo "  LiteLLM: $([ -n "$LITELLM_CONFIG" ] || [ -n "$LITELLM_API_KEY" ] || [ -n "$LITELLM_MODEL" ] && echo '✅ 已配置' || echo '❌ 未配置')"
           echo "  Gemini API Key: $([ -n "$GEMINI_API_KEY" ] && echo '✅ 已配置' || echo '❌ 未配置')"
+          echo "  Gemini 主模型: ${GEMINI_MODEL:-未配置}"
+          echo "  Gemini 备选模型: ${GEMINI_MODEL_FALLBACK:-未配置}"
+          echo "  Gemini 请求间隔: ${GEMINI_REQUEST_DELAY}s"
+          echo "  Gemini 重试次数: ${GEMINI_MAX_RETRIES}, 基础退避: ${GEMINI_RETRY_DELAY}s"
           echo "  AIHubMix Key:   $([ -n "$AIHUBMIX_KEY" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  OpenAI API Key: $([ -n "$OPENAI_API_KEY" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  Anthropic Key:  $([ -n "$ANTHROPIC_API_KEY" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
@@ -228,6 +234,7 @@ jobs:
           echo "  Telegram: $([ -n "$TELEGRAM_BOT_TOKEN" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  Discord: $([ -n "$DISCORD_WEBHOOK_URL" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  AstrBot: $([ -n "$ASTRBOT_URL" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
+          echo "  单股推送: ${SINGLE_STOCK_NOTIFY}"
           echo "=========================================="
           echo ""
           

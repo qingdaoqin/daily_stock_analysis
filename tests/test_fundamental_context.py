@@ -78,7 +78,7 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(ctx["coverage"].get("dragon_tiger"), "not_supported")
         self.assertEqual(ctx["coverage"].get("boards"), "not_supported")
 
-    def test_hk_market_keeps_valuation_and_marks_rest_not_supported(self) -> None:
+    def test_hk_market_returns_partial_with_structured_bundle(self) -> None:
         manager = DataFetcherManager(fetchers=[])
         cfg = SimpleNamespace(
             enable_fundamental_pipeline=True,
@@ -94,16 +94,28 @@ class TestFundamentalContext(unittest.TestCase):
             circ_mv=2.9e11,
             source=SimpleNamespace(value="akshare_hk"),
         )
+        bundle = {
+            "status": "partial",
+            "growth": {"revenue_yoy": 9.5, "net_profit_yoy": 12.1},
+            "earnings": {"earnings_date": "2026-03-28", "dividend_yield": 1.4},
+            "institution": {"institutional_holding_pct": 22.0, "analyst_coverage_count": 31},
+            "source_chain": ["growth:yfinance_info", "earnings:yfinance_info", "institution:yfinance_info"],
+            "errors": [],
+        }
         with patch("src.config.get_config", return_value=cfg), \
-                patch.object(manager, "get_realtime_quote", return_value=quote):
+                patch.object(manager, "get_realtime_quote", return_value=quote), \
+                patch(
+                    "data_provider.fundamental_adapter.HkYfinanceFundamentalAdapter.get_fundamental_bundle",
+                    return_value=bundle,
+                ):
             ctx = manager.get_fundamental_context("HK00700")
 
         self.assertEqual(ctx["market"], "hk")
         self.assertEqual(ctx["status"], "partial")
         self.assertEqual(ctx["coverage"].get("valuation"), "ok")
-        self.assertEqual(ctx["coverage"].get("growth"), "not_supported")
-        self.assertEqual(ctx["coverage"].get("earnings"), "not_supported")
-        self.assertEqual(ctx["coverage"].get("institution"), "not_supported")
+        self.assertEqual(ctx["coverage"].get("growth"), "ok")
+        self.assertEqual(ctx["coverage"].get("earnings"), "ok")
+        self.assertEqual(ctx["coverage"].get("institution"), "ok")
 
     def test_etf_market_downgrades_to_partial_or_not_supported(self) -> None:
         manager = DataFetcherManager(fetchers=[])

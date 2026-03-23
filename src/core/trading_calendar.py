@@ -40,6 +40,18 @@ MARKET_TIMEZONE = {
 }
 
 
+def _is_hk_stock_code(code: str) -> bool:
+    """Lightweight HK code detector without importing heavy fetcher modules."""
+    normalized = (code or "").strip().upper()
+    if normalized.endswith(".HK"):
+        digits = normalized[:-3]
+        return digits.isdigit() and 1 <= len(digits) <= 5
+    if normalized.startswith("HK"):
+        digits = normalized[2:]
+        return digits.isdigit() and 1 <= len(digits) <= 5
+    return normalized.isdigit() and 1 <= len(normalized) <= 5
+
+
 def get_market_for_stock(code: str) -> Optional[str]:
     """
     Infer market region for a stock code.
@@ -51,11 +63,11 @@ def get_market_for_stock(code: str) -> Optional[str]:
         return None
     code = (code or "").strip().upper()
 
-    from data_provider import is_us_stock_code, is_us_index_code, is_hk_stock_code
+    from data_provider.us_index_mapping import is_us_stock_code, is_us_index_code
 
     if is_us_stock_code(code) or is_us_index_code(code):
         return "us"
-    if is_hk_stock_code(code):
+    if _is_hk_stock_code(code):
         return "hk"
     # A-share: 6-digit numeric
     if code.isdigit() and len(code) == 6:
@@ -120,26 +132,45 @@ def compute_effective_region(
     Compute effective market review region given config and open markets.
 
     Args:
-        config_region: From MARKET_REVIEW_REGION ('cn' | 'us' | 'both')
+        config_region: From MARKET_REVIEW_REGION ('cn' | 'hk' | 'us' | 'both' | 'all')
         open_markets: Markets open today
 
     Returns:
         None: caller uses config default (check disabled)
         '': all relevant markets closed, skip market review
-        'cn' | 'us' | 'both': effective subset for today
+        'cn' | 'hk' | 'us' | 'both' | 'all': effective subset for today
     """
-    if config_region not in ("cn", "us", "both"):
+    if config_region not in ("cn", "hk", "us", "both", "all"):
         config_region = "cn"
     if config_region == "cn":
         return "cn" if "cn" in open_markets else ""
+    if config_region == "hk":
+        return "hk" if "hk" in open_markets else ""
     if config_region == "us":
         return "us" if "us" in open_markets else ""
-    # both
+    if config_region == "both":
+        parts = []
+        if "cn" in open_markets:
+            parts.append("cn")
+        if "us" in open_markets:
+            parts.append("us")
+        if not parts:
+            return ""
+        return "both" if len(parts) == 2 else parts[0]
+
+    # all
     parts = []
     if "cn" in open_markets:
         parts.append("cn")
+    if "hk" in open_markets:
+        parts.append("hk")
     if "us" in open_markets:
         parts.append("us")
     if not parts:
         return ""
-    return "both" if len(parts) == 2 else parts[0]
+    if len(parts) == 3:
+        return "all"
+    if len(parts) == 2:
+        combo = "+".join(parts)
+        return combo
+    return parts[0]

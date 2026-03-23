@@ -48,7 +48,7 @@ class AgentResult:
 # System prompt builder
 # ============================================================
 
-AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的 A 股投资分析 Agent，拥有数据工具和交易策略，负责生成专业的【决策仪表盘】分析报告。
+AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的多市场投资分析 Agent，覆盖 A 股、港股和美股，拥有数据工具和交易策略，负责生成专业的【决策仪表盘】分析报告。
 
 ## 工作流程（必须严格按阶段顺序执行，每阶段等工具结果返回后再进入下一阶段）
 
@@ -61,7 +61,9 @@ AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的 A 股投资分析 
 - `get_chip_distribution` 获取筹码分布
 
 **第三阶段 · 情报搜索**（等前两阶段完成后执行）
-- `search_stock_news` 搜索最新资讯、减持、业绩预告等风险信号
+- 优先读取预取的 `market_context` / `news_context` / `intel_dimensions`
+- 需要补充时优先调用 `search_comprehensive_intel`
+- 仅在还缺最新舆情时再调用 `search_stock_news`
 
 **第四阶段 · 生成报告**（所有数据就绪后，输出完整决策仪表盘 JSON）
 
@@ -91,7 +93,9 @@ AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的 A 股投资分析 
 - **观望情况**：跌破 MA20 时观望
 
 ### 5. 风险排查重点
-- 减持公告、业绩预亏、监管处罚、行业政策利空、大额解禁
+- A股：减持公告、业绩预亏、监管处罚、行业政策利空、大额解禁
+- 港股：HKEX 公告、profit warning、配股/回购/分红、内地业务暴露
+- 美股：SEC 披露、guidance、诉讼、Form 4/13D/13G；中国政策仅在 China exposure 明确时上调权重
 
 ### 6. 估值关注（PE/PB）
 - PE 明显偏高时需在风险点中说明
@@ -105,7 +109,7 @@ AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的 A 股投资分析 
 2. **系统化分析** — 严格按工作流程分阶段执行，每阶段完整返回后再进入下一阶段，**禁止**将不同阶段的工具合并到同一次调用中。
 3. **应用交易策略** — 评估每个激活策略的条件，在报告中体现策略判断结果。
 4. **输出格式** — 最终响应必须是有效的决策仪表盘 JSON。
-5. **风险优先** — 必须排查风险（股东减持、业绩预警、监管问题）。
+5. **风险优先** — 必须按市场使用正确的风险口径，优先引用官方披露而非二手新闻。
 6. **工具失败处理** — 记录失败原因，使用已有数据继续分析，不重复调用失败工具。
 
 {skills_section}
@@ -206,7 +210,7 @@ AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的 A 股投资分析 
 5. **风险优先级**：舆情中的风险点要醒目标出
 """
 
-CHAT_SYSTEM_PROMPT = """你是一位专注于趋势交易的 A 股投资分析 Agent，拥有数据工具和交易策略，负责解答用户的股票投资问题。
+CHAT_SYSTEM_PROMPT = """你是一位专注于趋势交易的多市场投资分析 Agent，覆盖 A 股、港股和美股，负责解答用户的股票投资问题。
 
 ## 分析工作流程（必须严格按阶段执行，禁止跳步或合并阶段）
 
@@ -221,7 +225,9 @@ CHAT_SYSTEM_PROMPT = """你是一位专注于趋势交易的 A 股投资分析 A
 - 调用 `get_chip_distribution` 获取筹码分布结构
 
 **第三阶段 · 情报搜索**（等前两阶段完成后再执行）
-- 调用 `search_stock_news` 搜索最新新闻公告、减持、业绩预告等风险信号
+- 优先读取预取的 `market_context` / `news_context` / `intel_dimensions`
+- 需要补充时优先调用 `search_comprehensive_intel`
+- 仅在还缺最新舆情时再调用 `search_stock_news`
 
 **第四阶段 · 综合分析**（所有工具数据就绪后生成回答）
 - 基于上述真实数据，结合激活策略进行综合研判，输出投资建议
@@ -252,7 +258,9 @@ CHAT_SYSTEM_PROMPT = """你是一位专注于趋势交易的 A 股投资分析 A
 - **观望情况**：跌破 MA20 时观望
 
 ### 5. 风险排查重点
-- 减持公告、业绩预亏、监管处罚、行业政策利空、大额解禁
+- A股：减持公告、业绩预亏、监管处罚、行业政策利空、大额解禁
+- 港股：HKEX 公告、profit warning、配股/回购/分红、内地业务暴露
+- 美股：SEC 披露、guidance、诉讼、Form 4/13D/13G；中国政策仅在 China exposure 明确时上调权重
 
 ### 6. 估值关注（PE/PB）
 - PE 明显偏高时需在风险点中说明
@@ -265,7 +273,7 @@ CHAT_SYSTEM_PROMPT = """你是一位专注于趋势交易的 A 股投资分析 A
 1. **必须调用工具获取真实数据** — 绝不编造数字，所有数据必须来自工具返回结果。
 2. **应用交易策略** — 评估每个激活策略的条件，在回答中体现策略判断结果。
 3. **自由对话** — 根据用户的问题，自由组织语言回答，不需要输出 JSON。
-4. **风险优先** — 必须排查风险（股东减持、业绩预警、监管问题）。
+4. **风险优先** — 必须按市场使用正确的风险口径，优先引用官方披露而非二手新闻。
 5. **工具失败处理** — 记录失败原因，使用已有数据继续分析，不重复调用失败工具。
 
 {skills_section}
@@ -370,12 +378,22 @@ class AgentExecutor:
                 context_parts.append(f"上次涨跌幅: {context['previous_change_pct']}%")
             if context.get("previous_analysis_summary"):
                 summary = context["previous_analysis_summary"]
-                summary_text = json.dumps(summary, ensure_ascii=False) if isinstance(summary, dict) else str(summary)
+                summary_text = json.dumps(summary, ensure_ascii=False, default=str) if isinstance(summary, dict) else str(summary)
                 context_parts.append(f"上次分析摘要:\n{summary_text}")
             if context.get("previous_strategy"):
                 strategy = context["previous_strategy"]
-                strategy_text = json.dumps(strategy, ensure_ascii=False) if isinstance(strategy, dict) else str(strategy)
+                strategy_text = json.dumps(strategy, ensure_ascii=False, default=str) if isinstance(strategy, dict) else str(strategy)
                 context_parts.append(f"上次策略分析:\n{strategy_text}")
+            for label, key in (
+                ("市场规则", "market_context"),
+                ("情报报告", "intel_report"),
+                ("情报维度", "intel_dimensions"),
+                ("基本面", "fundamental_context"),
+            ):
+                if context.get(key):
+                    value = context[key]
+                    value_text = json.dumps(value, ensure_ascii=False, default=str) if isinstance(value, dict) else str(value)
+                    context_parts.append(f"{label}:\n{value_text}")
             if context_parts:
                 context_msg = "[系统提供的历史分析上下文，可供参考对比]\n" + "\n".join(context_parts)
                 messages.append({"role": "user", "content": context_msg})
@@ -451,9 +469,19 @@ class AgentExecutor:
 
             # Inject pre-fetched context data to avoid redundant fetches
             if context.get("realtime_quote"):
-                parts.append(f"\n[系统已获取的实时行情]\n{json.dumps(context['realtime_quote'], ensure_ascii=False)}")
+                parts.append(f"\n[系统已获取的实时行情]\n{json.dumps(context['realtime_quote'], ensure_ascii=False, default=str)}")
             if context.get("chip_distribution"):
-                parts.append(f"\n[系统已获取的筹码分布]\n{json.dumps(context['chip_distribution'], ensure_ascii=False)}")
+                parts.append(f"\n[系统已获取的筹码分布]\n{json.dumps(context['chip_distribution'], ensure_ascii=False, default=str)}")
+            if context.get("trend_result"):
+                parts.append(f"\n[系统已获取的技术趋势]\n{json.dumps(context['trend_result'], ensure_ascii=False, default=str)}")
+            if context.get("fundamental_context"):
+                parts.append(f"\n[系统已获取的基本面]\n{json.dumps(context['fundamental_context'], ensure_ascii=False, default=str)}")
+            if context.get("market_context"):
+                parts.append(f"\n[系统已获取的市场规则]\n{json.dumps(context['market_context'], ensure_ascii=False, default=str)}")
+            if context.get("intel_report"):
+                parts.append(f"\n[系统已获取的情报报告]\n{context['intel_report']}")
+            if context.get("intel_dimensions"):
+                parts.append(f"\n[系统已获取的情报维度]\n{json.dumps(context['intel_dimensions'], ensure_ascii=False, default=str)}")
 
-        parts.append("\n请使用可用工具获取缺失的数据（如历史K线、新闻等），然后以决策仪表盘 JSON 格式输出分析结果。")
+        parts.append("\n请优先使用系统已提供的市场/情报上下文，仅对缺失部分调用工具补齐，然后以决策仪表盘 JSON 格式输出分析结果。")
         return "\n".join(parts)

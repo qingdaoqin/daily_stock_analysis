@@ -18,6 +18,10 @@ import pandas as pd
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+for _mod in ("litellm", "json_repair", "markdown2", "newspaper"):
+    if _mod not in sys.modules:
+        sys.modules[_mod] = MagicMock()
+
 from data_provider.realtime_types import UnifiedRealtimeQuote, RealtimeSource
 from src.stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult, TrendStatus
 from src.core.pipeline import StockAnalysisPipeline
@@ -223,6 +227,49 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
         )
         self.assertEqual(enhanced["today"]["close"], 15.0)
         self.assertEqual(enhanced["today"]["ma5"], 14.8)
+
+    def test_market_context_added_for_us_stock(self) -> None:
+        context = {"code": "AAPL", "today": {"close": 180.0}}
+        market_context = {
+            "market": "us",
+            "market_label": "美股",
+            "policy_scope": "中国政策只有在存在 China exposure 时才提高权重。",
+            "china_exposure": {
+                "level_label": "高",
+                "policy_weight_label": "高权重",
+                "reasoning": "同时存在中国收入和供应链暴露。",
+            },
+        }
+
+        enhanced = self.pipeline._enhance_context(
+            context,
+            None,
+            None,
+            None,
+            "Apple",
+            market_context=market_context,
+        )
+
+        self.assertEqual(enhanced["market_context"]["market"], "us")
+        self.assertEqual(enhanced["market"], "us")
+        self.assertEqual(
+            enhanced["market_context"]["china_exposure"]["policy_weight_label"],
+            "高权重",
+        )
+
+    def test_market_context_falls_back_from_stock_code(self) -> None:
+        context = {"code": "HK00700", "today": {"close": 320.0}}
+
+        enhanced = self.pipeline._enhance_context(
+            context,
+            None,
+            None,
+            None,
+            "腾讯控股",
+        )
+
+        self.assertEqual(enhanced["market_context"]["market"], "hk")
+        self.assertEqual(enhanced["market_context"]["market_label"], "港股")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ when only lightweight sub-modules like tools.registry are needed::
     from src.agent.orchestrator import AgentOrchestrator
 """
 
+from importlib import import_module
+
 
 def __getattr__(name):
     """Lazy import to avoid triggering json_repair etc. on package access."""
@@ -37,6 +39,8 @@ def __getattr__(name):
     if name == "AgentMemory":
         from src.agent.memory import AgentMemory
         return AgentMemory
+    if name == "llm_adapter":
+        return import_module("src.agent.llm_adapter")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -50,4 +54,5 @@ __all__ = [
     "AgentRunStats",
     "AgentOrchestrator",
     "AgentMemory",
+    "llm_adapter",
 ]

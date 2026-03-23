@@ -25,7 +25,11 @@ from typing import Callable, Optional, List, Tuple, Dict, Any
 import pandas as pd
 import numpy as np
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
-from .fundamental_adapter import AkshareFundamentalAdapter, UsSecFundamentalAdapter
+from .fundamental_adapter import (
+    AkshareFundamentalAdapter,
+    HkYfinanceFundamentalAdapter,
+    UsSecFundamentalAdapter,
+)
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -139,7 +143,7 @@ def _is_hk_market(code: str) -> bool:
     if normalized.startswith("HK"):
         digits = normalized[2:]
         return digits.isdigit() and 1 <= len(digits) <= 5
-    if normalized.isdigit() and len(normalized) == 5:
+    if normalized.isdigit() and 1 <= len(normalized) <= 5:
         return True
     return False
 
@@ -496,6 +500,7 @@ class DataFetcherManager:
             # 默认数据源将在首次使用时延迟加载
             self._init_default_fetchers()
         self._fundamental_adapter = AkshareFundamentalAdapter()
+        self._hk_fundamental_adapter = HkYfinanceFundamentalAdapter()
         self._us_fundamental_adapter = UsSecFundamentalAdapter()
         self._fundamental_cache: Dict[str, Dict[str, Any]] = {}
         self._fundamental_cache_lock = RLock()
@@ -979,21 +984,32 @@ class DataFetcherManager:
             return None
 
         # 港股实时行情只走港股专用入口，避免按 A 股 source_priority
-        # 反复触发同一个 ak.stock_hk_spot_em() 接口。
+        # 反复触发无关数据源。优先使用更稳定的 Yfinance，再回退 Akshare 港股接口。
         if _is_hk_market(stock_code):
-            for fetcher in self._fetchers:
-                if fetcher.name != "AkshareFetcher":
+            ordered_fetchers = sorted(
+                self._fetchers,
+                key=lambda fetcher: (
+                    0 if fetcher.name == "YfinanceFetcher"
+                    else 1 if fetcher.name == "AkshareFetcher"
+                    else 2
+                ),
+            )
+            for fetcher in ordered_fetchers:
+                if fetcher.name not in {"YfinanceFetcher", "AkshareFetcher"}:
                     continue
                 if not hasattr(fetcher, 'get_realtime_quote'):
-                    break
+                    continue
                 try:
-                    quote = fetcher.get_realtime_quote(stock_code, source="hk")
+                    if fetcher.name == "AkshareFetcher":
+                        quote = fetcher.get_realtime_quote(stock_code, source="hk")
+                    else:
+                        quote = fetcher.get_realtime_quote(stock_code)
                     if quote is not None and quote.has_basic_data():
-                        logger.info(f"[实时行情] 港股 {stock_code} 成功获取 (来源: akshare_hk)")
+                        source_name = "yfinance_hk" if fetcher.name == "YfinanceFetcher" else "akshare_hk"
+                        logger.info(f"[实时行情] 港股 {stock_code} 成功获取 (来源: {source_name})")
                         return quote
                 except Exception as e:
-                    logger.warning(f"[实时行情] 港股 {stock_code} 获取失败: {e}")
-                break
+                    logger.warning(f"[实时行情] 港股 {stock_code} 获取失败 ({fetcher.name}): {e}")
 
             logger.warning(f"[实时行情] 港股 {stock_code} 无可用数据源")
             return None
@@ -1232,7 +1248,7 @@ class DataFetcherManager:
 
         # 3. 依次尝试各个数据源
         fetchers = list(self._fetchers)
-        if _market_tag(stock_code) == "us":
+        if _market_tag(stock_code) in {"us", "hk"}:
             fetchers.sort(key=lambda fetcher: 0 if fetcher.name == "YfinanceFetcher" else 1)
 
         for fetcher in fetchers:
@@ -1855,17 +1871,21 @@ class DataFetcherManager:
                     bundle_errors = [bundle_err_msg] if bundle_err_msg else []
             else:
                 bundle_provider_name = "hk_fundamental_bundle"
-                bundle_ms = 0
-                bundle_status = "not_supported"
-                bundle_payload = {
-                    "status": "not_supported",
-                    "growth": {},
-                    "earnings": {},
-                    "institution": {},
-                    "source_chain": [],
-                    "errors": ["structured hk fundamental not supported"],
-                }
-                bundle_errors = []
+                bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
+                    lambda: self._hk_fundamental_adapter.get_fundamental_bundle(stock_code),
+                    bundle_timeout,
+                    "hk_fundamental_bundle",
+                )
+                _consume_budget(bundle_ms)
+                if not isinstance(bundle_payload, dict):
+                    bundle_status = "failed"
+                    bundle_payload = {}
+                    bundle_errors = ["hk_fundamental_bundle failed"]
+                    if bundle_err_msg:
+                        bundle_errors.append(bundle_err_msg)
+                else:
+                    bundle_status = str(bundle_payload.get("status", "not_supported"))
+                    bundle_errors = [bundle_err_msg] if bundle_err_msg else []
 
         bundle_chain = self._normalize_source_chain(
             bundle_payload.get("source_chain", []),

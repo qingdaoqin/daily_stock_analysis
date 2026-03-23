@@ -115,7 +115,7 @@ def _is_hk_code(stock_code: str) -> bool:
     判断代码是否为港股
 
     港股代码规则：
-    - 5位数字代码，如 '00700' (腾讯控股)
+    - 1-5 位数字代码，如 '700' / '0700' / '00700' (腾讯控股)
     - 部分港股代码可能带有前缀，如 'hk00700', 'hk1810'
 
     Args:
@@ -133,8 +133,8 @@ def _is_hk_code(stock_code: str) -> bool:
         # 带 hk 前缀的一定是港股，去掉前缀后应为纯数字（1-5位）
         numeric_part = code[2:]
         return numeric_part.isdigit() and 1 <= len(numeric_part) <= 5
-    # 无前缀时，5位纯数字才视为港股（避免误判 A 股代码）
-    return code.isdigit() and len(code) == 5
+    # 无前缀时，1-5 位纯数字都视为港股；A 股代码固定为 6 位，不会冲突。
+    return code.isdigit() and 1 <= len(code) <= 5
 
 
 def is_hk_stock_code(stock_code: str) -> bool:
@@ -144,7 +144,7 @@ def is_hk_stock_code(stock_code: str) -> bool:
     Delegates to _is_hk_code for internal compatibility.
 
     Args:
-        stock_code: Stock code (e.g. '00700', 'hk00700')
+        stock_code: Stock code (e.g. '700', '00700', 'hk00700')
 
     Returns:
         True if HK stock, False otherwise

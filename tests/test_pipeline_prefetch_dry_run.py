@@ -52,6 +52,14 @@ class TestPipelinePrefetchBehavior(unittest.TestCase):
             ["000001"], use_bulk=False
         )
 
+    def test_run_dry_run_counts_process_results_instead_of_today_data(self):
+        pipeline = self._build_pipeline(process_result=SimpleNamespace(code="AAPL", success=True))
+
+        with self.assertLogs("src.core.pipeline", level="INFO") as logs:
+            pipeline.run(stock_codes=["AAPL"], dry_run=True, send_notification=False)
+
+        self.assertTrue(any("成功: 1, 失败: 0" in message for message in logs.output))
+
 
 if __name__ == "__main__":
     unittest.main()

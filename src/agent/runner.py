@@ -168,7 +168,10 @@ def parse_dashboard_json(content: str) -> Optional[Dict[str, Any]]:
     if not content:
         return None
 
-    from json_repair import repair_json
+    try:
+        from json_repair import repair_json
+    except Exception:
+        repair_json = None
 
     # Strategy 1: markdown code blocks
     json_blocks = re.findall(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
@@ -177,9 +180,10 @@ def parse_dashboard_json(content: str) -> Optional[Dict[str, Any]]:
             parsed = _try_parse_json(block)
             if parsed is not None:
                 return parsed
-            parsed = _try_repair_json(block, repair_json)
-            if parsed is not None:
-                return parsed
+            if repair_json is not None:
+                parsed = _try_repair_json(block, repair_json)
+                if parsed is not None:
+                    return parsed
 
     # Strategy 2: raw parse
     parsed = _try_parse_json(content)
@@ -187,9 +191,10 @@ def parse_dashboard_json(content: str) -> Optional[Dict[str, Any]]:
         return parsed
 
     # Strategy 3: json_repair on full content
-    parsed = _try_repair_json(content, repair_json)
-    if parsed is not None:
-        return parsed
+    if repair_json is not None:
+        parsed = _try_repair_json(content, repair_json)
+        if parsed is not None:
+            return parsed
 
     # Strategy 4: brace-delimited
     brace_start = content.find("{")
@@ -199,9 +204,10 @@ def parse_dashboard_json(content: str) -> Optional[Dict[str, Any]]:
         parsed = _try_parse_json(candidate)
         if parsed is not None:
             return parsed
-        parsed = _try_repair_json(candidate, repair_json)
-        if parsed is not None:
-            return parsed
+        if repair_json is not None:
+            parsed = _try_repair_json(candidate, repair_json)
+            if parsed is not None:
+                return parsed
 
     logger.warning("Failed to parse dashboard JSON from agent response")
     return None
@@ -259,6 +265,14 @@ def try_parse_json(text: str) -> Optional[Dict[str, Any]]:
             if isinstance(obj, dict):
                 return obj
         except (json.JSONDecodeError, ValueError):
+            repaired_candidate = _repair_common_json_issues(candidate)
+            if repaired_candidate != candidate:
+                try:
+                    obj = json.loads(repaired_candidate)
+                    if isinstance(obj, dict):
+                        return obj
+                except (json.JSONDecodeError, ValueError):
+                    continue
             continue
 
     try:
@@ -286,6 +300,14 @@ def _try_repair_json(text: str, repair_fn: Callable) -> Optional[Dict[str, Any]]
         return obj if isinstance(obj, dict) else None
     except Exception:
         return None
+
+
+def _repair_common_json_issues(text: str) -> str:
+    """Apply a tiny set of safe repairs when json_repair is unavailable."""
+    if not text:
+        return text
+    repaired = re.sub(r",(\s*[}\]])", r"\1", text)
+    return repaired
 
 
 # ============================================================

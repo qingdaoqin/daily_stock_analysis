@@ -184,6 +184,42 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(result["institution"]["insider_form4_count_90d"], 1)
         self.assertEqual(result["institution"]["ownership_disclosure_count_180d"], 1)
 
+    def test_us_sec_adapter_extracts_china_exposure_from_filing_text(self) -> None:
+        adapter = UsSecFundamentalAdapter()
+        recent_10k = "2026-02-01"
+        submissions = {
+            "cik": "1045810",
+            "filings": {
+                "recent": {
+                    "form": ["10-K"],
+                    "filingDate": [recent_10k],
+                    "accessionNumber": ["0001045810-26-000001"],
+                    "primaryDocument": ["annual.htm"],
+                }
+            },
+        }
+        filing_text = """
+        <html><body>
+        Greater China revenue remained material during the fiscal year.
+        Our supply chain and manufacturing partners in China continued to support production.
+        Export controls affecting China remained a material risk factor.
+        </body></html>
+        """
+
+        with patch.object(
+            adapter,
+            "_load_ticker_map",
+            return_value={"NVDA": {"cik": "0001045810", "title": "NVIDIA Corporation"}},
+        ), patch.object(adapter, "_get_json", return_value=submissions), \
+                patch.object(adapter, "_get_text", return_value=filing_text):
+            result = adapter.get_china_exposure_summary("NVDA")
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["level"], "high")
+        self.assertIn("revenue", result["signals"])
+        self.assertIn("supply_chain", result["signals"])
+        self.assertTrue(result["evidence"])
+
 
 if __name__ == "__main__":
     unittest.main()

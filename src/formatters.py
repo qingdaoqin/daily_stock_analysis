@@ -8,9 +8,13 @@
 """
 
 import re
+import html
 from typing import List
 
-import markdown2
+try:
+    import markdown2
+except Exception:  # pragma: no cover - optional dependency in tests
+    markdown2 = None
 
 TRUNCATION_SUFFIX = "\n\n...(本段内容过长已截断)"
 PAGE_MARKER_PREFIX = f"\n\n📄"
@@ -108,10 +112,14 @@ def markdown_to_html_document(markdown_text: str) -> str:
     Returns:
         Full HTML document string with DOCTYPE, head, and body.
     """
-    html_content = markdown2.markdown(
-        markdown_text,
-        extras=["tables", "fenced-code-blocks", "break-on-newline", "cuddled-lists"],
-    )
+    if markdown2 is not None:
+        html_content = markdown2.markdown(
+            markdown_text,
+            extras=["tables", "fenced-code-blocks", "break-on-newline", "cuddled-lists"],
+        )
+    else:
+        escaped = html.escape(markdown_text or "")
+        html_content = escaped.replace("\n", "<br/>\n")
 
     css_style = """
             body {

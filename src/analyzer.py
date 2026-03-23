@@ -17,12 +17,21 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 
-import litellm
-from json_repair import repair_json
-from litellm import Router
+try:
+    import litellm
+    from litellm import Router
+except Exception:  # pragma: no cover - optional dependency
+    litellm = None
+    Router = None
+
+try:
+    from json_repair import repair_json
+except Exception:  # pragma: no cover - optional dependency
+    repair_json = None
 
 from src.agent.llm_adapter import get_thinking_extra_body
 from src.config import Config, get_config, get_api_keys_for_model, extra_litellm_params, get_configured_llm_models
+from src.core.trading_calendar import get_market_for_stock
 from src.storage import persist_llm_usage
 from src.data.stock_mapping import STOCK_NAME_MAP
 from src.schemas.report_schema import AnalysisReportSchema
@@ -496,7 +505,15 @@ class GeminiAnalyzer:
     # 核心模块：核心结论 + 数据透视 + 舆情情报 + 作战计划
     # ========================================
 
-    SYSTEM_PROMPT = """你是一位专注于趋势交易的 A 股投资分析师，负责生成专业的【决策仪表盘】分析报告。
+    SYSTEM_PROMPT = """你是一位专注于趋势交易的全球股票投资分析师，负责为 A 股、港股和美股生成专业的【决策仪表盘】分析报告。
+
+## 市场适配原则（必须严格遵守）
+
+- 先阅读提示中的【市场规则与政策权重】区块，再决定该标的使用 A 股、港股还是美股逻辑，严禁混用。
+- A股：优先使用交易所/巨潮公告、业绩预告、监管动态、资金流和产业政策，国内政策本身就是核心变量。
+- 港股：优先使用 HKEX 公告、业绩公告、配股/回购/分红安排，再结合南向资金和内地业务暴露判断。
+- 美股：优先使用 SEC 披露、财报电话会、公司指引、诉讼与估值；只有当 `China exposure` 明确时，才提高中国政策权重。
+- 若提示中写明“中国政策权重低/谨慎使用”，不得把中国政策当成核心结论来源。
 
 ## 核心交易理念（必须严格遵守）
 
@@ -524,11 +541,9 @@ class GeminiAnalyzer:
 - **观望情况**：跌破 MA20 时观望
 
 ### 5. 风险排查重点
-- 减持公告（股东、高管减持）
-- 业绩预亏/大幅下滑
-- 监管处罚/立案调查
-- 行业政策利空
-- 大额解禁
+- A股：减持公告、业绩预亏、监管处罚、大额解禁、产业政策变化
+- 港股：profit warning、配股摊薄、融资安排、回购变化、监管调查
+- 美股：SEC 重大披露、guidance 下修、insider selling、诉讼/调查、关税/出口管制
 
 ### 6. 估值关注（PE/PB）
 - 分析时请关注市盈率（PE）是否合理
@@ -702,6 +717,9 @@ class GeminiAnalyzer:
 
     def _init_litellm(self) -> None:
         """Initialize litellm Router from channels / YAML / legacy keys."""
+        if litellm is None or Router is None:
+            logger.warning("Analyzer LLM: litellm not installed")
+            return
         config = get_config()
         litellm_model = config.litellm_model
         if not litellm_model:
@@ -1059,6 +1077,7 @@ class GeminiAnalyzer:
             stock_name = STOCK_NAME_MAP.get(code, f'股票{code}')
             
         today = context.get('today', {})
+        market_context_block = self._build_market_context_block(context)
         
         # ========== 构建决策仪表盘格式的输入 ==========
         prompt = f"""# 决策仪表盘分析请求
@@ -1069,6 +1088,10 @@ class GeminiAnalyzer:
 | 股票代码 | **{code}** |
 | 股票名称 | **{stock_name}** |
 | 分析日期 | {context.get('date', '未知')} |
+
+---
+
+{market_context_block}
 
 ---
 
@@ -1213,12 +1236,7 @@ class GeminiAnalyzer:
 正确的股票名称格式为“股票名称（股票代码）”，例如“贵州茅台（600519）”。
 如果上方显示的股票名称为"股票{code}"或不正确，请在分析开头**明确输出该股票的正确中文全称**。
 
-### 重点关注（必须明确回答）：
-1. ❓ 是否满足 MA5>MA10>MA20 多头排列？
-2. ❓ 当前乖离率是否在安全范围内（<5%）？—— 超过5%必须标注"严禁追高"
-3. ❓ 量能是否配合（缩量回调/放量突破）？
-4. ❓ 筹码结构是否健康？
-5. ❓ 消息面有无重大利空？（减持、处罚、业绩变脸等）
+{self._build_market_focus_questions(context)}
 
 ### 决策仪表盘要求：
 - **股票名称**：必须输出正确的中文全称（如"贵州茅台"而非"股票600519"）
@@ -1270,6 +1288,66 @@ class GeminiAnalyzer:
             return f"{float(value):.2f}"
         except (TypeError, ValueError):
             return 'N/A'
+
+    @staticmethod
+    def _market_label(market: str) -> str:
+        return {
+            "cn": "A股",
+            "hk": "港股",
+            "us": "美股",
+        }.get(market, market or "未知市场")
+
+    def _resolve_market_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Return market metadata injected by pipeline, or infer a minimal fallback."""
+        market_context = context.get("market_context")
+        if isinstance(market_context, dict) and market_context.get("market"):
+            return market_context
+        market = get_market_for_stock(context.get("code", "")) or "cn"
+        return {
+            "market": market,
+            "market_label": self._market_label(market),
+        }
+
+    def _build_market_context_block(self, context: Dict[str, Any]) -> str:
+        """Build a compact market-specific guidance block for the analysis prompt."""
+        market_context = self._resolve_market_context(context)
+        lines = [
+            "## 🌍 市场规则与政策权重",
+            f"- 当前市场：{market_context.get('market_label', '未知')}",
+            f"- 官方优先源：{market_context.get('official_source_priority', '按市场默认源处理')}",
+            f"- 分析主线：{market_context.get('analysis_focus', '按市场主线处理')}",
+            f"- 政策口径：{market_context.get('policy_scope', '未指定')}",
+        ]
+        china_exposure = market_context.get("china_exposure")
+        if isinstance(china_exposure, dict):
+            lines.append(f"- China exposure：{china_exposure.get('level_label', '未知')}")
+            lines.append(f"- 中国政策权重：{china_exposure.get('policy_weight_label', '谨慎使用')}")
+            lines.append(f"- 判定依据：{china_exposure.get('reasoning', '未提供')}")
+        return "\n".join(lines)
+
+    def _build_market_focus_questions(self, context: Dict[str, Any]) -> str:
+        """Return market-aware checklist questions for the LLM."""
+        market = self._resolve_market_context(context).get("market", "cn")
+        if market == "us":
+            return """### 重点关注（必须明确回答）：
+1. ❓ SEC/财报/公司指引是否出现超预期或下修？
+2. ❓ `China exposure` 是高/中/低？中国政策是否应该成为核心因子，还是只能低权重引用？
+3. ❓ 是否存在 insider selling、诉讼、监管调查、short interest 或 put/call 异动？
+4. ❓ 估值与业绩增速是否匹配？消息面会不会改变估值锚？
+5. ❓ 技术面是否支持追踪或入场（多头排列、乖离率、量能）？"""
+        if market == "hk":
+            return """### 重点关注（必须明确回答）：
+1. ❓ HKEX 公告里是否有业绩、profit warning、配股、回购或分红等关键事项？
+2. ❓ 公司对内地业务/客户/资产是否敏感？内地政策该给多高权重？
+3. ❓ 是否存在融资摊薄、诉讼调查或明显的盈利下修风险？
+4. ❓ 行业景气、南向资金和估值是否支持当前仓位判断？
+5. ❓ 技术面是否支持追踪或入场（多头排列、乖离率、量能）？"""
+        return """### 重点关注（必须明确回答）：
+1. ❓ 是否满足 MA5>MA10>MA20 多头排列？
+2. ❓ 当前乖离率是否在安全范围内（<5%）？超过5%必须标注“严禁追高”
+3. ❓ 量能是否配合（缩量回调/放量突破）？
+4. ❓ 筹码结构是否健康？
+5. ❓ 消息面有无重大利空？（减持、处罚、业绩变脸、政策利空等）"""
 
     def _build_market_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """构建当日行情快照（展示用）"""
@@ -1484,9 +1562,10 @@ class GeminiAnalyzer:
         # 确保布尔值是小写
         json_str = json_str.replace('True', 'true').replace('False', 'false')
         
-        # fix by json-repair
-        json_str = repair_json(json_str)
-        
+        # fix by json-repair when available
+        if repair_json is not None:
+            json_str = repair_json(json_str)
+
         return json_str
     
     def _parse_text_response(

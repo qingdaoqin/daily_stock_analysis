@@ -336,6 +336,66 @@ class TestPipelineRouting(unittest.TestCase):
             # trend_result (8th arg) should be present (may be a TrendAnalysisResult or None)
             self.assertEqual(len(call_args[0]), 8)
 
+    def test_agent_mode_prefetches_market_intel_for_agent_context(self):
+        with patch('src.core.pipeline.get_config') as mock_config, \
+             patch('src.core.pipeline.get_db'), \
+             patch('src.core.pipeline.DataFetcherManager'), \
+             patch('src.core.pipeline.GeminiAnalyzer'), \
+             patch('src.core.pipeline.NotificationService'), \
+             patch('src.core.pipeline.SearchService'):
+
+            from src.search_service import SearchResponse, SearchResult
+
+            mock_cfg = MagicMock()
+            mock_cfg.max_workers = 2
+            mock_cfg.agent_mode = True
+            mock_cfg.agent_max_steps = 5
+            mock_cfg.agent_skills = []
+            mock_cfg.bocha_api_keys = []
+            mock_cfg.tavily_api_keys = []
+            mock_cfg.brave_api_keys = []
+            mock_cfg.serpapi_keys = []
+            mock_cfg.searxng_base_urls = []
+            mock_cfg.news_max_age_days = 7
+            mock_cfg.enable_realtime_quote = True
+            mock_cfg.enable_chip_distribution = True
+            mock_cfg.realtime_source_priority = []
+            mock_cfg.save_context_snapshot = False
+            mock_config.return_value = mock_cfg
+
+            from src.core.pipeline import StockAnalysisPipeline
+            from src.enums import ReportType
+
+            pipeline = StockAnalysisPipeline(config=mock_cfg)
+            pipeline._analyze_with_agent = MagicMock(return_value=None)
+            pipeline.search_service.can_run_comprehensive_intel.return_value = True
+            intel_results = {
+                "official_filings": SearchResponse(
+                    query="sec",
+                    results=[
+                        SearchResult(
+                            title="Apple 10-Q filed",
+                            snippet="SEC filing",
+                            url="https://www.sec.gov/example",
+                            source="sec.gov",
+                            published_date="2026-03-01",
+                        )
+                    ],
+                    provider="SEC",
+                    success=True,
+                )
+            }
+            pipeline.search_service.search_comprehensive_intel.return_value = intel_results
+            pipeline.search_service.build_market_intel_summary.return_value = {"market": "us", "market_label": "美股"}
+            pipeline.search_service.format_intel_report.return_value = "intel report"
+
+            pipeline.analyze_stock("AAPL", ReportType.SIMPLE, "q-agent-intel")
+
+            kwargs = pipeline._analyze_with_agent.call_args.kwargs
+            self.assertEqual(kwargs["news_context"], "intel report")
+            self.assertEqual(kwargs["intel_results"], intel_results)
+            self.assertEqual(kwargs["market_context"]["market"], "us")
+
     def test_legacy_mode_does_not_call_agent(self):
         """When agent_mode=False, analyze_stock should NOT call _analyze_with_agent."""
         with patch('src.core.pipeline.get_config') as mock_config, \

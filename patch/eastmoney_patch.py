@@ -7,13 +7,35 @@ import requests
 import json
 import uuid
 import logging
-from fake_useragent import UserAgent
+try:
+    from fake_useragent import UserAgent
+except Exception:  # pragma: no cover - optional dependency
+    UserAgent = None
 
 logger = logging.getLogger(__name__)
 
 original_request = requests.Session.request
 
-ua = UserAgent()
+_FALLBACK_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+]
+ua = UserAgent() if UserAgent is not None else None
+
+
+def _pick_user_agent() -> str:
+    if ua is not None:
+        try:
+            candidate = ua.random
+            if candidate:
+                return candidate
+        except Exception:
+            logger.debug("fake_useragent unavailable at runtime, fallback to static UA")
+    return random.choice(_FALLBACK_USER_AGENTS)
 
 
 class AuthCache:
@@ -164,7 +186,7 @@ def eastmoney_patch():
         if not is_target:
             return original_request(self, method, url, **kwargs)
         # 获取一个随机的 User-Agent
-        user_agent = ua.random
+        user_agent = _pick_user_agent()
         # 处理 Headers：确保不破坏业务代码传入的 headers
         headers = kwargs.get("headers", {})
         headers["User-Agent"] = user_agent

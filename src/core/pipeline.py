@@ -275,6 +275,76 @@ class StockAnalysisPipeline:
             except Exception as e:
                 logger.warning(f"{stock_name}({code}) 趋势分析失败: {e}", exc_info=True)
 
+            market_intel_summary: Dict[str, Any] = {}
+            try:
+                market_intel_summary = self.search_service.build_market_intel_summary(
+                    code,
+                    stock_name,
+                    {},
+                )
+            except Exception as e:
+                logger.debug(f"{stock_name}({code}) 构建市场摘要失败，使用兜底标签: {e}")
+            if not isinstance(market_intel_summary, dict):
+                market_tag = get_market_for_stock(code) or "cn"
+                market_intel_summary = {
+                    "market": market_tag,
+                    "market_label": {
+                        "cn": "A股",
+                        "hk": "港股",
+                        "us": "美股",
+                    }.get(market_tag, market_tag),
+                }
+
+            # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
+            news_context = None
+            intel_results: Dict[str, Any] = {}
+            if self.search_service.can_run_comprehensive_intel(code):
+                logger.info(f"{stock_name}({code}) 开始多维度情报搜索...")
+                try:
+                    intel_results = self.search_service.search_comprehensive_intel(
+                        stock_code=code,
+                        stock_name=stock_name,
+                        max_searches=8
+                    )
+
+                    if isinstance(intel_results, dict) and intel_results:
+                        market_intel_summary = self.search_service.build_market_intel_summary(
+                            code,
+                            stock_name,
+                            intel_results,
+                        )
+                        news_context = self.search_service.format_intel_report(
+                            intel_results,
+                            stock_name,
+                            stock_code=code,
+                        )
+                        total_results = sum(
+                            len(r.results) for r in intel_results.values() if r.success
+                        )
+                        logger.info(f"{stock_name}({code}) 情报搜索完成: 共 {total_results} 条结果")
+                        logger.debug(f"{stock_name}({code}) 情报搜索结果:\n{news_context}")
+
+                        try:
+                            query_context = self._build_query_context(query_id=query_id)
+                            for dim_name, response in intel_results.items():
+                                if response and response.success and response.results:
+                                    self.db.save_news_intel(
+                                        code=code,
+                                        name=stock_name,
+                                        dimension=dim_name,
+                                        query=response.query,
+                                        response=response,
+                                        query_context=query_context
+                                    )
+                        except Exception as e:
+                            logger.warning(f"{stock_name}({code}) 保存新闻情报失败: {e}")
+                    else:
+                        intel_results = {}
+                except Exception as e:
+                    logger.warning(f"{stock_name}({code}) 多维度情报搜索失败: {e}")
+            else:
+                logger.info(f"{stock_name}({code}) 无可用情报源，跳过情报搜索")
+
             if use_agent:
                 logger.info(f"{stock_name}({code}) 启用 Agent 模式进行分析")
                 return self._analyze_with_agent(
@@ -286,46 +356,10 @@ class StockAnalysisPipeline:
                     chip_data,
                     fundamental_context,
                     trend_result,
+                    market_context=market_intel_summary,
+                    news_context=news_context,
+                    intel_results=intel_results,
                 )
-
-            # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
-            news_context = None
-            if self.search_service.is_available:
-                logger.info(f"{stock_name}({code}) 开始多维度情报搜索...")
-
-                # 使用多维度搜索（最多5次搜索）
-                intel_results = self.search_service.search_comprehensive_intel(
-                    stock_code=code,
-                    stock_name=stock_name,
-                    max_searches=6
-                )
-
-                # 格式化情报报告
-                if intel_results:
-                    news_context = self.search_service.format_intel_report(intel_results, stock_name)
-                    total_results = sum(
-                        len(r.results) for r in intel_results.values() if r.success
-                    )
-                    logger.info(f"{stock_name}({code}) 情报搜索完成: 共 {total_results} 条结果")
-                    logger.debug(f"{stock_name}({code}) 情报搜索结果:\n{news_context}")
-
-                    # 保存新闻情报到数据库（用于后续复盘与查询）
-                    try:
-                        query_context = self._build_query_context(query_id=query_id)
-                        for dim_name, response in intel_results.items():
-                            if response and response.success and response.results:
-                                self.db.save_news_intel(
-                                    code=code,
-                                    name=stock_name,
-                                    dimension=dim_name,
-                                    query=response.query,
-                                    response=response,
-                                    query_context=query_context
-                                )
-                    except Exception as e:
-                        logger.warning(f"{stock_name}({code}) 保存新闻情报失败: {e}")
-            else:
-                logger.info(f"{stock_name}({code}) 搜索服务不可用，跳过情报搜索")
 
             # Step 5: 获取分析上下文（技术面数据）
             context = self.db.get_analysis_context(code)
@@ -349,6 +383,7 @@ class StockAnalysisPipeline:
                 trend_result,
                 stock_name,  # 传入股票名称
                 fundamental_context,
+                market_context=market_intel_summary,
             )
             
             # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
@@ -403,7 +438,8 @@ class StockAnalysisPipeline:
         chip_data: Optional[ChipDistribution],
         trend_result: Optional[TrendAnalysisResult],
         stock_name: str = "",
-        fundamental_context: Optional[Dict[str, Any]] = None
+        fundamental_context: Optional[Dict[str, Any]] = None,
+        market_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         增强分析上下文
@@ -544,6 +580,22 @@ class StockAnalysisPipeline:
             context.get('code', ''), enhanced.get('stock_name', stock_name)
         )
 
+        market_tag = get_market_for_stock(context.get('code', '')) or "cn"
+        fallback_market_context = {
+            "market": market_tag,
+            "market_label": {
+                "cn": "A股",
+                "hk": "港股",
+                "us": "美股",
+            }.get(market_tag, market_tag),
+        }
+        enhanced["market_context"] = (
+            market_context
+            if isinstance(market_context, dict) and market_context
+            else fallback_market_context
+        )
+        enhanced["market"] = enhanced["market_context"].get("market", market_tag)
+
         # P0: append unified fundamental block; keep as additional context only
         enhanced["fundamental_context"] = (
             fundamental_context
@@ -566,6 +618,9 @@ class StockAnalysisPipeline:
         chip_data: Optional[ChipDistribution],
         fundamental_context: Optional[Dict[str, Any]] = None,
         trend_result: Optional[TrendAnalysisResult] = None,
+        market_context: Optional[Dict[str, Any]] = None,
+        news_context: Optional[str] = None,
+        intel_results: Optional[Dict[str, Any]] = None,
     ) -> Optional[AnalysisResult]:
         """
         使用 Agent 模式分析单只股票。
@@ -583,6 +638,32 @@ class StockAnalysisPipeline:
                 "report_type": report_type.value,
                 "fundamental_context": fundamental_context,
             }
+            if isinstance(market_context, dict) and market_context:
+                initial_context["market_context"] = market_context
+            if news_context:
+                initial_context["news_context"] = news_context
+                initial_context["intel_report"] = news_context
+            if isinstance(intel_results, dict) and intel_results:
+                initial_context["intel_dimensions"] = {
+                    dim_name: {
+                        "query": getattr(response, "query", ""),
+                        "provider": getattr(response, "provider", ""),
+                        "success": getattr(response, "success", False),
+                        "error_message": getattr(response, "error_message", None),
+                        "results": [
+                            {
+                                "title": getattr(item, "title", ""),
+                                "snippet": getattr(item, "snippet", ""),
+                                "url": getattr(item, "url", ""),
+                                "source": getattr(item, "source", ""),
+                                "published_date": getattr(item, "published_date", None),
+                            }
+                            for item in getattr(response, "results", [])[:4]
+                        ],
+                        "metadata": getattr(response, "metadata", {}),
+                    }
+                    for dim_name, response in intel_results.items()
+                }
             
             if realtime_quote:
                 initial_context["realtime_quote"] = self._safe_to_dict(realtime_quote)
@@ -620,9 +701,8 @@ class StockAnalysisPipeline:
 
             resolved_stock_name = result.name if result and result.name else stock_name
 
-            # 保存新闻情报到数据库（Agent 工具结果仅用于 LLM 上下文，未持久化，Fixes #396）
-            # 使用 search_stock_news（与 Agent 工具调用逻辑一致），仅 1 次 API 调用，无额外延迟
-            if self.search_service.is_available:
+            # 兼容旧路径：若本轮未预取情报，则至少持久化一轮新闻搜索结果。
+            if not intel_results and self.search_service.is_available:
                 try:
                     news_response = self.search_service.search_stock_news(
                         stock_code=code,
@@ -994,7 +1074,26 @@ class StockAnalysisPipeline:
             # Step 2: AI 分析
             if skip_analysis:
                 logger.info(f"[{code}] 跳过 AI 分析（dry-run 模式）")
-                return None
+                if not success:
+                    return None
+
+                display_name = STOCK_NAME_MAP.get(code)
+                if not display_name:
+                    try:
+                        display_name = self.fetcher_manager.get_stock_name(code, allow_realtime=False)
+                    except Exception:
+                        display_name = ""
+
+                return AnalysisResult(
+                    code=code,
+                    name=display_name or code,
+                    sentiment_score=0,
+                    trend_prediction="未分析",
+                    operation_advice="仅拉取数据",
+                    analysis_summary="dry-run 模式，仅验证数据链路。",
+                    data_sources="dry-run",
+                    success=True,
+                )
             
             effective_query_id = analysis_query_id or self.query_id or uuid.uuid4().hex
             result = self.analyze_stock(code, report_type, query_id=effective_query_id)
@@ -1149,8 +1248,7 @@ class StockAnalysisPipeline:
         
         # dry-run 模式下，数据获取成功即视为成功
         if dry_run:
-            # 检查哪些股票的数据今天已存在
-            success_count = sum(1 for code in stock_codes if self.db.has_today_data(code))
+            success_count = sum(1 for result in results if getattr(result, "success", False))
             fail_count = len(stock_codes) - success_count
         else:
             success_count = len(results)

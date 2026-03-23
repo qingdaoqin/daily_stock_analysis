@@ -12,8 +12,12 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-import litellm
-from litellm import Router
+try:
+    import litellm
+    from litellm import Router
+except Exception:  # pragma: no cover - optional dependency
+    litellm = None
+    Router = None
 
 from src.config import get_config, get_api_keys_for_model, extra_litellm_params, get_configured_llm_models
 
@@ -119,6 +123,9 @@ class LLMToolAdapter:
 
     def _init_litellm(self) -> None:
         """Initialize litellm Router from channels / YAML / legacy keys."""
+        if litellm is None or Router is None:
+            logger.warning("Agent LLM: litellm not installed")
+            return
         config = self._config
         litellm_model = config.litellm_model
         if not litellm_model:

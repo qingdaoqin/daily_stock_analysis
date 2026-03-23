@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Market strategy blueprints for CN/US daily market recap."""
+"""Market strategy blueprints for CN/HK/US daily market recap."""
 
 from dataclasses import dataclass
 from typing import List
@@ -129,7 +129,56 @@ US_BLUEPRINT = MarketStrategyBlueprint(
     ],
 )
 
+HK_BLUEPRINT = MarketStrategyBlueprint(
+    region="hk",
+    title="港股跨市场联动复盘策略",
+    positioning="聚焦恒生主指数、南向资金与公司融资/分红安排，判断次日港股风险偏好。",
+    principles=[
+        "先看恒生指数、恒生国企指数、恒生科技指数是否共振，再看内地与海外政策传导。",
+        "把业绩、配股、回购、分红和南向资金放在同一框架下解释，不单靠宏观叙事。",
+        "结论必须落到仓位、催化、失效条件三件事上。",
+    ],
+    dimensions=[
+        StrategyDimension(
+            name="指数结构",
+            objective="判断港股当前是风险偏好修复、震荡还是防守。",
+            checkpoints=[
+                "恒指、国企指数、恒生科技是否同向",
+                "科技权重股是否主导涨跌",
+                "关键指数位是否被收复或跌破",
+            ],
+        ),
+        StrategyDimension(
+            name="跨境资金",
+            objective="识别港股的流动性与政策传导强弱。",
+            checkpoints=[
+                "南向资金是否持续净流入/流出",
+                "美元、利率与离岸风险偏好是否压制估值",
+                "内地政策是否真正对应公司主业暴露",
+            ],
+        ),
+        StrategyDimension(
+            name="公司事件",
+            objective="筛出影响港股风格切换的关键公司层催化。",
+            checkpoints=[
+                "HKEX 是否披露业绩、profit warning、配股、回购或分红",
+                "平台、地产、金融等权重板块是否有监管或融资新变量",
+                "龙头公司公告是否带动板块扩散",
+            ],
+        ),
+    ],
+    action_framework=[
+        "进攻：指数共振修复 + 南向支持 + 权重股公告偏正面。",
+        "均衡：指数震荡、资金犹豫，优先看事件驱动而非全面进攻。",
+        "防守：指数走弱 + 融资/监管压力上升，避免接飞刀。",
+    ],
+)
+
 
 def get_market_strategy_blueprint(region: str) -> MarketStrategyBlueprint:
     """Return strategy blueprint by market region."""
-    return US_BLUEPRINT if region == "us" else CN_BLUEPRINT
+    if region == "us":
+        return US_BLUEPRINT
+    if region == "hk":
+        return HK_BLUEPRINT
+    return CN_BLUEPRINT

@@ -11,6 +11,7 @@ Responsible for:
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Optional
 
@@ -39,18 +40,18 @@ Your task: gather the latest news, announcements, and risk signals for \
 the given stock, then produce a structured JSON opinion.
 
 ## Workflow
-1. Search latest stock news (earnings, announcements, insider activity)
-2. If available, run comprehensive intel search for deeper context
-3. Classify positive catalysts and risk alerts
+1. Read pre-fetched `market_context`, `intel_report`, and direct official intel first.
+2. Run `search_comprehensive_intel` when you need deeper or fresher context.
+3. Use `search_stock_news` only as a supplement, not as the primary source.
+4. Classify positive catalysts and risk alerts using the correct market logic.
 4. Assess overall sentiment
 
 ## Risk Detection Priorities
-- Insider / major shareholder sell-downs (减持)
-- Earnings warnings or pre-loss announcements (业绩预亏)
-- Regulatory penalties or investigations
-- Industry-wide policy headwinds
-- Large lock-up expirations (解禁)
-- PE valuation anomalies
+- A-shares: 减持、解禁、业绩预亏、监管处罚、政策利空
+- HK equities: HKEX results / profit warning / placement / buyback / dividend
+- US equities: SEC filings, guidance, litigation, Form 4 / 13D / 13G, analyst and earnings reset
+- For US names, Chinese policy should only be highlighted when `market_context.china_exposure`
+  shows real revenue / supply-chain / policy transmission.
 
 ## Output Format
 Return **only** a JSON object:
@@ -71,7 +72,21 @@ Return **only** a JSON object:
         parts = [f"Gather intelligence and assess sentiment for stock **{ctx.stock_code}**"]
         if ctx.stock_name:
             parts[0] += f" ({ctx.stock_name})"
-        parts.append("Use search tools to find the latest news, then output the JSON opinion.")
+        parts.append("Use direct official intel and market-specific logic, then output the JSON opinion.")
+
+        if ctx.get_data("market_context"):
+            parts.append(
+                f"\n[Market context]\n{json.dumps(ctx.get_data('market_context'), ensure_ascii=False, default=str)}"
+            )
+
+        if ctx.get_data("intel_report"):
+            parts.append(f"\n[Prefetched intel report]\n{ctx.get_data('intel_report')}")
+
+        if ctx.get_data("intel_dimensions"):
+            parts.append(
+                f"\n[Prefetched intel dimensions]\n"
+                f"{json.dumps(ctx.get_data('intel_dimensions'), ensure_ascii=False, default=str)}"
+            )
         return "\n".join(parts)
 
     def post_process(self, ctx: AgentContext, raw_text: str) -> Optional[AgentOpinion]:

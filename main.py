@@ -371,9 +371,13 @@ def run_full_analysis(
         if results:
             logger.info("\n===== 分析结果摘要 =====")
             for r in sorted(results, key=lambda x: x.sentiment_score, reverse=True):
-                emoji = r.get_emoji()
+                status_tag = {
+                    "buy": "[BUY]",
+                    "sell": "[SELL]",
+                    "hold": "[HOLD]",
+                }.get((r.decision_type or "").lower(), "[INFO]")
                 logger.info(
-                    f"{emoji} {r.name}({r.code}): {r.operation_advice} | "
+                    f"{status_tag} {r.name}({r.code}): {r.operation_advice} | "
                     f"评分 {r.sentiment_score} | {r.trend_prediction}"
                 )
 

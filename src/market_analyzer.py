@@ -102,13 +102,13 @@ class MarketAnalyzer:
         Args:
             search_service: 搜索服务实例
             analyzer: AI分析器实例（用于调用LLM）
-            region: 市场区域 cn=A股 us=美股
+            region: 市场区域 cn=A股 hk=港股 us=美股
         """
         self.config = get_config()
         self.search_service = search_service
         self.analyzer = analyzer
         self.data_manager = DataFetcherManager()
-        self.region = region if region in ("cn", "us") else "cn"
+        self.region = region if region in ("cn", "hk", "us") else "cn"
         self.profile: MarketProfile = get_profile(self.region)
         self.strategy = get_market_strategy_blueprint(self.region)
 
@@ -285,7 +285,11 @@ class MarketAnalyzer:
             logger.info("[大盘] 开始搜索市场新闻...")
             
             # 根据 region 设置搜索上下文名称，避免美股搜索被解读为 A 股语境
-            market_name = "大盘" if self.region == "cn" else "US market"
+            market_name = {
+                "cn": "A股大盘",
+                "hk": "港股大盘",
+                "us": "US market",
+            }.get(self.region, "大盘")
             for query in search_queries:
                 response = self.search_service.search_stock_news(
                     stock_code="market",
@@ -382,7 +386,7 @@ class MarketAnalyzer:
         if not has_stats:
             return ""
         lines = [
-            f"> 📈 上涨 **{overview.up_count}** 家 / 下跌 **{overview.down_count}** 家 / "
+            f"> [市场广度] 上涨 **{overview.up_count}** 家 / 下跌 **{overview.down_count}** 家 / "
             f"平盘 **{overview.flat_count}** 家 | "
             f"涨停 **{overview.limit_up_count}** / 跌停 **{overview.limit_down_count}** | "
             f"成交额 **{overview.total_amount:.0f}** 亿"
@@ -397,7 +401,7 @@ class MarketAnalyzer:
             "| 指数 | 最新 | 涨跌幅 | 成交额(亿) |",
             "|------|------|--------|-----------|"]
         for idx in overview.indices:
-            arrow = "🔴" if idx.change_pct < 0 else "🟢" if idx.change_pct > 0 else "⚪"
+            arrow = "-" if idx.change_pct < 0 else "+" if idx.change_pct > 0 else "="
             amount_raw = idx.amount or 0.0
             if amount_raw == 0.0:
                 # Yahoo Finance 不提供成交额，显示 N/A 避免误解
@@ -418,12 +422,12 @@ class MarketAnalyzer:
             top = " | ".join(
                 [f"**{s['name']}**({s['change_pct']:+.2f}%)" for s in overview.top_sectors[:5]]
             )
-            lines.append(f"> 🔥 领涨: {top}")
+            lines.append(f"> [领涨] {top}")
         if overview.bottom_sectors:
             bot = " | ".join(
                 [f"**{s['name']}**({s['change_pct']:+.2f}%)" for s in overview.bottom_sectors[:5]]
             )
-            lines.append(f"> 💧 领跌: {bot}")
+            lines.append(f"> [领跌] {bot}")
         return "\n".join(lines)
 
     def _build_review_prompt(self, overview: MarketOverview, news: List) -> str:
@@ -486,14 +490,14 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
                 if overview.northbound_flow is not None:
                     stats_block += f"\n- 北向资金净流入: {overview.northbound_flow:.2f} 亿元"
             else:
-                stats_block = "## 市场概况\n（美股暂无涨跌家数等统计）"
+                stats_block = "## 市场概况\n（港股暂无统一涨跌家数统计，请重点看指数、权重股与南向资金/公司事件。）"
 
             if self.profile.has_sector_rankings:
                 sector_block = f"""## 板块表现
 领涨: {top_sectors_text if top_sectors_text else "暂无数据"}
 领跌: {bottom_sectors_text if bottom_sectors_text else "暂无数据"}"""
             else:
-                sector_block = "## 板块表现\n（美股暂无板块涨跌数据）"
+                sector_block = "## 板块表现\n（港股暂无统一板块榜单，请重点看权重行业与公司事件。）"
             if cn_macro_lines:
                 macro_block = "## 宏观与资金\n" + "\n".join(cn_macro_lines)
 
@@ -705,7 +709,11 @@ Output the report content directly, no extra commentary.
         if macro_lines:
             title = "### 四、宏观与资金" if self.region == "cn" else "### 4. Macro & Flows"
             macro_section = "\n" + title + "\n" + "\n".join(macro_lines) + "\n"
-        market_label = "A股" if self.region == "cn" else "美股"
+        market_label = {
+            "cn": "A股",
+            "hk": "港股",
+            "us": "美股",
+        }.get(self.region, self.region)
         strategy_summary = self.strategy.to_markdown_block()
         report = f"""## {overview.date} 大盘复盘
 

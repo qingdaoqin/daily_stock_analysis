@@ -85,20 +85,26 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
     """Multi-dimensional intelligence search."""
     service = _get_search_service()
 
-    if not service.is_available:
-        return {"error": "No search engine available (no API keys configured)"}
-
     intel_results = service.search_comprehensive_intel(
         stock_code=stock_code,
         stock_name=stock_name,
-        max_searches=6,
+        max_searches=8,
     )
 
     if not intel_results:
         return {"error": "Comprehensive intel search returned no results"}
 
     # Format into readable report
-    report = service.format_intel_report(intel_results, stock_name)
+    report = service.format_intel_report(
+        intel_results,
+        stock_name,
+        stock_code=stock_code,
+    )
+    market_summary = service.build_market_intel_summary(
+        stock_code,
+        stock_name,
+        intel_results,
+    )
 
     # Also return structured data
     dimensions = {}
@@ -119,6 +125,7 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
 
     return {
         "report": report,
+        "market_summary": market_summary,
         "dimensions": dimensions,
     }
 

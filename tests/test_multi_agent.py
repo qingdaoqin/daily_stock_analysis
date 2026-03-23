@@ -505,6 +505,23 @@ class TestOrchestratorModes(unittest.TestCase):
         self.assertEqual(ctx.stock_name, "贵州茅台")
         self.assertEqual(ctx.meta["strategies_requested"], ["bull_trend"])
 
+    def test_build_context_keeps_market_intel_payload(self):
+        orch = self._make_orchestrator()
+        ctx = orch._build_context(
+            "Analyze AAPL",
+            context={
+                "stock_code": "AAPL",
+                "stock_name": "Apple",
+                "market_context": {"market": "us", "china_exposure": {"level": "high"}},
+                "intel_dimensions": {"official_filings": {"provider": "SEC"}},
+                "intel_report": "SEC direct intel",
+            },
+        )
+
+        self.assertEqual(ctx.get_data("market_context")["market"], "us")
+        self.assertIn("official_filings", ctx.get_data("intel_dimensions"))
+        self.assertEqual(ctx.get_data("intel_report"), "SEC direct intel")
+
     def test_build_context_extracts_code_from_query(self):
         orch = self._make_orchestrator()
         ctx = orch._build_context("分析600519的走势")

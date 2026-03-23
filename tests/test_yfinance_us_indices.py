@@ -214,6 +214,32 @@ class TestYfinanceGetStockName(unittest.TestCase):
         self.assertEqual(name, "Apple Inc.")
         mock_yf.Ticker.assert_called_once_with("AAPL")
 
+    def test_returns_hk_stock_name_from_numeric_code(self):
+        mock_ticker = MagicMock()
+        mock_ticker.info = {"shortName": "腾讯控股"}
+        mock_yf = MagicMock()
+        mock_yf.Ticker.return_value = mock_ticker
+
+        with patch.dict("data_provider.yfinance_fetcher.STOCK_NAME_MAP", {}, clear=True):
+            with patch.dict(sys.modules, {"yfinance": mock_yf}):
+                name = self.fetcher.get_stock_name("0700")
+
+        self.assertEqual(name, "腾讯控股")
+        mock_yf.Ticker.assert_called_once_with("0700.HK")
+
+    def test_returns_hk_stock_name_from_hk_prefixed_code(self):
+        mock_ticker = MagicMock()
+        mock_ticker.info = {"shortName": "腾讯控股"}
+        mock_yf = MagicMock()
+        mock_yf.Ticker.return_value = mock_ticker
+
+        with patch.dict("data_provider.yfinance_fetcher.STOCK_NAME_MAP", {}, clear=True):
+            with patch.dict(sys.modules, {"yfinance": mock_yf}):
+                name = self.fetcher.get_stock_name("HK00700")
+
+        self.assertEqual(name, "腾讯控股")
+        mock_yf.Ticker.assert_called_once_with("0700.HK")
+
 
 if __name__ == '__main__':
     unittest.main()

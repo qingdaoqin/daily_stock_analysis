@@ -8,6 +8,7 @@ endpoint candidates. It should never raise to caller; partial data is allowed.
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 from datetime import datetime, timedelta
@@ -51,6 +52,58 @@ def _safe_date(value: Any) -> Optional[datetime]:
         return pd.to_datetime(value).to_pydatetime()
     except Exception:
         return None
+
+
+def _scale_ratio(value: Optional[float]) -> Optional[float]:
+    """Convert ratio-like decimals to percentage points when appropriate."""
+    if value is None:
+        return None
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return None
+    if abs(ratio) <= 1:
+        ratio *= 100.0
+    return round(ratio, 2)
+
+
+def _clean_html_text(raw: str) -> str:
+    """Strip HTML tags and collapse whitespace."""
+    if not raw:
+        return ""
+    text = html.unescape(raw)
+    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", text)
+    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_regex_snippets(
+    text: str,
+    patterns: List[str],
+    *,
+    radius: int = 90,
+    limit: int = 3,
+) -> List[str]:
+    """Return short snippets around regex hits for explainability."""
+    snippets: List[str] = []
+    if not text:
+        return snippets
+
+    for pattern in patterns:
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            continue
+        for match in regex.finditer(text):
+            start = max(0, match.start() - radius)
+            end = min(len(text), match.end() + radius)
+            snippet = text[start:end].strip(" -:;,.")
+            if snippet and snippet not in snippets:
+                snippets.append(snippet)
+            if len(snippets) >= limit:
+                return snippets
+    return snippets
 
 
 def _normalize_code(raw: Any) -> str:
@@ -396,6 +449,121 @@ class AkshareFundamentalAdapter:
         return result
 
 
+class HkYfinanceFundamentalAdapter:
+    """Structured HK fundamental adapter backed by Yahoo Finance."""
+
+    @staticmethod
+    def _to_yf_symbol(stock_code: str) -> str:
+        code = _safe_str(stock_code).upper()
+        if code.startswith("HK"):
+            code = code[2:]
+        if code.endswith(".HK"):
+            code = code[:-3]
+        digits = re.sub(r"\D", "", code)
+        if not digits:
+            return ""
+        return f"{int(digits):04d}.HK"
+
+    @staticmethod
+    def _coerce_timestamp(value: Any) -> Optional[str]:
+        if value in (None, "", [], (), {}):
+            return None
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                parsed = HkYfinanceFundamentalAdapter._coerce_timestamp(item)
+                if parsed:
+                    return parsed
+            return None
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = None
+        if numeric is not None:
+            try:
+                return datetime.fromtimestamp(numeric).strftime("%Y-%m-%d")
+            except (OSError, OverflowError, ValueError):
+                return None
+        parsed = _safe_date(value)
+        if parsed:
+            return parsed.strftime("%Y-%m-%d")
+        return None
+
+    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "growth": {},
+            "earnings": {},
+            "institution": {},
+            "source_chain": [],
+            "errors": [],
+        }
+
+        symbol = self._to_yf_symbol(stock_code)
+        if not symbol:
+            result["errors"].append("hk_symbol_invalid")
+            return result
+
+        try:
+            import yfinance as yf
+        except Exception as exc:
+            result["errors"].append(f"import_yfinance:{type(exc).__name__}")
+            return result
+
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info or {}
+        except Exception as exc:
+            result["errors"].append(f"hk_yfinance_info:{type(exc).__name__}")
+            return result
+
+        growth = {
+            "revenue_yoy": _scale_ratio(_safe_float(info.get("revenueGrowth"))),
+            "net_profit_yoy": _scale_ratio(
+                _safe_float(info.get("earningsGrowth"))
+                or _safe_float(info.get("earningsQuarterlyGrowth"))
+            ),
+            "roe": _scale_ratio(_safe_float(info.get("returnOnEquity"))),
+            "gross_margin": _scale_ratio(_safe_float(info.get("grossMargins"))),
+        }
+        growth = {key: value for key, value in growth.items() if value is not None}
+        if growth:
+            result["growth"] = growth
+            result["source_chain"].append("growth:yfinance_info")
+
+        earnings = {
+            "earnings_date": self._coerce_timestamp(
+                info.get("earningsTimestamp")
+                or info.get("earningsTimestampStart")
+                or info.get("earningsDate")
+            ),
+            "ex_dividend_date": self._coerce_timestamp(info.get("exDividendDate")),
+            "dividend_rate": _safe_float(info.get("dividendRate")),
+            "dividend_yield": _scale_ratio(_safe_float(info.get("dividendYield"))),
+        }
+        earnings = {key: value for key, value in earnings.items() if value not in (None, "", [], {})}
+        if earnings:
+            result["earnings"] = earnings
+            result["source_chain"].append("earnings:yfinance_info")
+
+        institution = {
+            "institutional_holding_pct": _scale_ratio(_safe_float(info.get("heldPercentInstitutions"))),
+            "analyst_coverage_count": _safe_float(info.get("numberOfAnalystOpinions")),
+            "target_mean_price": _safe_float(info.get("targetMeanPrice")),
+            "recommendation_key": _safe_str(info.get("recommendationKey")) or None,
+        }
+        institution = {key: value for key, value in institution.items() if value not in (None, "", [], {})}
+        if institution:
+            result["institution"] = institution
+            result["source_chain"].append("institution:yfinance_info")
+
+        if result["growth"] or result["earnings"] or result["institution"]:
+            result["status"] = "partial"
+
+        return result
+
+
 class UsSecFundamentalAdapter:
     """Official SEC-based adapter for US structured fundamentals."""
 
@@ -408,10 +576,8 @@ class UsSecFundamentalAdapter:
         self._session = requests.Session()
         self._session.headers.update(
             {
-                "User-Agent": (
-                    "Mozilla/5.0 (compatible; DSA/1.0; "
-                    "+https://github.com/qingdaoqin/daily_stock_analysis)"
-                ),
+                "User-Agent": "daily-stock-analysis/1.0 admin@example.com",
+                "From": "admin@example.com",
                 "Accept-Encoding": "gzip, deflate",
                 "Accept": "application/json,text/plain,*/*",
             }
@@ -423,6 +589,11 @@ class UsSecFundamentalAdapter:
         response = self._session.get(url, timeout=8)
         response.raise_for_status()
         return response.json()
+
+    def _get_text(self, url: str) -> str:
+        response = self._session.get(url, timeout=8)
+        response.raise_for_status()
+        return response.text
 
     def _load_ticker_map(self) -> Dict[str, Dict[str, Any]]:
         now = datetime.now().timestamp()
@@ -707,4 +878,161 @@ class UsSecFundamentalAdapter:
 
         has_content = any(bool(result[key]) for key in ("growth", "earnings", "institution"))
         result["status"] = "partial" if has_content else "not_supported"
+        return result
+
+    def get_recent_filings(
+        self,
+        stock_code: str,
+        *,
+        forms: Optional[List[str]] = None,
+        limit: int = 5,
+    ) -> Dict[str, Any]:
+        """Return recent SEC filings for a ticker using the official submissions feed."""
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "items": [],
+            "source_chain": [],
+            "errors": [],
+        }
+
+        ticker = _safe_str(stock_code).upper()
+        if not ticker:
+            return result
+
+        try:
+            ticker_map = self._load_ticker_map()
+        except Exception as exc:
+            result["errors"].append(f"sec_ticker_map:{type(exc).__name__}")
+            return result
+
+        company = ticker_map.get(ticker)
+        if not company:
+            result["errors"].append("sec_ticker_not_found")
+            return result
+
+        cik = company.get("cik") or ""
+        if not cik:
+            result["errors"].append("sec_cik_missing")
+            return result
+
+        try:
+            submissions = self._get_json(self._SUBMISSIONS_URL.format(cik=cik))
+        except Exception as exc:
+            result["errors"].append(f"sec_submissions:{type(exc).__name__}")
+            return result
+
+        normalized_forms = {str(form).upper() for form in (forms or []) if str(form).strip()}
+        filings = self._extract_recent_filings(submissions)
+        if normalized_forms:
+            filings = [item for item in filings if _safe_str(item.get("form")).upper() in normalized_forms]
+
+        result["items"] = filings[: max(1, int(limit or 1))]
+        if result["items"]:
+            result["status"] = "ok"
+            result["source_chain"].append("sec_submissions")
+        return result
+
+    def get_china_exposure_summary(self, stock_code: str) -> Dict[str, Any]:
+        """Assess China exposure using official SEC filing text instead of search snippets."""
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "level": "unknown",
+            "signals": [],
+            "evidence": [],
+            "filing_form": None,
+            "filing_date": None,
+            "filing_url": "",
+            "source_chain": [],
+            "errors": [],
+        }
+
+        filings = self.get_recent_filings(
+            stock_code,
+            forms=["10-K", "10-K/A", "10-Q", "10-Q/A", "20-F", "20-F/A", "6-K"],
+            limit=3,
+        )
+        result["errors"].extend(filings.get("errors", []))
+        if filings.get("status") != "ok":
+            return result
+
+        filing = next((item for item in filings.get("items", []) if item.get("url")), None)
+        if not filing:
+            result["status"] = "partial"
+            return result
+
+        filing_url = _safe_str(filing.get("url"))
+        result["filing_form"] = filing.get("form")
+        result["filing_date"] = filing.get("filed")
+        result["filing_url"] = filing_url
+
+        try:
+            filing_text = _clean_html_text(self._get_text(filing_url))
+            result["source_chain"].append("sec_filing_text")
+        except Exception as exc:
+            result["errors"].append(f"sec_filing_text:{type(exc).__name__}")
+            result["status"] = "partial"
+            return result
+
+        signal_patterns = {
+            "revenue": [
+                r"greater china",
+                r"china revenue",
+                r"china sales",
+                r"net sales.{0,60}china",
+                r"china.{0,60}net sales",
+                r"mainland china",
+                r"prc operations",
+            ],
+            "supply_chain": [
+                r"supply chain.{0,100}china",
+                r"china.{0,100}supply chain",
+                r"manufactur.{0,80}china",
+                r"china.{0,80}manufactur",
+                r"assembly.{0,80}china",
+                r"china.{0,80}assembly",
+                r"suppliers?.{0,80}china",
+                r"china.{0,80}suppliers?",
+            ],
+            "policy": [
+                r"export controls?.{0,120}china",
+                r"china.{0,120}export controls?",
+                r"tariffs?.{0,120}china",
+                r"china.{0,120}tariffs?",
+                r"prc.{0,80}regulations?",
+                r"china.{0,80}regulations?",
+                r"sanctions?.{0,120}china",
+                r"china.{0,120}sanctions?",
+                r"rare earth",
+            ],
+        }
+
+        evidence_map: Dict[str, List[str]] = {}
+        for signal, patterns in signal_patterns.items():
+            snippets = _extract_regex_snippets(filing_text, patterns, limit=2)
+            if snippets:
+                evidence_map[signal] = snippets
+
+        result["signals"] = sorted(evidence_map.keys())
+        evidence_lines: List[str] = []
+        for signal in result["signals"]:
+            label = {
+                "revenue": "中国收入/需求",
+                "supply_chain": "中国供应链/制造",
+                "policy": "中国政策/关税/出口管制",
+            }.get(signal, signal)
+            for snippet in evidence_map.get(signal, []):
+                evidence_lines.append(f"{label}: {snippet[:220]}")
+        result["evidence"] = evidence_lines[:4]
+        result["status"] = "partial"
+
+        signals = set(result["signals"])
+        if "revenue" in signals and ("supply_chain" in signals or "policy" in signals):
+            result["level"] = "high"
+        elif len(signals) >= 2:
+            result["level"] = "medium"
+        elif len(signals) == 1:
+            result["level"] = "low"
+        else:
+            result["level"] = "unknown"
+
         return result

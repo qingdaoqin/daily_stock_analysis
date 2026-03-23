@@ -83,6 +83,25 @@ class TestPrefetchStockNames(unittest.TestCase):
         us_fetcher.get_stock_name.assert_called_once_with("AAPL")
         cn_fetcher.get_stock_name.assert_not_called()
 
+    def test_get_stock_name_prefers_yfinance_for_hk_codes(self):
+        manager = DataFetcherManager.__new__(DataFetcherManager)
+        cn_fetcher = MagicMock()
+        cn_fetcher.name = "AkshareFetcher"
+        cn_fetcher.get_stock_name.return_value = "不应该先调用"
+        hk_fetcher = MagicMock()
+        hk_fetcher.name = "YfinanceFetcher"
+        hk_fetcher.get_stock_name.return_value = "腾讯控股"
+        manager._fetchers = [cn_fetcher, hk_fetcher]
+        manager.get_realtime_quote = MagicMock()
+
+        with patch.dict("data_provider.base.STOCK_NAME_MAP", {}, clear=True):
+            name = DataFetcherManager.get_stock_name(manager, "0700", allow_realtime=False)
+
+        self.assertEqual(name, "腾讯控股")
+        manager.get_realtime_quote.assert_not_called()
+        hk_fetcher.get_stock_name.assert_called_once_with("0700")
+        cn_fetcher.get_stock_name.assert_not_called()
+
     def test_pytdx_get_stock_name_reads_all_security_list_pages(self):
         fetcher = PytdxFetcher(hosts=[])
 

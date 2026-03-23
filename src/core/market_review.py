@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-股票智能分析系统 - 大盘复盘模块（支持 A 股 / 美股）
+股票智能分析系统 - 大盘复盘模块（支持 A 股 / 港股 / 美股）
 ===================================
 
 职责：
-1. 根据 MARKET_REVIEW_REGION 配置选择市场区域（cn / us / both）
+1. 根据 MARKET_REVIEW_REGION 配置选择市场区域（cn / hk / us / both / all）
 2. 执行大盘复盘分析并生成复盘报告
 3. 保存和发送复盘报告
 """
@@ -53,31 +53,31 @@ def run_market_review(
         if override_region is not None
         else (getattr(config, 'market_review_region', 'cn') or 'cn')
     )
-    if region not in ('cn', 'us', 'both'):
+    if region not in ('cn', 'hk', 'us', 'both', 'all', 'cn+hk', 'cn+us', 'hk+us'):
         region = 'cn'
 
     try:
-        if region == 'both':
-            # 顺序执行 A 股 + 美股，合并报告
-            cn_analyzer = MarketAnalyzer(
-                search_service=search_service, analyzer=analyzer, region='cn'
-            )
-            us_analyzer = MarketAnalyzer(
-                search_service=search_service, analyzer=analyzer, region='us'
-            )
-            logger.info("生成 A 股大盘复盘报告...")
-            cn_report = cn_analyzer.run_daily_review()
-            logger.info("生成美股大盘复盘报告...")
-            us_report = us_analyzer.run_daily_review()
-            review_report = ''
-            if cn_report:
-                review_report = f"# A股大盘复盘\n\n{cn_report}"
-            if us_report:
-                if review_report:
-                    review_report += "\n\n---\n\n> 以下为美股大盘复盘\n\n"
-                review_report += f"# 美股大盘复盘\n\n{us_report}"
-            if not review_report:
-                review_report = None
+        if region in {'both', 'all', 'cn+hk', 'cn+us', 'hk+us'}:
+            region_parts = {
+                'both': ['cn', 'us'],
+                'all': ['cn', 'hk', 'us'],
+                'cn+hk': ['cn', 'hk'],
+                'cn+us': ['cn', 'us'],
+                'hk+us': ['hk', 'us'],
+            }[region]
+            label_map = {'cn': 'A股', 'hk': '港股', 'us': '美股'}
+            report_parts = []
+            for part in region_parts:
+                logger.info(f"生成 {label_map.get(part, part)}大盘复盘报告...")
+                part_analyzer = MarketAnalyzer(
+                    search_service=search_service,
+                    analyzer=analyzer,
+                    region=part,
+                )
+                part_report = part_analyzer.run_daily_review()
+                if part_report:
+                    report_parts.append(f"# {label_map.get(part, part)}大盘复盘\n\n{part_report}")
+            review_report = "\n\n---\n\n".join(report_parts) if report_parts else None
         else:
             market_analyzer = MarketAnalyzer(
                 search_service=search_service,

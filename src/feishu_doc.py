@@ -2,9 +2,39 @@
 # -*- coding: utf-8 -*-
 import logging
 import json
-import lark_oapi as lark
-from lark_oapi.api.docx.v1 import *
 from typing import List, Dict, Any, Optional
+
+try:
+    import lark_oapi as lark
+    from lark_oapi.api.docx.v1 import (
+        Block,
+        CreateDocumentRequest,
+        CreateDocumentRequestBody,
+        CreateDocumentBlockChildrenRequest,
+        CreateDocumentBlockChildrenRequestBody,
+        Divider,
+        TextRun,
+        TextElementStyle,
+        TextElement,
+        Text,
+        TextStyle,
+    )
+    _LARK_SDK_AVAILABLE = True
+except ModuleNotFoundError:
+    lark = None
+    Block = Any
+    CreateDocumentRequest = None
+    CreateDocumentRequestBody = None
+    CreateDocumentBlockChildrenRequest = None
+    CreateDocumentBlockChildrenRequestBody = None
+    Divider = None
+    TextRun = None
+    TextElementStyle = None
+    TextElement = None
+    Text = None
+    TextStyle = None
+    _LARK_SDK_AVAILABLE = False
+
 from src.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -32,14 +62,17 @@ class FeishuDocManager:
 
     def is_configured(self) -> bool:
         """检查配置是否完整"""
-        return bool(self.app_id and self.app_secret and self.folder_token)
+        return bool(_LARK_SDK_AVAILABLE and self.app_id and self.app_secret and self.folder_token)
 
     def create_daily_doc(self, title: str, content_md: str) -> Optional[str]:
         """
         创建日报文档
         """
         if not self.client or not self.is_configured():
-            logger.warning("飞书 SDK 未初始化或配置缺失，跳过创建")
+            if not _LARK_SDK_AVAILABLE:
+                logger.warning("飞书 SDK 未安装，跳过创建")
+            else:
+                logger.warning("飞书 SDK 未初始化或配置缺失，跳过创建")
             return None
 
         try:

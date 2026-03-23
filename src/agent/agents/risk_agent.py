@@ -30,6 +30,7 @@ class RiskAgent(BaseAgent):
     agent_name = "risk"
     max_steps = 4
     tool_names = [
+        "search_comprehensive_intel",
         "search_stock_news",
         "get_realtime_quote",
         "get_stock_info",
@@ -38,19 +39,27 @@ class RiskAgent(BaseAgent):
     def system_prompt(self, ctx: AgentContext) -> str:
         return """\
 You are a **Risk Screening Agent** focused exclusively on identifying \
-risks and red flags for the given stock.
+risks and red flags for the given stock across A-shares, HK equities, \
+and US equities.
 
-Your task: search for and evaluate ALL potential risk factors, then \
+Your task: search for and evaluate ALL material risk factors, then \
 output a structured JSON risk assessment.
 
 ## Mandatory Risk Checks
-1. **Insider / Major Shareholder Activity** — sell-downs (减持), pledges
-2. **Earnings Warnings** — pre-loss, downward revisions (业绩预亏, 业绩变脸)
-3. **Regulatory** — penalties, investigations, violations (监管处罚, 立案调查)
-4. **Industry Policy** — headwinds, sector crackdowns
-5. **Lock-up Expirations** — large block unlocks within 30 days (解禁)
-6. **Valuation Extremes** — PE > 100 or negative, PB > 10 (flag as anomaly)
-7. **Technical Warning Signs** — death crosses, breaking key supports
+1. **Official Source First** — use pre-fetched `market_context`, `intel_report`, \
+   and `search_comprehensive_intel` before generic news search. Prefer CNINFO / \
+   HKEX / SEC evidence over media summaries.
+2. **A-shares** — insider sell-downs (减持), earnings warnings, regulatory \
+   penalties, lock-up expirations (解禁), policy crackdowns.
+3. **HK equities** — profit warning, placement/rights issue, buyback/dividend \
+   changes, litigation, HKEX corporate actions, mainland-policy transmission \
+   only when the issuer actually has mainland exposure.
+4. **US equities** — SEC filings, litigation, guidance cuts, Form 4 / 13D / \
+   13G activity, valuation extremes, short-interest / options stress. \
+   Chinese policy matters only if `market_context.china_exposure` shows \
+   genuine China revenue / supply-chain / export-control exposure.
+5. **Technical Warning Signs** — death crosses, breaks of key supports, \
+   sharp gap-downs.
 
 ## Severity Levels
 - "high": existential or material risk (lawsuits, fraud, massive insider selling)
@@ -84,7 +93,20 @@ from your search results. Do NOT invent risks.
         if ctx.stock_name:
             parts[0] += f" ({ctx.stock_name})"
         parts.append("for ALL risk factors listed in your instructions.")
-        parts.append("Search for latest news if you haven't received intel data yet.")
+        parts.append("Use pre-fetched market context and comprehensive intel first; search latest news only to fill gaps.")
+
+        if ctx.get_data("market_context"):
+            parts.append(
+                f"\n[Market context]\n{json.dumps(ctx.get_data('market_context'), ensure_ascii=False, default=str)}"
+            )
+
+        if ctx.get_data("intel_report"):
+            parts.append(f"\n[Intel report]\n{ctx.get_data('intel_report')}")
+
+        if ctx.get_data("intel_dimensions"):
+            parts.append(
+                f"\n[Intel dimensions]\n{json.dumps(ctx.get_data('intel_dimensions'), ensure_ascii=False, default=str)}"
+            )
 
         # Feed any existing intel data so the risk agent doesn't redo searches
         if ctx.get_data("intel_opinion"):

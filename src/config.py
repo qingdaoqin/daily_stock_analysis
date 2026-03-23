@@ -1434,7 +1434,7 @@ class Config:
         ]
 
         if not stock_list:
-            stock_list = ['000001']
+            stock_list = self.stock_list or ['600519', '000001', '300750']
 
         self.stock_list = stock_list
     

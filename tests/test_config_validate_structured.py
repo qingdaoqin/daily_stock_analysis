@@ -8,6 +8,9 @@ Covers:
   legacy keys) via llm_model_list
 - validate() backward-compat: still returns List[str] with the same messages
 """
+import os
+import tempfile
+from pathlib import Path
 import pytest
 from unittest.mock import patch
 
@@ -122,6 +125,18 @@ class TestValidateStructuredStockList:
         cfg = _make_config(stock_list=["600519", "000001"])
         issues = cfg.validate_structured()
         assert not any(i.field == "STOCK_LIST" for i in issues if i.severity == "error")
+
+
+class TestRefreshStockList:
+    def test_refresh_stock_list_keeps_existing_list_when_source_empty(self):
+        cfg = _make_config(stock_list=["AAPL", "TSLA"])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env_path = Path(tmp_dir) / ".env"
+            env_path.write_text("", encoding="utf-8")
+            with patch.dict(os.environ, {"ENV_FILE": str(env_path), "STOCK_LIST": ""}, clear=False):
+                cfg.refresh_stock_list()
+
+        assert cfg.stock_list == ["AAPL", "TSLA"]
 
 
 # ---------------------------------------------------------------------------

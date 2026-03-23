@@ -476,12 +476,12 @@ class HistoryService:
             AnalysisResult object or None
         """
         try:
-            from src.analyzer import AnalysisResult
+            from src.analyzer import AnalysisResult, normalize_analysis_result_signals
             # Extract dashboard data if available
             dashboard = raw_result.get("dashboard", {})
 
             # Build AnalysisResult with available data
-            return AnalysisResult(
+            result = AnalysisResult(
                 code=raw_result.get("code", record.code),
                 name=raw_result.get("name", record.name),
                 sentiment_score=raw_result.get("sentiment_score", record.sentiment_score or 50),
@@ -516,6 +516,7 @@ class HistoryService:
                 change_pct=raw_result.get("change_pct"),
                 model_used=raw_result.get("model_used"),
             )
+            return normalize_analysis_result_signals(result)
         except Exception as e:
             logger.error(f"Failed to rebuild AnalysisResult: {e}", exc_info=True)
             return None
@@ -771,16 +772,10 @@ class HistoryService:
         return text
 
     def _get_signal_level(self, result: AnalysisResult) -> Tuple[str, str, str]:
-        """Get signal level based on sentiment score and decision type."""
-        score = result.sentiment_score or 50
-        decision = getattr(result, 'decision_type', '')
+        """Get signal level using the same normalization as runtime notifications."""
+        from src.analyzer import get_result_signal_level
 
-        if decision == 'buy' or score >= 70:
-            return ('买入', '🟢', '买入')
-        elif decision == 'sell' or score < 35:
-            return ('卖出', '🔴', '卖出')
-        else:
-            return ('观望', '⚪', '观望')
+        return get_result_signal_level(result)
 
     @staticmethod
     def _safe_format_number(value: Any, fmt: str = ".2f") -> str:

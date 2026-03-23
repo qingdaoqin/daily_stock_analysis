@@ -292,6 +292,53 @@ class AnalysisHistoryTestCase(unittest.TestCase):
         self.assertEqual(detail.get("stop_loss"), "110.0")
         self.assertEqual(detail.get("take_profit"), "150.0")
 
+    def test_markdown_report_normalizes_conflicting_saved_signals(self) -> None:
+        """Historical markdown should normalize stale conflicting signals before rendering."""
+        result = self._build_result()
+        saved = self.db.save_analysis_history(
+            result=result,
+            query_id="query_008",
+            report_type="simple",
+            news_content="新闻摘要",
+            context_snapshot=None,
+            save_snapshot=False
+        )
+        self.assertEqual(saved, 1)
+
+        with self.db.get_session() as session:
+            row = session.query(AnalysisHistory).filter(AnalysisHistory.query_id == "query_008").first()
+            if row is None:
+                self.fail("未找到保存的历史记录")
+            row.raw_result = json.dumps({
+                "code": "AAPL",
+                "name": "Apple",
+                "sentiment_score": 81,
+                "trend_prediction": "看空",
+                "operation_advice": "买入",
+                "decision_type": "buy",
+                "analysis_summary": "旧结果存在冲突",
+                "dashboard": {
+                    "core_conclusion": {
+                        "one_sentence": "建议直接买入",
+                        "signal_type": "买入信号",
+                    }
+                },
+            })
+            row.code = "AAPL"
+            row.name = "Apple"
+            row.operation_advice = "买入"
+            row.trend_prediction = "看空"
+            row.sentiment_score = 81
+            session.commit()
+            record_id = row.id
+
+        service = HistoryService(self.db)
+        report = service.get_markdown_report(str(record_id))
+        self.assertIsNotNone(report)
+        self.assertIn("持有", report)
+        self.assertNotIn("建议直接买入", report)
+        self.assertIn("震荡偏多", report)
+
     def test_delete_analysis_history_records_also_cleans_backtests(self) -> None:
         """删除历史记录时应一并清理关联回测结果。"""
         record_id = self._save_history("query_delete_001")

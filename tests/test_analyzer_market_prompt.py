@@ -28,6 +28,8 @@ class TestAnalyzerMarketPrompt(unittest.TestCase):
         self.assertIn("A 股、港股和美股", analyzer.SYSTEM_PROMPT)
         self.assertIn("China exposure", analyzer.SYSTEM_PROMPT)
         self.assertNotIn("A 股投资分析师", analyzer.SYSTEM_PROMPT.splitlines()[0])
+        self.assertIn("美股：乖离率 > 5% 只代表追价风险", analyzer.SYSTEM_PROMPT)
+        self.assertIn("不能仅因离均线较远就把强趋势股直接判成看空", analyzer.SYSTEM_PROMPT)
 
     def test_us_prompt_includes_china_exposure_guidance(self) -> None:
         analyzer = self._make_analyzer()

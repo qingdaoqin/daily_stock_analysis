@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -37,6 +38,190 @@ from src.data.stock_mapping import STOCK_NAME_MAP
 from src.schemas.report_schema import AnalysisReportSchema
 
 logger = logging.getLogger(__name__)
+
+
+_BUY_SIGNAL_HINTS = {
+    "buy", "strong_buy", "long", "bullish",
+    "买入", "加仓", "强烈买入", "看多", "强烈看多",
+}
+_SELL_SIGNAL_HINTS = {
+    "sell", "strong_sell", "short", "bearish",
+    "卖出", "减仓", "强烈卖出", "看空", "强烈看空",
+}
+_HOLD_SIGNAL_HINTS = {
+    "hold", "neutral", "wait", "watch",
+    "持有", "观望", "震荡", "中性",
+}
+
+
+def _canonical_decision_signal(value: Any) -> str:
+    """Normalize model-facing decision labels into buy/hold/sell."""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip().lower()
+    if not text:
+        return ""
+    if text in _BUY_SIGNAL_HINTS:
+        return "buy"
+    if text in _SELL_SIGNAL_HINTS:
+        return "sell"
+    if text in _HOLD_SIGNAL_HINTS:
+        return "hold"
+    return ""
+
+
+def _signal_from_operation_advice(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    if any(keyword in text for keyword in ("买入", "加仓", "做多")):
+        return "buy"
+    if any(keyword in text for keyword in ("卖出", "减仓", "止盈", "止损")):
+        return "sell"
+    if any(keyword in text for keyword in ("持有", "观望", "等待")):
+        return "hold"
+    return _canonical_decision_signal(text)
+
+
+def _signal_from_trend_prediction(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    if "看空" in text or "bearish" in text.lower():
+        return "sell"
+    if "看多" in text or "bullish" in text.lower():
+        return "buy"
+    if any(keyword in text for keyword in ("震荡", "中性", "盘整")):
+        return "hold"
+    return _canonical_decision_signal(text)
+
+
+def _signal_from_sentiment_score(score: int) -> str:
+    if score >= 60:
+        return "buy"
+    if score <= 39:
+        return "sell"
+    return "hold"
+
+
+def _coerce_sentiment_score_value(value: Any, default: int = 50) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_sentiment_score_to_signal(score: int, signal: str) -> int:
+    bands = {
+        "buy": (60, 79),
+        "hold": (40, 59),
+        "sell": (0, 39),
+    }
+    low, high = bands.get(signal, (0, 100))
+    return max(low, min(high, score))
+
+
+def _canonical_operation_advice(signal: str) -> str:
+    mapping = {
+        "buy": "买入",
+        "hold": "观望",
+        "sell": "减仓/卖出",
+    }
+    return mapping.get(signal, "观望")
+
+
+def _canonical_trend_prediction(signal: str) -> str:
+    mapping = {
+        "buy": "看多",
+        "hold": "震荡",
+        "sell": "看空",
+    }
+    return mapping.get(signal, "震荡")
+
+
+def _canonical_signal_type(signal: str) -> str:
+    mapping = {
+        "buy": "买入信号",
+        "hold": "持有观望",
+        "sell": "卖出信号",
+    }
+    return mapping.get(signal, "持有观望")
+
+
+def _default_position_advice_for_signal(signal: str) -> Dict[str, str]:
+    mapping = {
+        "buy": {
+            "no_position": "可等待回踩支撑位后分批试仓，避免一次性追高。",
+            "has_position": "可继续持有，回踩关键位不破再考虑加仓。",
+        },
+        "hold": {
+            "no_position": "先观察，不追价，等待更清晰的入场条件。",
+            "has_position": "以持有观察为主，跌破止损位再执行风控。",
+        },
+        "sell": {
+            "no_position": "暂不参与，等待风险充分释放后再评估。",
+            "has_position": "优先控制回撤，按计划减仓或离场。",
+        },
+    }
+    return mapping.get(signal, mapping["hold"])
+
+
+def _resolve_consistent_signal(signals: List[str]) -> Tuple[str, bool]:
+    valid_signals = [signal for signal in signals if signal in {"buy", "hold", "sell"}]
+    if not valid_signals:
+        return "hold", False
+
+    counts = Counter(valid_signals)
+    top_count = max(counts.values())
+    winners = [signal for signal, count in counts.items() if count == top_count]
+    if len(winners) == 1:
+        final_signal = winners[0]
+    else:
+        final_signal = "hold"
+
+    has_conflict = len(set(valid_signals)) > 1
+    if "buy" in valid_signals and "sell" in valid_signals:
+        final_signal = "hold"
+        has_conflict = True
+
+    return final_signal, has_conflict
+
+
+def _normalize_dashboard_signal_fields(
+    dashboard: Any,
+    signal: str,
+    *,
+    has_conflict: bool,
+) -> Any:
+    if not isinstance(dashboard, dict):
+        return dashboard
+
+    dashboard["decision_type"] = signal
+    core = dashboard.get("core_conclusion")
+    if not isinstance(core, dict):
+        core = {}
+        dashboard["core_conclusion"] = core
+
+    core["signal_type"] = _canonical_signal_type(signal)
+    if has_conflict or not isinstance(core.get("position_advice"), dict):
+        core["position_advice"] = _default_position_advice_for_signal(signal)
+    if has_conflict:
+        core["one_sentence"] = {
+            "buy": "趋势偏强，但应等待更优买点",
+            "hold": "信号存在分歧，当前以观望为主",
+            "sell": "风险偏高，优先减仓防守",
+        }.get(signal, "信号存在分歧，当前以观望为主")
+        core["time_sensitivity"] = {
+            "buy": "本周内",
+            "hold": "不急",
+            "sell": "立即行动",
+        }.get(signal, "不急")
+
+    return dashboard
 
 
 def check_content_integrity(result: "AnalysisResult") -> Tuple[bool, List[str]]:
@@ -517,18 +702,17 @@ class GeminiAnalyzer:
 
 ## 核心交易理念（必须严格遵守）
 
-### 1. 严进策略（不追高）
-- **绝对不追高**：当股价偏离 MA5 超过 5% 时，坚决不买入
+### 1. 入场纪律（按市场区别处理）
 - **乖离率公式**：(现价 - MA5) / MA5 × 100%
-- 乖离率 < 2%：最佳买点区间
-- 乖离率 2-5%：可小仓介入
-- 乖离率 > 5%：严禁追高！直接判定为"观望"
+- A股：乖离率 < 2% 为最佳买点，2-5% 可小仓介入，> 5% 默认观望，严禁追高
+- 港股：大体参照 A股，但对强势龙头和公告催化股可略放宽；> 6% 仍应明确提示“不宜追高”
+- 美股：乖离率 > 5% 只代表追价风险，不等于自动看空或卖出；若财报、指引、业绩或趋势共振，只能给“持有/轻仓跟踪/等回踩”，不得机械转成卖出
 
-### 2. 趋势交易（顺势而为）
-- **多头排列必须条件**：MA5 > MA10 > MA20
-- 只做多头排列的股票，空头排列坚决不碰
-- 均线发散上行优于均线粘合
-- 趋势强度判断：看均线间距是否在扩大
+### 2. 趋势判断（顺势而为，但不能机械套用）
+- A股：`MA5 > MA10 > MA20` 是买入级信号的重要硬条件
+- 港股：优先看多头排列，同时结合公告催化、回购分红和南向资金
+- 美股：均线趋势重要，但必须和财报、公司指引、估值、行业主线一起判断；不能仅因离均线较远就把强趋势股直接判成看空
+- 均线发散上行优于均线粘合，趋势强度要看均线间距是否扩大
 
 ### 3. 效率优先（筹码结构）
 - 关注筹码集中度：90%集中度 < 15% 表示筹码集中
@@ -674,12 +858,12 @@ class GeminiAnalyzer:
 
 ### 买入（60-79分）：
 - 通过：多头排列或弱势多头
-- 通过：乖离率 <5%
+- 通过：A股/港股乖离率 <5%；美股若催化明确且趋势延续，可放宽，但必须写清“回踩更优，不宜追高”
 - 通过：量能正常
 - 说明：允许一项次要条件不满足
 
 ### 观望（40-59分）：
-- 警示：乖离率 >5%（追高风险）
+- 警示：A股/港股乖离率 >5% 为强警示；美股 >5% 只代表追价风险，不直接等同看空
 - 警示：均线缠绕趋势不明
 - 警示：有风险事件
 
@@ -1550,26 +1734,71 @@ class GeminiAnalyzer:
                 if ai_stock_name and (name.startswith('股票') or name == code or 'Unknown' in name):
                     name = ai_stock_name
 
-                # 解析所有字段，使用默认值防止缺失
-                # 解析 decision_type，如果没有则根据 operation_advice 推断
-                decision_type = data.get('decision_type', '')
-                if not decision_type:
-                    op = data.get('operation_advice', '持有')
-                    if op in ['买入', '加仓', '强烈买入']:
-                        decision_type = 'buy'
-                    elif op in ['卖出', '减仓', '强烈卖出']:
-                        decision_type = 'sell'
-                    else:
-                        decision_type = 'hold'
+                # 解析所有字段，优先做一致性校验，避免出现“看空但买入”之类互相打架的结论
+                raw_score = _coerce_sentiment_score_value(data.get('sentiment_score', 50))
+                raw_trend_prediction = data.get('trend_prediction', '震荡')
+                raw_operation_advice = data.get('operation_advice', '持有')
+                raw_decision_type = data.get('decision_type', '')
+
+                decision_signal = _canonical_decision_signal(raw_decision_type)
+                operation_signal = _signal_from_operation_advice(raw_operation_advice)
+                trend_signal = _signal_from_trend_prediction(raw_trend_prediction)
+                score_signal = _signal_from_sentiment_score(raw_score)
+
+                action_signal = decision_signal or operation_signal
+                opposite_pairs = {("buy", "sell"), ("sell", "buy")}
+                hard_conflict = False
+
+                if decision_signal and operation_signal and (decision_signal, operation_signal) in opposite_pairs:
+                    hard_conflict = True
+                elif action_signal and trend_signal and (action_signal, trend_signal) in opposite_pairs:
+                    hard_conflict = True
+                elif action_signal and score_signal and (action_signal, score_signal) in opposite_pairs:
+                    hard_conflict = True
+
+                if hard_conflict:
+                    final_signal = "hold"
+                elif action_signal:
+                    final_signal = action_signal
+                else:
+                    final_signal, _ = _resolve_consistent_signal([
+                        trend_signal,
+                        score_signal,
+                    ])
+
+                has_conflict = hard_conflict
+
+                normalized_score = raw_score
+                if raw_score < 0 or raw_score > 100 or hard_conflict:
+                    normalized_score = _clamp_sentiment_score_to_signal(
+                        max(0, min(100, raw_score)),
+                        final_signal,
+                    )
+
+                normalized_trend_prediction = raw_trend_prediction
+                if hard_conflict and trend_signal not in ("", final_signal):
+                    normalized_trend_prediction = _canonical_trend_prediction(final_signal)
+
+                normalized_operation_advice = raw_operation_advice
+                if not action_signal:
+                    normalized_operation_advice = _canonical_operation_advice(final_signal)
+                elif hard_conflict and operation_signal not in ("", final_signal):
+                    normalized_operation_advice = _canonical_operation_advice(final_signal)
+
+                dashboard = _normalize_dashboard_signal_fields(
+                    dashboard,
+                    final_signal,
+                    has_conflict=has_conflict,
+                )
                 
                 return AnalysisResult(
                     code=code,
                     name=name,
                     # 核心指标
-                    sentiment_score=int(data.get('sentiment_score', 50)),
-                    trend_prediction=data.get('trend_prediction', '震荡'),
-                    operation_advice=data.get('operation_advice', '持有'),
-                    decision_type=decision_type,
+                    sentiment_score=normalized_score,
+                    trend_prediction=normalized_trend_prediction,
+                    operation_advice=normalized_operation_advice,
+                    decision_type=final_signal,
                     confidence_level=data.get('confidence_level', '中'),
                     # 决策仪表盘
                     dashboard=dashboard,
@@ -1625,8 +1854,13 @@ class GeminiAnalyzer:
         json_str = json_str.replace('True', 'true').replace('False', 'false')
         
         # fix by json-repair when available
-        if repair_json is not None:
-            json_str = repair_json(json_str)
+        if callable(repair_json):
+            try:
+                repaired = repair_json(json_str)
+                if isinstance(repaired, str) and repaired.strip():
+                    json_str = repaired
+            except Exception:
+                pass
 
         return json_str
     

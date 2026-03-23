@@ -110,7 +110,8 @@ class TestAnalyzerSchemaFallback(unittest.TestCase):
         result = analyzer._parse_response(response, "600519", "贵州茅台")
         self.assertIsInstance(result, AnalysisResult)
         self.assertEqual(result.code, "600519")
-        self.assertEqual(result.sentiment_score, 150)  # from raw dict
+        self.assertEqual(result.decision_type, "hold")
+        self.assertTrue(40 <= result.sentiment_score <= 59)
         self.assertTrue(result.success)
 
     def test_parse_response_valid_json_succeeds(self) -> None:
@@ -130,3 +131,51 @@ class TestAnalyzerSchemaFallback(unittest.TestCase):
         self.assertEqual(result.name, "贵州茅台")
         self.assertEqual(result.sentiment_score, 72)
         self.assertEqual(result.analysis_summary, "技术面向好")
+
+    def test_parse_response_reconciles_conflicting_signal_fields(self) -> None:
+        """Conflicting top-level fields should be normalized to a conservative hold signal."""
+        analyzer = GeminiAnalyzer()
+        response = json.dumps({
+            "stock_name": "Apple",
+            "sentiment_score": 78,
+            "trend_prediction": "看空",
+            "operation_advice": "买入",
+            "decision_type": "buy",
+            "dashboard": {
+                "core_conclusion": {
+                    "one_sentence": "建议直接买入",
+                    "signal_type": "买入信号",
+                }
+            },
+            "analysis_summary": "原始输出存在分歧",
+        })
+
+        result = analyzer._parse_response(response, "AAPL", "Apple")
+
+        self.assertEqual(result.decision_type, "hold")
+        self.assertEqual(result.operation_advice, "观望")
+        self.assertEqual(result.trend_prediction, "震荡")
+        self.assertTrue(40 <= result.sentiment_score <= 59)
+        self.assertIsInstance(result.dashboard, dict)
+        self.assertEqual(result.dashboard["decision_type"], "hold")
+        self.assertEqual(result.dashboard["core_conclusion"]["signal_type"], "持有观望")
+        self.assertEqual(result.dashboard["core_conclusion"]["one_sentence"], "信号存在分歧，当前以观望为主")
+
+    def test_parse_response_normalizes_strong_decision_label_but_keeps_buy_signal(self) -> None:
+        """Model-facing strong_buy labels should be accepted and mapped to the stable enum."""
+        analyzer = GeminiAnalyzer()
+        response = json.dumps({
+            "stock_name": "Apple",
+            "sentiment_score": 88,
+            "trend_prediction": "强烈看多",
+            "operation_advice": "买入",
+            "decision_type": "strong_buy",
+            "analysis_summary": "趋势延续",
+        })
+
+        result = analyzer._parse_response(response, "AAPL", "Apple")
+
+        self.assertEqual(result.decision_type, "buy")
+        self.assertEqual(result.operation_advice, "买入")
+        self.assertEqual(result.trend_prediction, "强烈看多")
+        self.assertEqual(result.sentiment_score, 88)

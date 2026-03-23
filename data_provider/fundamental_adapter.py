@@ -11,9 +11,11 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timedelta
+from itertools import zip_longest
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,15 @@ def _safe_str(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _safe_date(value: Any) -> Optional[datetime]:
+    if value in (None, ""):
+        return None
+    try:
+        return pd.to_datetime(value).to_pydatetime()
+    except Exception:
+        return None
 
 
 def _normalize_code(raw: Any) -> str:
@@ -85,6 +96,26 @@ def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series
 
     # Fallback: use latest row
     return df.iloc[0]
+
+
+def _classify_fact_period(start: Optional[datetime], end: Optional[datetime]) -> Optional[str]:
+    if start is None or end is None:
+        return None
+    duration_days = max(0, (end - start).days)
+    if duration_days >= 300:
+        return "annual"
+    if 70 <= duration_days <= 120:
+        return "quarterly"
+    return None
+
+
+def _pct_change(latest: Optional[float], previous: Optional[float]) -> Optional[float]:
+    if latest is None or previous in (None, 0):
+        return None
+    try:
+        return round((float(latest) - float(previous)) / abs(float(previous)) * 100.0, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
 
 
 class AkshareFundamentalAdapter:
@@ -327,4 +358,353 @@ class AkshareFundamentalAdapter:
         )
         result["status"] = "ok"
         result["source_chain"].append(f"dragon_tiger:{source}")
+        return result
+
+    def get_northbound_flow(self) -> Dict[str, Any]:
+        """Return latest northbound net flow in 亿元 when available."""
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "net_inflow": None,
+            "source_chain": [],
+            "errors": [],
+        }
+
+        df, source, errors = self._call_df_candidates([
+            ("stock_hsgt_north_net_flow_in_em", {"symbol": "北上"}),
+            ("stock_hsgt_north_net_flow_in_em", {}),
+        ])
+        result["errors"].extend(errors)
+        if df is None:
+            return result
+
+        latest = df.iloc[-1]
+        flow = _safe_float(
+            _pick_by_keywords(
+                latest,
+                ["当日净流入", "净流入", "当日买入成交净额", "资金净流入", "净买额", "净额"],
+            )
+        )
+        if flow is not None:
+            if abs(flow) > 1_000_000:
+                flow = round(flow / 1e8, 2)
+            result["net_inflow"] = flow
+            result["status"] = "ok"
+        else:
+            result["status"] = "partial"
+
+        result["source_chain"].append(f"northbound_flow:{source}")
+        return result
+
+
+class UsSecFundamentalAdapter:
+    """Official SEC-based adapter for US structured fundamentals."""
+
+    _TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
+    _SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+    _COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+    _TICKER_CACHE_TTL_SECONDS = 24 * 60 * 60
+
+    def __init__(self) -> None:
+        self._session = requests.Session()
+        self._session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; DSA/1.0; "
+                    "+https://github.com/qingdaoqin/daily_stock_analysis)"
+                ),
+                "Accept-Encoding": "gzip, deflate",
+                "Accept": "application/json,text/plain,*/*",
+            }
+        )
+        self._ticker_cache: Dict[str, Dict[str, Any]] = {}
+        self._ticker_cache_ts: float = 0.0
+
+    def _get_json(self, url: str) -> Any:
+        response = self._session.get(url, timeout=8)
+        response.raise_for_status()
+        return response.json()
+
+    def _load_ticker_map(self) -> Dict[str, Dict[str, Any]]:
+        now = datetime.now().timestamp()
+        if self._ticker_cache and now - self._ticker_cache_ts <= self._TICKER_CACHE_TTL_SECONDS:
+            return self._ticker_cache
+
+        payload = self._get_json(self._TICKER_MAP_URL)
+        records: List[Dict[str, Any]] = []
+        if isinstance(payload, dict):
+            if isinstance(payload.get("data"), list):
+                records = payload.get("data", [])
+            else:
+                records = [item for item in payload.values() if isinstance(item, dict)]
+        elif isinstance(payload, list):
+            records = payload
+
+        ticker_map: Dict[str, Dict[str, Any]] = {}
+        for item in records:
+            ticker = _safe_str(item.get("ticker")).upper()
+            if not ticker:
+                continue
+            cik = item.get("cik_str") or item.get("cik")
+            cik_value = None
+            try:
+                cik_value = int(cik)
+            except (TypeError, ValueError):
+                continue
+            ticker_map[ticker] = {
+                "ticker": ticker,
+                "cik": f"{cik_value:010d}",
+                "title": _safe_str(item.get("title") or item.get("name")),
+            }
+
+        self._ticker_cache = ticker_map
+        self._ticker_cache_ts = now
+        return ticker_map
+
+    @staticmethod
+    def _extract_recent_filings(submissions: Dict[str, Any]) -> List[Dict[str, Any]]:
+        recent = ((submissions or {}).get("filings") or {}).get("recent") or {}
+        forms = recent.get("form") or []
+        dates = recent.get("filingDate") or []
+        accessions = recent.get("accessionNumber") or []
+        primary_docs = recent.get("primaryDocument") or []
+
+        company_cik = _safe_str((submissions or {}).get("cik")).zfill(10)
+        archive_cik = str(int(company_cik)) if company_cik.isdigit() else company_cik
+
+        filings: List[Dict[str, Any]] = []
+        for form, filed, accession, primary_doc in zip_longest(forms, dates, accessions, primary_docs, fillvalue=""):
+            form_value = _safe_str(form)
+            filed_value = _safe_str(filed)
+            accession_value = _safe_str(accession)
+            primary_doc_value = _safe_str(primary_doc)
+            if not form_value or not filed_value:
+                continue
+            accession_compact = accession_value.replace("-", "")
+            filing_url = ""
+            if archive_cik and accession_compact and primary_doc_value:
+                filing_url = (
+                    f"https://www.sec.gov/Archives/edgar/data/"
+                    f"{archive_cik}/{accession_compact}/{primary_doc_value}"
+                )
+            filings.append(
+                {
+                    "form": form_value,
+                    "filed": filed_value,
+                    "filed_dt": _safe_date(filed_value),
+                    "url": filing_url,
+                }
+            )
+        return filings
+
+    @staticmethod
+    def _extract_company_fact_records(
+        companyfacts: Dict[str, Any],
+        taxonomy: str,
+        concepts: List[str],
+    ) -> List[Dict[str, Any]]:
+        taxonomy_facts = (((companyfacts or {}).get("facts") or {}).get(taxonomy) or {})
+        records: List[Dict[str, Any]] = []
+        for concept in concepts:
+            concept_payload = taxonomy_facts.get(concept)
+            if not isinstance(concept_payload, dict):
+                continue
+            units = concept_payload.get("units") or {}
+            for unit_name, entries in units.items():
+                if not isinstance(entries, list):
+                    continue
+                for item in entries:
+                    value = _safe_float(item.get("val"))
+                    start = _safe_date(item.get("start"))
+                    end = _safe_date(item.get("end"))
+                    filed = _safe_date(item.get("filed"))
+                    if value is None or filed is None:
+                        continue
+                    period_type = _classify_fact_period(start, end)
+                    records.append(
+                        {
+                            "concept": concept,
+                            "unit": _safe_str(unit_name),
+                            "value": value,
+                            "form": _safe_str(item.get("form")),
+                            "start": start,
+                            "end": end,
+                            "filed": filed,
+                            "period_type": period_type,
+                        }
+                    )
+        records.sort(
+            key=lambda item: (
+                item.get("filed") or datetime.min,
+                item.get("end") or datetime.min,
+            ),
+            reverse=True,
+        )
+        return records
+
+    @staticmethod
+    def _latest_comparable_pair(records: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        filtered = [item for item in records if item.get("period_type") in {"annual", "quarterly"}]
+        if not filtered:
+            return None, None
+
+        latest = filtered[0]
+        target_period = latest.get("period_type")
+        for previous in filtered[1:]:
+            if previous.get("period_type") == target_period:
+                return latest, previous
+        return latest, None
+
+    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+        """Return normalized US fundamental blocks from SEC official filings."""
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "growth": {},
+            "earnings": {},
+            "institution": {},
+            "source_chain": [],
+            "errors": [],
+        }
+
+        ticker = _safe_str(stock_code).upper()
+        if not ticker:
+            return result
+
+        try:
+            ticker_map = self._load_ticker_map()
+        except Exception as exc:
+            result["errors"].append(f"sec_ticker_map:{type(exc).__name__}")
+            return result
+
+        company = ticker_map.get(ticker)
+        if not company:
+            result["errors"].append("sec_ticker_not_found")
+            return result
+
+        cik = company.get("cik") or ""
+        if not cik:
+            result["errors"].append("sec_cik_missing")
+            return result
+
+        submissions: Dict[str, Any] = {}
+        companyfacts: Dict[str, Any] = {}
+        try:
+            submissions = self._get_json(self._SUBMISSIONS_URL.format(cik=cik))
+            result["source_chain"].append("earnings:sec_submissions")
+            result["source_chain"].append("institution:sec_submissions")
+        except Exception as exc:
+            result["errors"].append(f"sec_submissions:{type(exc).__name__}")
+
+        try:
+            companyfacts = self._get_json(self._COMPANY_FACTS_URL.format(cik=cik))
+            result["source_chain"].append("growth:sec_companyfacts")
+        except Exception as exc:
+            result["errors"].append(f"sec_companyfacts:{type(exc).__name__}")
+
+        revenue_records = self._extract_company_fact_records(
+            companyfacts,
+            "us-gaap",
+            [
+                "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "Revenues",
+                "SalesRevenueNet",
+            ],
+        )
+        income_records = self._extract_company_fact_records(
+            companyfacts,
+            "us-gaap",
+            ["NetIncomeLoss", "ProfitLoss"],
+        )
+        equity_records = self._extract_company_fact_records(
+            companyfacts,
+            "us-gaap",
+            [
+                "StockholdersEquity",
+                "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+            ],
+        )
+        gross_profit_records = self._extract_company_fact_records(
+            companyfacts,
+            "us-gaap",
+            ["GrossProfit"],
+        )
+
+        latest_revenue, previous_revenue = self._latest_comparable_pair(revenue_records)
+        latest_income, previous_income = self._latest_comparable_pair(income_records)
+        latest_gross_profit, _ = self._latest_comparable_pair(gross_profit_records)
+        latest_equity = equity_records[0] if equity_records else None
+
+        revenue_yoy = _pct_change(
+            latest_revenue.get("value") if latest_revenue else None,
+            previous_revenue.get("value") if previous_revenue else None,
+        )
+        net_income_yoy = _pct_change(
+            latest_income.get("value") if latest_income else None,
+            previous_income.get("value") if previous_income else None,
+        )
+
+        roe = None
+        if latest_income and latest_equity and latest_equity.get("value") not in (None, 0):
+            income_value = float(latest_income["value"])
+            if latest_income.get("period_type") == "quarterly":
+                income_value *= 4
+            try:
+                roe = round(income_value / float(latest_equity["value"]) * 100.0, 2)
+            except (TypeError, ValueError, ZeroDivisionError):
+                roe = None
+
+        gross_margin = None
+        if latest_gross_profit and latest_revenue and latest_revenue.get("value") not in (None, 0):
+            try:
+                gross_margin = round(
+                    float(latest_gross_profit["value"]) / float(latest_revenue["value"]) * 100.0,
+                    2,
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                gross_margin = None
+
+        result["growth"] = {
+            "revenue_yoy": revenue_yoy,
+            "net_profit_yoy": net_income_yoy,
+            "roe": roe,
+            "gross_margin": gross_margin,
+            "latest_period_type": latest_revenue.get("period_type") if latest_revenue else None,
+        }
+
+        filings = self._extract_recent_filings(submissions)
+        financial_forms = [item for item in filings if item["form"] in {"10-Q", "10-Q/A", "10-K", "10-K/A", "20-F", "20-F/A", "6-K"}]
+        latest_financial = financial_forms[0] if financial_forms else None
+        if latest_financial:
+            result["earnings"] = {
+                "latest_filing_form": latest_financial["form"],
+                "latest_filing_date": latest_financial["filed"],
+                "latest_filing_url": latest_financial["url"],
+                "recent_financial_forms": [
+                    {"form": item["form"], "filed": item["filed"], "url": item["url"]}
+                    for item in financial_forms[:5]
+                ],
+            }
+
+        now = datetime.now()
+        insider_forms = [
+            item for item in filings
+            if item["form"].startswith("4")
+            and item.get("filed_dt") is not None
+            and (now - item["filed_dt"]).days <= 90
+        ]
+        ownership_forms = [
+            item for item in filings
+            if item["form"] in {"13D", "13D/A", "13G", "13G/A"}
+            and item.get("filed_dt") is not None
+            and (now - item["filed_dt"]).days <= 180
+        ]
+        if insider_forms or ownership_forms:
+            result["institution"] = {
+                "insider_form4_count_90d": len(insider_forms),
+                "ownership_disclosure_count_180d": len(ownership_forms),
+                "latest_insider_filing_date": insider_forms[0]["filed"] if insider_forms else None,
+                "latest_ownership_filing_date": ownership_forms[0]["filed"] if ownership_forms else None,
+            }
+
+        has_content = any(bool(result[key]) for key in ("growth", "earnings", "institution"))
+        result["status"] = "partial" if has_content else "not_supported"
         return result

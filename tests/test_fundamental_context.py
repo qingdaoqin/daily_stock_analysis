@@ -37,7 +37,7 @@ class _DummyBoardFetcher:
 
 
 class TestFundamentalContext(unittest.TestCase):
-    def test_non_cn_market_returns_not_supported(self) -> None:
+    def test_us_market_returns_partial_with_sec_bundle(self) -> None:
         manager = DataFetcherManager(fetchers=[])
         cfg = SimpleNamespace(
             enable_fundamental_pipeline=True,
@@ -46,17 +46,64 @@ class TestFundamentalContext(unittest.TestCase):
             fundamental_fetch_timeout_seconds=0.8,
             fundamental_retry_max=1,
         )
+        quote = SimpleNamespace(
+            pe_ratio=28.5,
+            pb_ratio=42.0,
+            total_mv=2.5e12,
+            circ_mv=2.4e12,
+            source=SimpleNamespace(value="yfinance"),
+        )
+        bundle = {
+            "status": "partial",
+            "growth": {"revenue_yoy": 12.0, "net_profit_yoy": 10.0},
+            "earnings": {"latest_filing_form": "10-Q"},
+            "institution": {"insider_form4_count_90d": 1},
+            "source_chain": ["growth:sec_companyfacts", "earnings:sec_submissions"],
+            "errors": [],
+        }
         with patch("src.config.get_config", return_value=cfg):
-            ctx = manager.get_fundamental_context("AAPL")
+            with patch.object(manager, "get_realtime_quote", return_value=quote), \
+                    patch(
+                        "data_provider.fundamental_adapter.UsSecFundamentalAdapter.get_fundamental_bundle",
+                        return_value=bundle,
+                    ):
+                ctx = manager.get_fundamental_context("AAPL")
         self.assertEqual(ctx["market"], "us")
-        self.assertEqual(ctx["status"], "not_supported")
-        self.assertEqual(ctx["coverage"].get("valuation"), "not_supported")
-        self.assertEqual(ctx["coverage"].get("growth"), "not_supported")
-        self.assertEqual(ctx["coverage"].get("earnings"), "not_supported")
-        self.assertEqual(ctx["coverage"].get("institution"), "not_supported")
+        self.assertEqual(ctx["status"], "partial")
+        self.assertEqual(ctx["coverage"].get("valuation"), "ok")
+        self.assertEqual(ctx["coverage"].get("growth"), "ok")
+        self.assertEqual(ctx["coverage"].get("earnings"), "ok")
+        self.assertEqual(ctx["coverage"].get("institution"), "ok")
         self.assertEqual(ctx["coverage"].get("capital_flow"), "not_supported")
         self.assertEqual(ctx["coverage"].get("dragon_tiger"), "not_supported")
         self.assertEqual(ctx["coverage"].get("boards"), "not_supported")
+
+    def test_hk_market_keeps_valuation_and_marks_rest_not_supported(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        quote = SimpleNamespace(
+            pe_ratio=20.1,
+            pb_ratio=4.8,
+            total_mv=3.1e11,
+            circ_mv=2.9e11,
+            source=SimpleNamespace(value="akshare_hk"),
+        )
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote", return_value=quote):
+            ctx = manager.get_fundamental_context("HK00700")
+
+        self.assertEqual(ctx["market"], "hk")
+        self.assertEqual(ctx["status"], "partial")
+        self.assertEqual(ctx["coverage"].get("valuation"), "ok")
+        self.assertEqual(ctx["coverage"].get("growth"), "not_supported")
+        self.assertEqual(ctx["coverage"].get("earnings"), "not_supported")
+        self.assertEqual(ctx["coverage"].get("institution"), "not_supported")
 
     def test_etf_market_downgrades_to_partial_or_not_supported(self) -> None:
         manager = DataFetcherManager(fetchers=[])

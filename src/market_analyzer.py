@@ -70,7 +70,8 @@ class MarketOverview:
     limit_up_count: int = 0             # 涨停家数
     limit_down_count: int = 0           # 跌停家数
     total_amount: float = 0.0           # 两市成交额（亿元）
-    # north_flow: float = 0.0           # 北向资金净流入（亿元）- 已废弃，接口不可用
+    northbound_flow: Optional[float] = None  # 北向资金净流入（亿元）
+    macro_snapshot: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # 美股宏观快照
     
     # 板块涨幅榜
     top_sectors: List[Dict] = field(default_factory=list)     # 涨幅前5板块
@@ -132,8 +133,11 @@ class MarketAnalyzer:
         if self.profile.has_sector_rankings:
             self._get_sector_rankings(overview)
         
-        # 4. 获取北向资金（可选）
-        # self._get_north_flow(overview)
+        # 4. 获取市场关键资金/宏观信号
+        if self.region == "cn":
+            self._get_northbound_flow(overview)
+        elif self.region == "us":
+            self._get_us_macro_snapshot(overview)
         
         return overview
 
@@ -214,27 +218,52 @@ class MarketAnalyzer:
 
         except Exception as e:
             logger.error(f"[大盘] 获取板块涨跌榜失败: {e}")
-    
-    # def _get_north_flow(self, overview: MarketOverview):
-    #     """获取北向资金流入"""
-    #     try:
-    #         logger.info("[大盘] 获取北向资金...")
-    #         
-    #         # 获取北向资金数据
-    #         df = ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
-    #         
-    #         if df is not None and not df.empty:
-    #             # 取最新一条数据
-    #             latest = df.iloc[-1]
-    #             if '当日净流入' in df.columns:
-    #                 overview.north_flow = float(latest['当日净流入']) / 1e8  # 转为亿元
-    #             elif '净流入' in df.columns:
-    #                 overview.north_flow = float(latest['净流入']) / 1e8
-    #                 
-    #             logger.info(f"[大盘] 北向资金净流入: {overview.north_flow:.2f}亿")
-    #             
-    #     except Exception as e:
-    #         logger.warning(f"[大盘] 获取北向资金失败: {e}")
+
+    def _get_northbound_flow(self, overview: MarketOverview):
+        """获取北向资金净流入。"""
+        try:
+            logger.info("[大盘] 获取北向资金...")
+            payload = self.data_manager.get_northbound_flow()
+            flow = payload.get("net_inflow")
+            if flow is not None:
+                overview.northbound_flow = float(flow)
+                logger.info(f"[大盘] 北向资金净流入: {overview.northbound_flow:.2f}亿")
+        except Exception as e:
+            logger.warning(f"[大盘] 获取北向资金失败: {e}")
+
+    def _get_us_macro_snapshot(self, overview: MarketOverview):
+        """获取美股宏观快照。"""
+        try:
+            logger.info("[大盘] 获取美股宏观快照...")
+            snapshot = self.data_manager.get_macro_snapshot(region="us")
+            if snapshot:
+                overview.macro_snapshot = snapshot
+                logger.info(f"[大盘] 获取到 {len(snapshot)} 个宏观指标")
+        except Exception as e:
+            logger.warning(f"[大盘] 获取美股宏观快照失败: {e}")
+
+    @staticmethod
+    def _format_macro_snapshot_lines(snapshot: Dict[str, Dict[str, Any]], locale: str = "zh") -> List[str]:
+        """格式化宏观快照为文本行。"""
+        label_map = {
+            "treasury_10y": ("10Y Treasury Yield", "10年美债收益率"),
+            "dxy": ("US Dollar Index", "美元指数"),
+            "vix": ("VIX", "VIX波动率"),
+        }
+        lines: List[str] = []
+        for key in ("treasury_10y", "dxy", "vix"):
+            item = snapshot.get(key) or {}
+            value = item.get("value")
+            if value is None:
+                continue
+            change_pct = item.get("change_pct")
+            unit = item.get("unit") or ""
+            label = label_map.get(key, (key, key))[0 if locale == "en" else 1]
+            change_text = ""
+            if isinstance(change_pct, (int, float)):
+                change_text = f" ({change_pct:+.2f}%)"
+            lines.append(f"- {label}: {value}{unit}{change_text}")
+        return lines
     
     def search_market_news(self) -> List[Dict]:
         """
@@ -408,6 +437,8 @@ class MarketAnalyzer:
         # 板块信息
         top_sectors_text = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.top_sectors[:3]])
         bottom_sectors_text = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.bottom_sectors[:3]])
+        us_macro_lines = self._format_macro_snapshot_lines(overview.macro_snapshot, locale="en")
+        cn_macro_lines = self._format_macro_snapshot_lines(overview.macro_snapshot, locale="zh")
         
         # 新闻信息 - 支持 SearchResult 对象或字典
         news_text = ""
@@ -424,6 +455,7 @@ class MarketAnalyzer:
         # 按 region 组装市场概况与板块区块（美股无涨跌家数、板块数据）
         stats_block = ""
         sector_block = ""
+        macro_block = ""
         if self.region == "us":
             if self.profile.has_market_stats:
                 stats_block = f"""## Market Overview
@@ -432,6 +464,12 @@ class MarketAnalyzer:
 - Total volume (CNY bn): {overview.total_amount:.0f}"""
             else:
                 stats_block = "## Market Overview\n(US market has no equivalent advance/decline stats.)"
+
+            macro_block = (
+                "## Macro & Flows\n" + "\n".join(us_macro_lines)
+                if us_macro_lines
+                else "## Macro & Flows\n(No macro snapshot available.)"
+            )
 
             if self.profile.has_sector_rankings:
                 sector_block = f"""## Sector Performance
@@ -445,6 +483,8 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
 - 上涨: {overview.up_count} 家 | 下跌: {overview.down_count} 家 | 平盘: {overview.flat_count} 家
 - 涨停: {overview.limit_up_count} 家 | 跌停: {overview.limit_down_count} 家
 - 两市成交额: {overview.total_amount:.0f} 亿元"""
+                if overview.northbound_flow is not None:
+                    stats_block += f"\n- 北向资金净流入: {overview.northbound_flow:.2f} 亿元"
             else:
                 stats_block = "## 市场概况\n（美股暂无涨跌家数等统计）"
 
@@ -454,6 +494,8 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
 领跌: {bottom_sectors_text if bottom_sectors_text else "暂无数据"}"""
             else:
                 sector_block = "## 板块表现\n（美股暂无板块涨跌数据）"
+            if cn_macro_lines:
+                macro_block = "## 宏观与资金\n" + "\n".join(cn_macro_lines)
 
         data_no_indices_hint = (
             "注意：由于行情数据获取失败，请主要根据【市场新闻】进行定性分析和总结，不要编造具体的指数点位。"
@@ -489,6 +531,8 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
 {indices_placeholder}
 
 {stats_block}
+
+{macro_block}
 
 {sector_block}
 
@@ -551,6 +595,8 @@ Output the report content directly, no extra commentary.
 {indices_placeholder}
 
 {stats_block}
+
+{macro_block}
 
 {sector_block}
 
@@ -628,6 +674,10 @@ Output the report content directly, no extra commentary.
         # 板块信息
         top_text = "、".join([s['name'] for s in overview.top_sectors[:3]])
         bottom_text = "、".join([s['name'] for s in overview.bottom_sectors[:3]])
+        macro_lines = self._format_macro_snapshot_lines(
+            overview.macro_snapshot,
+            locale="en" if self.region == "us" else "zh",
+        )
         
         # 按 region 决定是否包含涨跌统计和板块（美股无）
         stats_section = ""
@@ -642,6 +692,8 @@ Output the report content directly, no extra commentary.
 | 跌停 | {overview.limit_down_count} |
 | 两市成交额 | {overview.total_amount:.0f}亿 |
 """
+            if overview.northbound_flow is not None:
+                stats_section += f"| 北向资金净流入 | {overview.northbound_flow:.2f}亿 |\n"
         sector_section = ""
         if self.profile.has_sector_rankings and (top_text or bottom_text):
             sector_section = f"""
@@ -649,6 +701,10 @@ Output the report content directly, no extra commentary.
 - **领涨**: {top_text}
 - **领跌**: {bottom_text}
 """
+        macro_section = ""
+        if macro_lines:
+            title = "### 四、宏观与资金" if self.region == "cn" else "### 4. Macro & Flows"
+            macro_section = "\n" + title + "\n" + "\n".join(macro_lines) + "\n"
         market_label = "A股" if self.region == "cn" else "美股"
         strategy_summary = self.strategy.to_markdown_block()
         report = f"""## {overview.date} 大盘复盘
@@ -660,6 +716,7 @@ Output the report content directly, no extra commentary.
 {indices_text}
 {stats_section}
 {sector_section}
+{macro_section}
 ### 五、风险提示
 市场有风险，投资需谨慎。以上数据仅供参考，不构成投资建议。
 

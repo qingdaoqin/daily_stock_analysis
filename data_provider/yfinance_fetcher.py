@@ -412,6 +412,67 @@ class YfinanceFetcher(BaseFetcher):
 
         return None
 
+    def get_macro_snapshot(self, region: str = "us") -> Optional[Dict[str, Dict[str, Any]]]:
+        """获取美股宏观快照（美债收益率、美元指数、VIX）。"""
+        if region != "us":
+            return None
+
+        try:
+            import yfinance as yf
+        except Exception as exc:
+            logger.debug(f"[Yfinance] 宏观快照不可用: {exc}")
+            return None
+
+        metrics = {
+            "treasury_10y": {
+                "label": "10Y Treasury Yield",
+                "unit": "%",
+                "candidates": ["^TNX"],
+            },
+            "dxy": {
+                "label": "US Dollar Index",
+                "unit": "",
+                "candidates": ["DX-Y.NYB", "DX=F"],
+            },
+            "vix": {
+                "label": "VIX",
+                "unit": "",
+                "candidates": ["^VIX"],
+            },
+        }
+
+        snapshot: Dict[str, Dict[str, Any]] = {}
+        for metric_name, meta in metrics.items():
+            for symbol in meta["candidates"]:
+                try:
+                    hist = yf.Ticker(symbol).history(period="5d")
+                    if hist is None or hist.empty or "Close" not in hist.columns:
+                        continue
+
+                    latest_close = float(hist["Close"].iloc[-1])
+                    prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else latest_close
+                    value = latest_close
+                    if metric_name == "treasury_10y" and value > 20:
+                        value = value / 10.0
+
+                    change_pct = 0.0
+                    if prev_close:
+                        change_pct = round((latest_close - prev_close) / abs(prev_close) * 100.0, 2)
+
+                    snapshot[metric_name] = {
+                        "label": meta["label"],
+                        "value": round(value, 2),
+                        "unit": meta["unit"],
+                        "change_pct": change_pct,
+                        "symbol": symbol,
+                    }
+                    break
+                except Exception as exc:
+                    logger.debug(f"[Yfinance] 获取宏观指标 {metric_name}({symbol}) 失败: {exc}")
+                    continue
+
+        return snapshot or None
+
     def _is_us_stock(self, stock_code: str) -> bool:
         """
         判断代码是否为美股股票（排除美股指数）。

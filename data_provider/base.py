@@ -25,7 +25,7 @@ from typing import Callable, Optional, List, Tuple, Dict, Any
 import pandas as pd
 import numpy as np
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
-from .fundamental_adapter import AkshareFundamentalAdapter
+from .fundamental_adapter import AkshareFundamentalAdapter, UsSecFundamentalAdapter
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -306,6 +306,10 @@ class BaseFetcher(ABC):
         """
         return None
 
+    def get_macro_snapshot(self, region: str = "us") -> Optional[Dict[str, Dict[str, Any]]]:
+        """获取宏观/资金快照。"""
+        return None
+
     def get_sector_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
         """
         获取板块涨跌榜
@@ -492,6 +496,7 @@ class DataFetcherManager:
             # 默认数据源将在首次使用时延迟加载
             self._init_default_fetchers()
         self._fundamental_adapter = AkshareFundamentalAdapter()
+        self._us_fundamental_adapter = UsSecFundamentalAdapter()
         self._fundamental_cache: Dict[str, Dict[str, Any]] = {}
         self._fundamental_cache_lock = RLock()
         self._fundamental_timeout_worker_limit = 8
@@ -1378,6 +1383,55 @@ class DataFetcherManager:
                 continue
         return {}
 
+    def get_macro_snapshot(self, region: str = "us") -> Dict[str, Dict[str, Any]]:
+        """获取宏观/资金快照（自动切换数据源）。"""
+        for fetcher in self._fetchers:
+            try:
+                data = fetcher.get_macro_snapshot(region=region)
+                if data:
+                    logger.info(f"[{fetcher.name}] 获取宏观快照成功")
+                    return data
+            except Exception as e:
+                logger.warning(f"[{fetcher.name}] 获取宏观快照失败: {e}")
+                continue
+        return {}
+
+    def get_northbound_flow(self) -> Dict[str, Any]:
+        """获取北向资金净流入（亿元）。"""
+        from src.config import get_config
+
+        config = get_config()
+        timeout = max(0.0, float(getattr(config, "fundamental_fetch_timeout_seconds", 0.8)))
+        if timeout <= 0:
+            return {
+                "status": "failed",
+                "net_inflow": None,
+                "source_chain": [],
+                "errors": ["northbound_flow timeout"],
+            }
+
+        payload, err, _ = self._run_with_retry(
+            lambda: self._fundamental_adapter.get_northbound_flow(),
+            timeout,
+            "northbound_flow",
+        )
+        if not isinstance(payload, dict):
+            return {
+                "status": "failed",
+                "net_inflow": None,
+                "source_chain": [],
+                "errors": [err or "northbound_flow failed"],
+            }
+        result = {
+            "status": payload.get("status", "partial"),
+            "net_inflow": payload.get("net_inflow"),
+            "source_chain": list(payload.get("source_chain", [])),
+            "errors": list(payload.get("errors", [])),
+        }
+        if err:
+            result["errors"].append(err)
+        return result
+
     def _run_with_timeout(
         self,
         task: Callable[[], Any],
@@ -1680,11 +1734,6 @@ class DataFetcherManager:
         stock_code = normalize_stock_code(stock_code)
         market = _market_tag(stock_code)
         is_etf = _is_etf_code(stock_code)
-        if market in {"us", "hk"}:
-            return self._build_market_not_supported(
-                market=market,
-                reason="market not supported",
-            )
 
         stage_timeout = float(
             budget_seconds if budget_seconds is not None else config.fundamental_stage_timeout_seconds
@@ -1761,38 +1810,71 @@ class DataFetcherManager:
             [valuation_err] if valuation_err else [],
         )
 
-        # growth / earnings / institution (one AkShare call)
+        # growth / earnings / institution (market-specific structured source)
         if remaining_seconds <= 0:
             bundle_status = "failed"
             bundle_payload: Dict[str, Any] = {}
             bundle_errors = ["fundamental stage timeout"]
             bundle_ms = 0
+            bundle_provider_name = "fundamental_bundle"
         else:
             bundle_timeout = min(fetch_timeout, remaining_seconds)
-            bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
-                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
-                bundle_timeout,
-                "fundamental_bundle",
-            )
-            _consume_budget(bundle_ms)
-            if not isinstance(bundle_payload, dict):
-                bundle_status = "failed"
-                bundle_payload = {}
-                bundle_errors = ["fundamental_bundle failed"]
-                if bundle_err_msg:
-                    bundle_errors.append(bundle_err_msg)
+            if market == "cn":
+                bundle_provider_name = "fundamental_bundle"
+                bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
+                    lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
+                    bundle_timeout,
+                    "fundamental_bundle",
+                )
+                _consume_budget(bundle_ms)
+                if not isinstance(bundle_payload, dict):
+                    bundle_status = "failed"
+                    bundle_payload = {}
+                    bundle_errors = ["fundamental_bundle failed"]
+                    if bundle_err_msg:
+                        bundle_errors.append(bundle_err_msg)
+                else:
+                    bundle_status = str(bundle_payload.get("status", "not_supported"))
+                    bundle_errors = [bundle_err_msg] if bundle_err_msg else []
+            elif market == "us":
+                bundle_provider_name = "us_fundamental_bundle"
+                bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
+                    lambda: self._us_fundamental_adapter.get_fundamental_bundle(stock_code),
+                    bundle_timeout,
+                    "us_fundamental_bundle",
+                )
+                _consume_budget(bundle_ms)
+                if not isinstance(bundle_payload, dict):
+                    bundle_status = "failed"
+                    bundle_payload = {}
+                    bundle_errors = ["us_fundamental_bundle failed"]
+                    if bundle_err_msg:
+                        bundle_errors.append(bundle_err_msg)
+                else:
+                    bundle_status = str(bundle_payload.get("status", "not_supported"))
+                    bundle_errors = [bundle_err_msg] if bundle_err_msg else []
             else:
-                bundle_status = str(bundle_payload.get("status", "not_supported"))
-                bundle_errors = [bundle_err_msg] if bundle_err_msg else []
+                bundle_provider_name = "hk_fundamental_bundle"
+                bundle_ms = 0
+                bundle_status = "not_supported"
+                bundle_payload = {
+                    "status": "not_supported",
+                    "growth": {},
+                    "earnings": {},
+                    "institution": {},
+                    "source_chain": [],
+                    "errors": ["structured hk fundamental not supported"],
+                }
+                bundle_errors = []
 
         bundle_chain = self._normalize_source_chain(
             bundle_payload.get("source_chain", []),
-            "fundamental_bundle",
+            bundle_provider_name,
             bundle_status,
             bundle_ms,
         ) if isinstance(bundle_payload, dict) else self._normalize_source_chain(
             None,
-            "fundamental_bundle",
+            bundle_provider_name,
             bundle_status,
             bundle_ms,
         )
@@ -1897,7 +1979,11 @@ class DataFetcherManager:
             )
         elif all(value == "not_supported" for value in block_statuses.values()):
             result_ctx["status"] = "not_supported"
-        elif "failed" in block_statuses.values() or "partial" in block_statuses.values():
+        elif (
+            "failed" in block_statuses.values()
+            or "partial" in block_statuses.values()
+            or "not_supported" in block_statuses.values()
+        ):
             result_ctx["status"] = "partial"
         else:
             result_ctx["status"] = "ok"

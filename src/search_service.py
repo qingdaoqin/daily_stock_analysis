@@ -1419,6 +1419,17 @@ class SearchService:
             return True
         return False
 
+    @staticmethod
+    def _market_tag(stock_code: str) -> str:
+        """返回市场标签: cn/us/hk。"""
+        code = (stock_code or "").strip()
+        lower = code.lower()
+        if lower.endswith(".hk") or lower.startswith("hk") or (code.isdigit() and len(code) == 5):
+            return "hk"
+        if SearchService._is_foreign_stock(code):
+            return "us"
+        return "cn"
+
     # A-share ETF code prefixes (Shanghai 51/52/56/58, Shenzhen 15/16/18)
     _A_ETF_PREFIXES = ('51', '52', '56', '58', '15', '16', '18')
     _ETF_NAME_KEYWORDS = ('ETF', 'FUND', 'TRUST', 'INDEX', 'TRACKER', 'UNIT')  # US/HK ETF name hints
@@ -1581,10 +1592,27 @@ class SearchService:
             SearchResponse 对象
         """
         if event_types is None:
-            if self._is_foreign_stock(stock_code):
-                event_types = ["earnings report", "insider selling", "quarterly results"]
+            market = self._market_tag(stock_code)
+            if market == "us":
+                event_types = [
+                    "earnings report",
+                    "insider selling",
+                    "quarterly results",
+                    "SEC filing",
+                    "guidance",
+                    "dividend ex-date",
+                ]
+            elif market == "hk":
+                event_types = [
+                    "业绩公告",
+                    "profit warning",
+                    "回购",
+                    "配股",
+                    "分红除净",
+                    "HKEX announcement",
+                ]
             else:
-                event_types = ["年报预告", "减持公告", "业绩快报"]
+                event_types = ["年报预告", "减持公告", "业绩快报", "解禁", "回购", "增持"]
         
         # 构建针对性查询
         event_query = " OR ".join(event_types)
@@ -1614,7 +1642,7 @@ class SearchService:
         self,
         stock_code: str,
         stock_name: str,
-        max_searches: int = 3
+        max_searches: int = 6
     ) -> Dict[str, SearchResponse]:
         """
         多维度情报搜索（同时使用多个引擎、多个维度）
@@ -1635,13 +1663,28 @@ class SearchService:
         results = {}
         search_count = 0
 
-        is_foreign = self._is_foreign_stock(stock_code)
+        market = self._market_tag(stock_code)
+        is_foreign = market in {"us", "hk"}
         is_index_etf = self.is_index_or_etf(stock_code, stock_name)
 
-        if is_foreign:
+        if market == "us":
             search_dimensions = [
                 {'name': 'latest_news', 'query': f"{stock_name} {stock_code} latest news events", 'desc': '最新消息'},
-                {'name': 'market_analysis', 'query': f"{stock_name} analyst rating target price report", 'desc': '机构分析'},
+                {
+                    'name': 'official_filings',
+                    'query': (
+                        f"site:sec.gov {stock_name} {stock_code} "
+                        f"(10-Q OR 10-K OR 8-K OR \"Form 4\" OR \"13D\" OR \"13G\")"
+                    ),
+                    'desc': '官方披露',
+                },
+                {
+                    'name': 'event_calendar',
+                    'query': (
+                        f"{stock_name} {stock_code} earnings date guidance dividend ex-date split conference call"
+                    ),
+                    'desc': '事件日历',
+                },
                 {'name': 'risk_check', 'query': (
                     f"{stock_name} {stock_code} index performance outlook tracking error"
                     if is_index_etf else f"{stock_name} risk insider selling lawsuit litigation"
@@ -1650,15 +1693,64 @@ class SearchService:
                     f"{stock_name} {stock_code} index performance composition outlook"
                     if is_index_etf else f"{stock_name} earnings revenue profit growth forecast"
                 ), 'desc': '业绩预期'},
+                {'name': 'macro_flows', 'query': (
+                    f"{stock_name} {stock_code} treasury yield dxy vix sector rotation"
+                    if is_index_etf else f"{stock_name} {stock_code} short interest options put call insider buying"
+                ), 'desc': '宏观资金'},
+                {'name': 'market_analysis', 'query': f"{stock_name} analyst rating target price report", 'desc': '机构分析'},
                 {'name': 'industry', 'query': (
                     f"{stock_name} {stock_code} index sector allocation holdings"
                     if is_index_etf else f"{stock_name} industry competitors market share outlook"
                 ), 'desc': '行业分析'},
             ]
+        elif market == "hk":
+            search_dimensions = [
+                {'name': 'latest_news', 'query': f"{stock_name} {stock_code} 最新 消息 公告", 'desc': '最新消息'},
+                {
+                    'name': 'official_announcements',
+                    'query': (
+                        f"(site:hkexnews.hk OR site:hkex.com.hk) "
+                        f"{stock_name} {stock_code} announcement results profit warning buyback"
+                    ),
+                    'desc': '官方公告',
+                },
+                {
+                    'name': 'event_calendar',
+                    'query': (
+                        f"{stock_name} {stock_code} earnings date dividend ex-date buyback shareholder meeting"
+                    ),
+                    'desc': '事件日历',
+                },
+                {'name': 'risk_check', 'query': (
+                    f"{stock_name} {stock_code} tracking error premium discount"
+                    if is_index_etf else f"{stock_name} {stock_code} profit warning placement litigation insider selling"
+                ), 'desc': '风险排查'},
+                {'name': 'earnings', 'query': (
+                    f"{stock_name} {stock_code} results revenue profit guidance"
+                ), 'desc': '业绩预期'},
+                {'name': 'market_analysis', 'query': f"{stock_name} {stock_code} target price rating broker report", 'desc': '机构分析'},
+                {'name': 'industry', 'query': (
+                    f"{stock_name} {stock_code} sector peers market share outlook"
+                ), 'desc': '行业分析'},
+            ]
         else:
             search_dimensions = [
                 {'name': 'latest_news', 'query': f"{stock_name} {stock_code} 最新 新闻 重大 事件", 'desc': '最新消息'},
-                {'name': 'market_analysis', 'query': f"{stock_name} 研报 目标价 评级 深度分析", 'desc': '机构分析'},
+                {
+                    'name': 'official_announcements',
+                    'query': (
+                        f"(site:cninfo.com.cn OR site:sse.com.cn OR site:szse.cn) "
+                        f"{stock_name} {stock_code} 公告"
+                    ),
+                    'desc': '官方公告',
+                },
+                {
+                    'name': 'event_calendar',
+                    'query': (
+                        f"{stock_name} {stock_code} 解禁 回购 增持 减持 分红 除权 业绩预约披露"
+                    ),
+                    'desc': '事件日历',
+                },
                 {'name': 'risk_check', 'query': (
                     f"{stock_name} 指数走势 跟踪误差 净值 表现"
                     if is_index_etf else f"{stock_name} 减持 处罚 违规 诉讼 利空 风险"
@@ -1667,6 +1759,7 @@ class SearchService:
                     f"{stock_name} 指数成分 净值 跟踪表现"
                     if is_index_etf else f"{stock_name} 业绩预告 财报 营收 净利润 同比增长"
                 ), 'desc': '业绩预期'},
+                {'name': 'market_analysis', 'query': f"{stock_name} 研报 目标价 评级 深度分析", 'desc': '机构分析'},
                 {'name': 'industry', 'query': (
                     f"{stock_name} 指数成分股 行业配置 权重"
                     if is_index_etf else f"{stock_name} 所在行业 竞争对手 市场份额 行业前景"
@@ -1678,6 +1771,7 @@ class SearchService:
         # 轮流使用不同的搜索引擎
         provider_index = 0
         
+        max_searches = max(1, min(max_searches, len(search_dimensions)))
         for dim in search_dimensions:
             if search_count >= max_searches:
                 break
@@ -1720,7 +1814,17 @@ class SearchService:
         lines = [f"【{stock_name} 情报搜索结果】"]
         
         # 维度展示顺序
-        display_order = ['latest_news', 'market_analysis', 'risk_check', 'earnings', 'industry']
+        display_order = [
+            'latest_news',
+            'official_announcements',
+            'official_filings',
+            'event_calendar',
+            'risk_check',
+            'earnings',
+            'market_analysis',
+            'macro_flows',
+            'industry',
+        ]
         
         for dim_name in display_order:
             if dim_name not in intel_results:
@@ -1731,9 +1835,13 @@ class SearchService:
             # 获取维度描述
             dim_desc = dim_name
             if dim_name == 'latest_news': dim_desc = '📰 最新消息'
+            elif dim_name == 'official_announcements': dim_desc = '📣 官方公告'
+            elif dim_name == 'official_filings': dim_desc = '📄 官方披露'
+            elif dim_name == 'event_calendar': dim_desc = '🗓️ 事件日历'
             elif dim_name == 'market_analysis': dim_desc = '📈 机构分析'
             elif dim_name == 'risk_check': dim_desc = '⚠️ 风险排查'
             elif dim_name == 'earnings': dim_desc = '📊 业绩预期'
+            elif dim_name == 'macro_flows': dim_desc = '🌐 宏观资金'
             elif dim_name == 'industry': dim_desc = '🏭 行业分析'
             
             lines.append(f"\n{dim_desc} (来源: {resp.provider}):")

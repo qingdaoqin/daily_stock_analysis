@@ -44,6 +44,32 @@ class TestMarketAnalyzerStrategyPrompt(unittest.TestCase):
         self.assertIn("Strategy Plan", prompt)
         self.assertIn("US Market Regime Strategy", prompt)
 
+    def test_cn_prompt_includes_northbound_flow_when_available(self):
+        analyzer = MarketAnalyzer(region="cn")
+        prompt = analyzer._build_review_prompt(
+            MarketOverview(date="2026-02-24", northbound_flow=35.6),
+            [],
+        )
+
+        self.assertIn("北向资金净流入: 35.60 亿元", prompt)
+
+    def test_us_prompt_includes_macro_flows_block(self):
+        analyzer = MarketAnalyzer(region="us")
+        prompt = analyzer._build_review_prompt(
+            MarketOverview(
+                date="2026-02-24",
+                macro_snapshot={
+                    "treasury_10y": {"value": 4.32, "unit": "%", "change_pct": 1.25},
+                    "dxy": {"value": 103.1, "unit": "", "change_pct": -0.45},
+                },
+            ),
+            [],
+        )
+
+        self.assertIn("Macro & Flows", prompt)
+        self.assertIn("10Y Treasury Yield: 4.32%", prompt)
+        self.assertIn("US Dollar Index: 103.1", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -237,6 +237,7 @@ class AnalysisTaskQueue:
         stock_name: Optional[str] = None,
         report_type: str = "detailed",
         force_refresh: bool = False,
+        notify: bool = True,
     ) -> Tuple[List[TaskInfo], List[DuplicateTaskError]]:
         """
         批量提交分析任务。
@@ -279,6 +280,7 @@ class AnalysisTaskQueue:
                         stock_code,
                         report_type,
                         force_refresh,
+                        notify,
                     )
                 except Exception:
                     # 回滚当前批次，避免 API 拿不到 task_id 却留下半提交任务。
@@ -381,6 +383,7 @@ class AnalysisTaskQueue:
         stock_code: str,
         report_type: str,
         force_refresh: bool,
+        notify: bool = True,
     ) -> Optional[Dict[str, Any]]:
         """
         执行分析任务（在线程池中运行）
@@ -417,6 +420,7 @@ class AnalysisTaskQueue:
                 report_type=report_type,
                 force_refresh=force_refresh,
                 query_id=task_id,
+                send_notification=notify,
             )
             
             if result:

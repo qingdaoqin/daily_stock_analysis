@@ -133,7 +133,7 @@ class TestAnalyzerSchemaFallback(unittest.TestCase):
         self.assertEqual(result.analysis_summary, "技术面向好")
 
     def test_parse_response_reconciles_conflicting_signal_fields(self) -> None:
-        """Conflicting top-level fields should be normalized to a conservative hold signal."""
+        """Conflicting top-level fields should be normalized into a directional hold state."""
         analyzer = GeminiAnalyzer()
         response = json.dumps({
             "stock_name": "Apple",
@@ -153,13 +153,32 @@ class TestAnalyzerSchemaFallback(unittest.TestCase):
         result = analyzer._parse_response(response, "AAPL", "Apple")
 
         self.assertEqual(result.decision_type, "hold")
-        self.assertEqual(result.operation_advice, "观望")
-        self.assertEqual(result.trend_prediction, "震荡")
-        self.assertTrue(40 <= result.sentiment_score <= 59)
+        self.assertEqual(result.operation_advice, "持有")
+        self.assertEqual(result.trend_prediction, "震荡偏多")
+        self.assertTrue(52 <= result.sentiment_score <= 59)
         self.assertIsInstance(result.dashboard, dict)
         self.assertEqual(result.dashboard["decision_type"], "hold")
-        self.assertEqual(result.dashboard["core_conclusion"]["signal_type"], "持有观望")
-        self.assertEqual(result.dashboard["core_conclusion"]["one_sentence"], "信号存在分歧，当前以观望为主")
+        self.assertEqual(result.dashboard["core_conclusion"]["signal_type"], "持有待机")
+        self.assertEqual(result.dashboard["core_conclusion"]["one_sentence"], "多空有分歧，当前先持有等待更优买点")
+
+    def test_parse_response_can_surface_bearish_hold_bias(self) -> None:
+        """Sell-vs-bullish conflicts should become a defensive hold with bearish bias when negatives dominate."""
+        analyzer = GeminiAnalyzer()
+        response = json.dumps({
+            "stock_name": "Apple",
+            "sentiment_score": 28,
+            "trend_prediction": "看多",
+            "operation_advice": "卖出",
+            "decision_type": "sell",
+            "analysis_summary": "原始输出存在分歧",
+        })
+
+        result = analyzer._parse_response(response, "AAPL", "Apple")
+
+        self.assertEqual(result.decision_type, "hold")
+        self.assertEqual(result.operation_advice, "观望")
+        self.assertEqual(result.trend_prediction, "震荡偏空")
+        self.assertTrue(40 <= result.sentiment_score <= 47)
 
     def test_parse_response_normalizes_strong_decision_label_but_keeps_buy_signal(self) -> None:
         """Model-facing strong_buy labels should be accepted and mapped to the stable enum."""

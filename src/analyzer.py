@@ -116,9 +116,18 @@ def _coerce_sentiment_score_value(value: Any, default: int = 50) -> int:
 
 
 def _clamp_sentiment_score_to_signal(score: int, signal: str) -> int:
+    return _clamp_sentiment_score_to_signal_with_bias(score, signal, "neutral")
+
+
+def _clamp_sentiment_score_to_signal_with_bias(score: int, signal: str, hold_bias: str = "neutral") -> int:
+    hold_bands = {
+        "bullish": (52, 59),
+        "neutral": (46, 54),
+        "bearish": (40, 47),
+    }
     bands = {
         "buy": (60, 79),
-        "hold": (40, 59),
+        "hold": hold_bands.get(hold_bias, hold_bands["neutral"]),
         "sell": (0, 39),
     }
     low, high = bands.get(signal, (0, 100))
@@ -126,48 +135,89 @@ def _clamp_sentiment_score_to_signal(score: int, signal: str) -> int:
 
 
 def _canonical_operation_advice(signal: str) -> str:
+    return _canonical_operation_advice_with_bias(signal, "neutral")
+
+
+def _canonical_operation_advice_with_bias(signal: str, hold_bias: str = "neutral") -> str:
+    if signal == "hold":
+        return "观望" if hold_bias == "bearish" else "持有"
     mapping = {
         "buy": "买入",
-        "hold": "观望",
         "sell": "减仓/卖出",
     }
     return mapping.get(signal, "观望")
 
 
 def _canonical_trend_prediction(signal: str) -> str:
+    return _canonical_trend_prediction_with_bias(signal, "neutral")
+
+
+def _canonical_trend_prediction_with_bias(signal: str, hold_bias: str = "neutral") -> str:
+    if signal == "hold":
+        hold_mapping = {
+            "bullish": "震荡偏多",
+            "neutral": "震荡",
+            "bearish": "震荡偏空",
+        }
+        return hold_mapping.get(hold_bias, "震荡")
     mapping = {
         "buy": "看多",
-        "hold": "震荡",
         "sell": "看空",
     }
     return mapping.get(signal, "震荡")
 
 
 def _canonical_signal_type(signal: str) -> str:
+    return _canonical_signal_type_with_bias(signal, "neutral")
+
+
+def _canonical_signal_type_with_bias(signal: str, hold_bias: str = "neutral") -> str:
+    if signal == "hold":
+        hold_mapping = {
+            "bullish": "持有待机",
+            "neutral": "持有观望",
+            "bearish": "谨慎观望",
+        }
+        return hold_mapping.get(hold_bias, "持有观望")
     mapping = {
         "buy": "买入信号",
-        "hold": "持有观望",
         "sell": "卖出信号",
     }
     return mapping.get(signal, "持有观望")
 
 
 def _default_position_advice_for_signal(signal: str) -> Dict[str, str]:
+    return _default_position_advice_for_signal_with_bias(signal, "neutral")
+
+
+def _default_position_advice_for_signal_with_bias(signal: str, hold_bias: str = "neutral") -> Dict[str, str]:
+    if signal == "hold":
+        hold_mapping = {
+            "bullish": {
+                "no_position": "暂不追价，等回踩支撑位或下一次确认后再考虑介入。",
+                "has_position": "可继续持有，回踩关键支撑不破则耐心观察。",
+            },
+            "neutral": {
+                "no_position": "先观察，等待趋势和消息进一步明朗。",
+                "has_position": "控制仓位，等待新的方向选择。",
+            },
+            "bearish": {
+                "no_position": "暂不开新仓，等待风险释放或重新企稳。",
+                "has_position": "以防守为主，跌破关键位优先减仓。",
+            },
+        }
+        return hold_mapping.get(hold_bias, hold_mapping["neutral"])
     mapping = {
         "buy": {
             "no_position": "可等待回踩支撑位后分批试仓，避免一次性追高。",
             "has_position": "可继续持有，回踩关键位不破再考虑加仓。",
-        },
-        "hold": {
-            "no_position": "先观察，不追价，等待更清晰的入场条件。",
-            "has_position": "以持有观察为主，跌破止损位再执行风控。",
         },
         "sell": {
             "no_position": "暂不参与，等待风险充分释放后再评估。",
             "has_position": "优先控制回撤，按计划减仓或离场。",
         },
     }
-    return mapping.get(signal, mapping["hold"])
+    return mapping.get(signal, _default_position_advice_for_signal_with_bias("hold", hold_bias))
 
 
 def _resolve_consistent_signal(signals: List[str]) -> Tuple[str, bool]:
@@ -191,11 +241,23 @@ def _resolve_consistent_signal(signals: List[str]) -> Tuple[str, bool]:
     return final_signal, has_conflict
 
 
+def _derive_hold_bias(signals: List[str]) -> str:
+    valid_signals = [signal for signal in signals if signal in {"buy", "hold", "sell"}]
+    buy_count = valid_signals.count("buy")
+    sell_count = valid_signals.count("sell")
+    if buy_count > sell_count:
+        return "bullish"
+    if sell_count > buy_count:
+        return "bearish"
+    return "neutral"
+
+
 def _normalize_dashboard_signal_fields(
     dashboard: Any,
     signal: str,
     *,
     has_conflict: bool,
+    hold_bias: str = "neutral",
 ) -> Any:
     if not isinstance(dashboard, dict):
         return dashboard
@@ -206,20 +268,22 @@ def _normalize_dashboard_signal_fields(
         core = {}
         dashboard["core_conclusion"] = core
 
-    core["signal_type"] = _canonical_signal_type(signal)
+    core["signal_type"] = _canonical_signal_type_with_bias(signal, hold_bias)
     if has_conflict or not isinstance(core.get("position_advice"), dict):
-        core["position_advice"] = _default_position_advice_for_signal(signal)
+        core["position_advice"] = _default_position_advice_for_signal_with_bias(signal, hold_bias)
     if has_conflict:
-        core["one_sentence"] = {
-            "buy": "趋势偏强，但应等待更优买点",
-            "hold": "信号存在分歧，当前以观望为主",
-            "sell": "风险偏高，优先减仓防守",
-        }.get(signal, "信号存在分歧，当前以观望为主")
-        core["time_sensitivity"] = {
-            "buy": "本周内",
-            "hold": "不急",
-            "sell": "立即行动",
-        }.get(signal, "不急")
+        hold_summary = {
+            "bullish": ("多空有分歧，当前先持有等待更优买点", "本周内"),
+            "neutral": ("信号存在分歧，当前以观望为主", "不急"),
+            "bearish": ("上行动能不足，当前先观望或偏防守", "今日内"),
+        }
+        summary, time_sensitivity = {
+            "buy": ("趋势偏强，但应等待更优买点", "本周内"),
+            "hold": hold_summary.get(hold_bias, hold_summary["neutral"]),
+            "sell": ("风险偏高，优先减仓防守", "立即行动"),
+        }.get(signal, hold_summary["neutral"])
+        core["one_sentence"] = summary
+        core["time_sensitivity"] = time_sensitivity
 
     return dashboard
 
@@ -746,7 +810,7 @@ class GeminiAnalyzer:
 {
     "stock_name": "股票中文名称",
     "sentiment_score": 0-100整数,
-    "trend_prediction": "强烈看多/看多/震荡/看空/强烈看空",
+    "trend_prediction": "强烈看多/看多/震荡偏多/震荡/震荡偏空/看空/强烈看空",
     "operation_advice": "买入/加仓/持有/减仓/卖出/观望",
     "decision_type": "buy/hold/sell",
     "confidence_level": "高/中/低",
@@ -879,7 +943,8 @@ class GeminiAnalyzer:
 2. **分持仓建议**：空仓者和持仓者给不同建议
 3. **精确狙击点**：必须给出具体价格，不说模糊的话
 4. **检查清单可视化**：用 通过/警示/否决 明确显示每项检查结果
-5. **风险优先级**：舆情中的风险点要醒目标出"""
+5. **风险优先级**：舆情中的风险点要醒目标出
+6. **字段一致性**：`decision_type`、`operation_advice`、`trend_prediction`、`sentiment_score` 必须互相一致；若多空分歧，请用 `hold + 震荡偏多/震荡/震荡偏空` 表达，不得输出“看空但买入”之类冲突组合"""
 
     def __init__(self, api_key: Optional[str] = None):
         """Initialize LLM Analyzer via LiteLLM.
@@ -1756,6 +1821,7 @@ class GeminiAnalyzer:
                 elif action_signal and score_signal and (action_signal, score_signal) in opposite_pairs:
                     hard_conflict = True
 
+                hold_bias = "neutral"
                 if hard_conflict:
                     final_signal = "hold"
                 elif action_signal:
@@ -1767,28 +1833,37 @@ class GeminiAnalyzer:
                     ])
 
                 has_conflict = hard_conflict
+                if final_signal == "hold":
+                    hold_bias = _derive_hold_bias([
+                        decision_signal,
+                        operation_signal,
+                        trend_signal,
+                        score_signal,
+                    ])
 
                 normalized_score = raw_score
                 if raw_score < 0 or raw_score > 100 or hard_conflict:
-                    normalized_score = _clamp_sentiment_score_to_signal(
+                    normalized_score = _clamp_sentiment_score_to_signal_with_bias(
                         max(0, min(100, raw_score)),
                         final_signal,
+                        hold_bias,
                     )
 
                 normalized_trend_prediction = raw_trend_prediction
                 if hard_conflict and trend_signal not in ("", final_signal):
-                    normalized_trend_prediction = _canonical_trend_prediction(final_signal)
+                    normalized_trend_prediction = _canonical_trend_prediction_with_bias(final_signal, hold_bias)
 
                 normalized_operation_advice = raw_operation_advice
                 if not action_signal:
-                    normalized_operation_advice = _canonical_operation_advice(final_signal)
+                    normalized_operation_advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
                 elif hard_conflict and operation_signal not in ("", final_signal):
-                    normalized_operation_advice = _canonical_operation_advice(final_signal)
+                    normalized_operation_advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
 
                 dashboard = _normalize_dashboard_signal_fields(
                     dashboard,
                     final_signal,
                     has_conflict=has_conflict,
+                    hold_bias=hold_bias,
                 )
                 
                 return AnalysisResult(

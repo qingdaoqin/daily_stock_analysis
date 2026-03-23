@@ -304,7 +304,7 @@ class StockAnalysisPipeline:
                     intel_results = self.search_service.search_comprehensive_intel(
                         stock_code=code,
                         stock_name=stock_name,
-                        max_searches=8
+                        max_searches=9
                     )
 
                     if isinstance(intel_results, dict) and intel_results:

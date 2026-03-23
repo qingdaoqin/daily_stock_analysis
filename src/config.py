@@ -334,6 +334,8 @@ class Config:
     tavily_api_keys: List[str] = field(default_factory=list)  # Tavily API Keys
     brave_api_keys: List[str] = field(default_factory=list)  # Brave Search API Keys
     serpapi_keys: List[str] = field(default_factory=list)  # SerpAPI Keys
+    xai_api_keys: List[str] = field(default_factory=list)  # xAI X Search API Keys
+    xai_search_model: str = "grok-4-1-fast-reasoning"  # xAI model for X Search social signals
     searxng_base_urls: List[str] = field(default_factory=list)  # SearXNG instance URLs (self-hosted, no quota)
 
     # === 新闻与分析筛选配置 ===
@@ -816,6 +818,9 @@ class Config:
         brave_keys_str = os.getenv('BRAVE_API_KEYS', '')
         brave_api_keys = [k.strip() for k in brave_keys_str.split(',') if k.strip()]
 
+        xai_keys_str = os.getenv('XAI_API_KEYS', '') or os.getenv('XAI_API_KEY', '')
+        xai_api_keys = [k.strip() for k in xai_keys_str.split(',') if k.strip()]
+
         _raw_urls = [u.strip() for u in os.getenv('SEARXNG_BASE_URLS', '').split(',') if u.strip()]
         searxng_base_urls = []
         invalid_searxng_urls = []
@@ -895,6 +900,8 @@ class Config:
             tavily_api_keys=tavily_api_keys,
             brave_api_keys=brave_api_keys,
             serpapi_keys=serpapi_keys,
+            xai_api_keys=xai_api_keys,
+            xai_search_model=os.getenv('XAI_SEARCH_MODEL', 'grok-4-1-fast-reasoning'),
             searxng_base_urls=searxng_base_urls,
             news_max_age_days=max(1, int(os.getenv('NEWS_MAX_AGE_DAYS', '3'))),
             bias_threshold=max(1.0, float(os.getenv('BIAS_THRESHOLD', '5.0'))),

@@ -17,7 +17,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 from typing import List, Dict, Any, Optional, Tuple
 from itertools import cycle
@@ -1322,6 +1322,288 @@ class SearXNGSearchProvider(BaseSearchProvider):
             return "未知来源"
 
 
+class XAIXSearchProvider(BaseSearchProvider):
+    """xAI X Search provider for social-signal enrichment on US stocks."""
+
+    API_ENDPOINT = "https://api.x.ai/v1/responses"
+
+    def __init__(self, api_keys: List[str], model: str = "grok-4-1-fast-reasoning"):
+        super().__init__(api_keys, "xAI X Search")
+        self._model = (model or "grok-4-1-fast-reasoning").strip()
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        lookback_days = max(1, min(int(days or 7), 30))
+        end_date = datetime.now(UTC).date()
+        start_date = end_date - timedelta(days=lookback_days - 1)
+
+        payload = {
+            "model": self._model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": self._build_prompt(query, max_results=max_results, days=lookback_days),
+                }
+            ],
+            "tools": [
+                {
+                    "type": "x_search",
+                    "from_date": start_date.isoformat(),
+                    "to_date": end_date.isoformat(),
+                }
+            ],
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            response = _post_with_retry(self.API_ENDPOINT, headers=headers, json=payload, timeout=20)
+        except requests.exceptions.Timeout:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="xAI X Search 请求超时",
+            )
+        except requests.exceptions.RequestException as e:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"xAI X Search 网络请求失败: {e}",
+            )
+
+        if response.status_code != 200:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=self._parse_http_error(response),
+            )
+
+        try:
+            data = response.json()
+        except ValueError as e:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"xAI X Search 响应JSON解析失败: {e}",
+            )
+
+        results, summary_text = self._extract_results(data, max_results=max_results)
+        if not results:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="xAI X Search 未返回可解析的社交信号",
+                metadata={"summary": summary_text},
+            )
+
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider=self.name,
+            success=True,
+            metadata={
+                "summary": summary_text,
+                "model": self._model,
+                "citations": data.get("citations", []),
+            },
+        )
+
+    @staticmethod
+    def _build_prompt(query: str, *, max_results: int, days: int) -> str:
+        return (
+            f"Search X for the last {days} days about {query}. "
+            f"Return up to {max_results} high-signal items as a numbered list. "
+            "Each item must be one single line in this format: "
+            "Short title — concise summary. "
+            "Focus on earnings, guidance, official company posts, executive comments, "
+            "product issues, lawsuits, short reports, analyst or market-moving posts. "
+            "Avoid generic hype, jokes, memes, and duplicated points."
+        )
+
+    @staticmethod
+    def _parse_http_error(response) -> str:
+        try:
+            if response.headers.get("content-type", "").startswith("application/json"):
+                error_data = response.json()
+                if isinstance(error_data, dict):
+                    error = error_data.get("error")
+                    if isinstance(error, dict):
+                        message = error.get("message") or error.get("code")
+                        if message:
+                            return f"HTTP {response.status_code}: {message}"
+                    message = error_data.get("message")
+                    if message:
+                        return f"HTTP {response.status_code}: {message}"
+                return f"HTTP {response.status_code}: {error_data}"
+            return f"HTTP {response.status_code}: {response.text[:200]}"
+        except Exception:
+            return f"HTTP {response.status_code}: {response.text[:200]}"
+
+    def _extract_results(self, data: Dict[str, Any], *, max_results: int) -> Tuple[List[SearchResult], str]:
+        citations = data.get("citations", [])
+        output = data.get("output", [])
+        seen_urls = set()
+        results: List[SearchResult] = []
+        collected_text: List[str] = []
+
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for content in item.get("content", []):
+                if not isinstance(content, dict) or content.get("type") != "output_text":
+                    continue
+                text = str(content.get("text") or "").strip()
+                if text:
+                    collected_text.append(text)
+                annotations = content.get("annotations") or []
+                if text and annotations:
+                    block_results = self._extract_results_from_output_block(
+                        text,
+                        annotations,
+                        seen_urls=seen_urls,
+                    )
+                    results.extend(block_results)
+                    if len(results) >= max_results:
+                        return results[:max_results], "\n".join(collected_text).strip()
+
+        summary_text = "\n".join(collected_text).strip()
+        if len(results) < max_results and citations:
+            results.extend(
+                self._fallback_results_from_citations(
+                    citations,
+                    summary_text,
+                    max_results=max_results,
+                    seen_urls=seen_urls,
+                )
+            )
+
+        return results[:max_results], summary_text
+
+    def _extract_results_from_output_block(
+        self,
+        text: str,
+        annotations: List[Dict[str, Any]],
+        *,
+        seen_urls: set,
+    ) -> List[SearchResult]:
+        results: List[SearchResult] = []
+        sorted_annotations = sorted(
+            [ann for ann in annotations if isinstance(ann, dict) and ann.get("url")],
+            key=lambda ann: int(ann.get("start_index", 0)),
+        )
+
+        for ann in sorted_annotations:
+            url = str(ann.get("url") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            line = self._extract_line(text, int(ann.get("start_index", 0)), int(ann.get("end_index", 0)))
+            clean_line = self._strip_inline_citations(line)
+            title, snippet = self._split_title_and_snippet(clean_line, url)
+            seen_urls.add(url)
+            results.append(
+                SearchResult(
+                    title=title,
+                    snippet=snippet,
+                    url=url,
+                    source=self._extract_domain(url),
+                )
+            )
+
+        return results
+
+    def _fallback_results_from_citations(
+        self,
+        citations: List[Any],
+        summary_text: str,
+        *,
+        max_results: int,
+        seen_urls: set,
+    ) -> List[SearchResult]:
+        results: List[SearchResult] = []
+        clean_lines = [
+            self._strip_inline_citations(line).strip()
+            for line in summary_text.splitlines()
+            if self._strip_inline_citations(line).strip()
+        ]
+        candidate_lines = [
+            re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+            for line in clean_lines
+            if line.strip()
+        ]
+
+        for idx, raw_url in enumerate(citations):
+            url = str(raw_url or "").strip()
+            if not url or url in seen_urls:
+                continue
+            line = candidate_lines[min(idx, len(candidate_lines) - 1)] if candidate_lines else "X 社交信号摘要"
+            title, snippet = self._split_title_and_snippet(line, url)
+            seen_urls.add(url)
+            results.append(
+                SearchResult(
+                    title=title,
+                    snippet=snippet,
+                    url=url,
+                    source=self._extract_domain(url),
+                )
+            )
+            if len(results) >= max_results:
+                break
+
+        return results
+
+    @staticmethod
+    def _extract_line(text: str, start_index: int, end_index: int) -> str:
+        line_start = text.rfind("\n", 0, max(start_index, 0))
+        if line_start < 0:
+            line_start = 0
+        else:
+            line_start += 1
+        line_end = text.find("\n", max(end_index, 0))
+        if line_end < 0:
+            line_end = len(text)
+        return text[line_start:line_end].strip()
+
+    @staticmethod
+    def _strip_inline_citations(text: str) -> str:
+        return re.sub(r"\[\[\d+\]\]\([^)]+\)", "", text or "").strip()
+
+    def _split_title_and_snippet(self, line: str, url: str) -> Tuple[str, str]:
+        normalized = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line or "").strip(" \t-–—:")
+        for separator in (" — ", " – ", " - ", ": "):
+            if separator in normalized:
+                left, right = normalized.split(separator, 1)
+                title = (left or "").strip()[:120]
+                snippet = (right or "").strip()[:500]
+                if title and snippet:
+                    return title, snippet
+
+        fallback_title = normalized[:120] if normalized else self._extract_domain(url)
+        fallback_snippet = normalized[:500] if normalized else "X 社交信号摘要"
+        return fallback_title, fallback_snippet
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(url)
+            domain = parsed.netloc.replace("www.", "")
+            return domain or "x.com"
+        except Exception:
+            return "x.com"
+
+
 class SearchService:
     """
     搜索服务
@@ -1359,6 +1641,8 @@ class SearchService:
         brave_keys: Optional[List[str]] = None,
         serpapi_keys: Optional[List[str]] = None,
         minimax_keys: Optional[List[str]] = None,
+        xai_keys: Optional[List[str]] = None,
+        xai_search_model: str = "grok-4-1-fast-reasoning",
         searxng_base_urls: Optional[List[str]] = None,
         news_max_age_days: int = 3,
     ):
@@ -1371,10 +1655,13 @@ class SearchService:
             brave_keys: Brave Search API Key 列表
             serpapi_keys: SerpAPI Key 列表
             minimax_keys: MiniMax API Key 列表
+            xai_keys: xAI API Key 列表（用于 X 社交信号）
+            xai_search_model: xAI X Search 使用的模型
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             news_max_age_days: 新闻最大时效（天）
         """
         self._providers: List[BaseSearchProvider] = []
+        self._x_signal_provider: Optional[XAIXSearchProvider] = None
         self.news_max_age_days = max(1, news_max_age_days)
 
         # 初始化搜索引擎（按优先级排序）
@@ -1407,6 +1694,10 @@ class SearchService:
         if searxng_base_urls:
             self._providers.append(SearXNGSearchProvider(searxng_base_urls))
             logger.info(f"已配置 SearXNG 搜索，共 {len(searxng_base_urls)} 个实例")
+
+        if xai_keys:
+            self._x_signal_provider = XAIXSearchProvider(xai_keys, model=xai_search_model)
+            logger.info(f"已配置 xAI X Search，共 {len(xai_keys)} 个 API Key")
         
         if not self._providers:
             logger.warning("未配置任何搜索引擎 API Key，新闻搜索功能将不可用")
@@ -2005,6 +2296,23 @@ class SearchService:
             metadata={"china_exposure": summary},
         )
 
+    def _direct_x_social_signal(
+        self,
+        stock_code: str,
+        stock_name: str,
+        *,
+        query: str,
+        limit: int = 4,
+    ) -> SearchResponse:
+        if not self._x_signal_provider or not self._x_signal_provider.is_available:
+            return self._build_failed_response(query, "xAI X Search", "未配置 XAI_API_KEY")
+
+        return self._x_signal_provider.search(
+            query=query or f"{stock_name} {stock_code} X social signal",
+            max_results=limit,
+            days=self.news_max_age_days,
+        )
+
     @property
     def is_available(self) -> bool:
         """检查是否有可用的搜索引擎"""
@@ -2192,7 +2500,7 @@ class SearchService:
         self,
         stock_code: str,
         stock_name: str,
-        max_searches: int = 8
+        max_searches: int = 9
     ) -> Dict[str, SearchResponse]:
         """
         多维度情报搜索（同时使用多个引擎、多个维度）
@@ -2285,6 +2593,17 @@ class SearchService:
                         f"{stock_name} industry competitors market share outlook supply chain"
                     ), 'desc': '行业分析'},
                 ]
+                if self._x_signal_provider and self._x_signal_provider.is_available:
+                    search_dimensions.insert(3, {
+                        'name': 'x_signal',
+                        'query': (
+                            f"{stock_name} {stock_code} earnings guidance product launch lawsuit "
+                            f"short report analyst downgrade CEO comments"
+                        ),
+                        'desc': 'X社交信号',
+                        'direct_kind': 'x_social_signal',
+                        'engine_fallback': False,
+                    })
         elif market == "hk":
             search_dimensions = [
                 {'name': 'latest_news', 'query': f"{stock_name} {stock_code} 最新 消息 公告", 'desc': '最新消息'},
@@ -2382,9 +2701,12 @@ class SearchService:
                 response = self._direct_sec_filings(stock_code, stock_name, query=query)
             elif direct_kind == 'sec_china_exposure':
                 response = self._direct_us_china_exposure(stock_code, stock_name, query=query)
+            elif direct_kind == 'x_social_signal':
+                response = self._direct_x_social_signal(stock_code, stock_name, query=query)
 
+            allow_engine_fallback = dim.get('engine_fallback', True)
             if response is None or not response.success:
-                if query and self.is_available:
+                if allow_engine_fallback and query and self.is_available:
                     logger.info(f"[情报搜索] {dim['desc']}: 搜索引擎回退")
                     response, provider_index = self._run_provider_search(query, provider_index, max_results=3)
                     time.sleep(0.5)
@@ -2441,6 +2763,7 @@ class SearchService:
             'official_announcements',
             'official_filings',
             'china_exposure',
+            'x_signal',
             'event_calendar',
             'risk_check',
             'earnings',
@@ -2461,6 +2784,7 @@ class SearchService:
             elif dim_name == 'official_announcements': dim_desc = '📣 官方公告'
             elif dim_name == 'official_filings': dim_desc = '📄 官方披露'
             elif dim_name == 'china_exposure': dim_desc = '🇨🇳 中国暴露'
+            elif dim_name == 'x_signal': dim_desc = 'X 社交信号'
             elif dim_name == 'event_calendar': dim_desc = '🗓️ 事件日历'
             elif dim_name == 'market_analysis': dim_desc = '📈 机构分析'
             elif dim_name == 'risk_check': dim_desc = '⚠️ 风险排查'
@@ -2708,6 +3032,8 @@ def get_search_service() -> SearchService:
             brave_keys=config.brave_api_keys,
             serpapi_keys=config.serpapi_keys,
             minimax_keys=config.minimax_api_keys,
+            xai_keys=config.xai_api_keys,
+            xai_search_model=config.xai_search_model,
             searxng_base_urls=config.searxng_base_urls,
             news_max_age_days=config.news_max_age_days,
         )

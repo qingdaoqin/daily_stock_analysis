@@ -221,6 +221,116 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
         self.assertIn("600519", out)
 
     @mock.patch("src.notification.get_config")
+    def test_generate_single_stock_report_truncates_intel_with_ellipsis(self, mock_get_config: mock.MagicMock):
+        mock_get_config.return_value = _make_config(report_renderer_enabled=False)
+        service = NotificationService()
+        long_outlook = (
+            "根据事件日历，Circle Internet Group (CRCL) 将于2026年2月25日公布财报。"
+            "后续新闻继续讨论收入结构、稳定币监管、盈利质量、机构观点和市场波动。"
+            "这是一段故意拉长的文本，用于验证单股推送不会无提示硬截断。"
+        ) * 3
+        result = AnalysisResult(
+            code="CRCL",
+            name="Circle Internet Group, Inc.",
+            sentiment_score=85,
+            trend_prediction="强烈看多",
+            operation_advice="买入",
+            analysis_summary="趋势向上",
+            dashboard={
+                "core_conclusion": {"one_sentence": "多头趋势稳健，缩量回踩提供良机。"},
+                "intelligence": {
+                    "earnings_outlook": long_outlook,
+                    "sentiment_summary": long_outlook,
+                    "risk_alerts": [long_outlook],
+                    "positive_catalysts": [long_outlook],
+                },
+            },
+        )
+
+        out = service.generate_single_stock_report(result)
+
+        self.assertIn("### 📰 重要信息", out)
+        self.assertIn("...", out)
+        self.assertNotIn(long_outlook, out)
+
+    @mock.patch("src.notification.get_config")
+    def test_generate_single_stock_report_shows_failure_state_instead_of_fake_hold(self, mock_get_config: mock.MagicMock):
+        mock_get_config.return_value = _make_config(report_renderer_enabled=False)
+        service = NotificationService()
+        result = AnalysisResult(
+            code="PLTA",
+            name="ProShares Ultra PLTR",
+            sentiment_score=50,
+            trend_prediction="震荡",
+            operation_advice="持有",
+            analysis_summary="分析过程出错: All LLM models failed",
+            success=False,
+            error_message="All LLM models failed (tried 2 model(s)). Last error: litellm.RateLimitError",
+        )
+
+        out = service.generate_single_stock_report(result)
+
+        self.assertIn("分析失败", out)
+        self.assertIn("本次未形成有效买卖结论", out)
+        self.assertNotIn("评分: **50**", out)
+        self.assertNotIn("**持有**:", out)
+
+    @mock.patch("src.notification.get_config")
+    def test_generate_brief_report_marks_failed_result_as_failure(self, mock_get_config: mock.MagicMock):
+        mock_get_config.return_value = _make_config(report_renderer_enabled=False)
+        service = NotificationService()
+        result = AnalysisResult(
+            code="PLTA",
+            name="ProShares Ultra PLTR",
+            sentiment_score=50,
+            trend_prediction="震荡",
+            operation_advice="持有",
+            analysis_summary="分析过程出错: All LLM models failed",
+            success=False,
+            error_message="All LLM models failed (tried 2 model(s)). Last error: litellm.RateLimitError",
+        )
+
+        out = service.generate_brief_report([result])
+
+        self.assertIn("分析失败", out)
+        self.assertIn("All LLM models failed", out)
+        self.assertNotIn("持有 | 评分50", out)
+
+    @mock.patch("src.notification.get_config")
+    def test_generate_dashboard_report_counts_failed_separately(self, mock_get_config: mock.MagicMock):
+        mock_get_config.return_value = _make_config(report_renderer_enabled=False)
+        service = NotificationService()
+        ok_result = AnalysisResult(
+            code="CRCL",
+            name="Circle Internet Group, Inc.",
+            sentiment_score=85,
+            trend_prediction="强烈看多",
+            operation_advice="买入",
+            decision_type="buy",
+            analysis_summary="趋势向上",
+        )
+        failed_result = AnalysisResult(
+            code="PLTA",
+            name="ProShares Ultra PLTR",
+            sentiment_score=50,
+            trend_prediction="震荡",
+            operation_advice="持有",
+            decision_type="hold",
+            analysis_summary="分析过程出错: All LLM models failed",
+            success=False,
+            error_message="All LLM models failed (tried 2 model(s)). Last error: litellm.RateLimitError",
+        )
+
+        out = service.generate_dashboard_report([ok_result, failed_result])
+
+        self.assertIn("🟢买入:1", out)
+        self.assertIn("🟡观望:0", out)
+        self.assertIn("🔴卖出:0", out)
+        self.assertIn("❌失败:1", out)
+        self.assertIn("PLTA", out)
+        self.assertIn("分析失败", out)
+
+    @mock.patch("src.notification.get_config")
     def test_get_signal_level_prefers_decision_type_before_score_fallback(self, mock_get_config: mock.MagicMock):
         mock_get_config.return_value = _make_config()
         service = NotificationService()

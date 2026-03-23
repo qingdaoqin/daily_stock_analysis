@@ -1,18 +1,31 @@
 {% from '_macros.j2' import market_snapshot %}
 # 🎯 {{ report_date }} 决策仪表盘
 
-> 共分析 **{{ results|length }}** 只股票 | 🟢买入:{{ buy_count }} 🟡观望:{{ hold_count }} 🔴卖出:{{ sell_count }}
+> 共分析 **{{ results|length }}** 只股票 | 🟢买入:{{ buy_count }} 🟡观望:{{ hold_count }} 🔴卖出:{{ sell_count }}{% if failed_count %} ❌失败:{{ failed_count }}{% endif %}
 
 ## 📊 分析结果摘要
 
 {% for e in enriched %}
+{% if e.is_failed %}
+❌ **{{ e.stock_name }}({{ e.result.code }})**: 分析失败 | {{ e.failure_text }}
+{% else %}
 {{ e.signal_emoji }} **{{ e.stock_name }}({{ e.result.code }})**: {{ e.result.operation_advice }} | 评分 {{ e.result.sentiment_score }} | {{ e.result.trend_prediction }}
+{% endif %}
 {% endfor %}
 
 ---
 {% if not summary_only %}
 {% for e in enriched %}
 {% set result = e.result %}
+{% if e.is_failed %}
+## ❌ {{ e.stock_name }} ({{ result.code }})
+
+### ❌ 分析异常
+
+{{ e.failure_text }}
+
+---
+{% else %}
 {% set dashboard = result.dashboard if result.dashboard else {} %}
 {% set intel = dashboard.get('intelligence') or {} %}
 {% set core = dashboard.get('core_conclusion') or {} %}
@@ -153,6 +166,7 @@
 {% endif %}
 
 ---
+{% endif %}
 {% endfor %}
 {% endif %}
 

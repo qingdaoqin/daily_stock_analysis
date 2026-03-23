@@ -93,6 +93,36 @@ class TestReportRenderer(unittest.TestCase):
         self.assertIn("决策简报", out)
         self.assertIn("贵州茅台", out)
 
+    def test_render_markdown_counts_failed_results_separately(self) -> None:
+        ok_result = _make_result(
+            code="CRCL",
+            name="Circle Internet Group, Inc.",
+            sentiment_score=85,
+            operation_advice="买入",
+            decision_type="buy",
+        )
+        failed_result = AnalysisResult(
+            code="PLTA",
+            name="ProShares Ultra PLTR",
+            trend_prediction="震荡",
+            sentiment_score=50,
+            operation_advice="持有",
+            analysis_summary="分析过程出错: All LLM models failed",
+            decision_type="hold",
+            success=False,
+            error_message="All LLM models failed (tried 2 model(s)). Last error: litellm.RateLimitError",
+        )
+
+        out = render("markdown", [ok_result, failed_result], summary_only=True)
+
+        self.assertIsNotNone(out)
+        self.assertIn("🟢买入:1", out)
+        self.assertIn("🟡观望:0", out)
+        self.assertIn("🔴卖出:0", out)
+        self.assertIn("❌失败:1", out)
+        self.assertIn("PLTA", out)
+        self.assertIn("分析失败", out)
+
     def test_render_unknown_platform_returns_none(self) -> None:
         """Unknown platform returns None (caller fallback)."""
         r = _make_result()

@@ -1,12 +1,16 @@
 # 🎯 {{ report_date }} 决策简报
 
-> {{ results|length }}只 | 🟢{{ buy_count }} 🟡{{ hold_count }} 🔴{{ sell_count }}
+> {{ results|length }}只 | 🟢{{ buy_count }} 🟡{{ hold_count }} 🔴{{ sell_count }}{% if failed_count %} ❌{{ failed_count }}{% endif %}
 
 {% for e in enriched %}
+{% if e.is_failed %}
+**{{ e.stock_name }}({{ e.result.code }})** ❌ 分析失败 | {{ e.failure_text }}
+{% else %}
 {% set dash = e.result.dashboard or {} %}
 {% set core = (dash.get('core_conclusion') or {}) if dash else {} %}
 {% set one = (core.get('one_sentence') or e.result.analysis_summary or '')[:60] %}
 **{{ e.stock_name }}({{ e.result.code }})** {{ e.signal_emoji }} {{ e.result.operation_advice }} | 评分{{ e.result.sentiment_score }} | {{ one }}
+{% endif %}
 {% endfor %}
 
 *{{ report_timestamp }}*

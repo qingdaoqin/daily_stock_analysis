@@ -370,12 +370,23 @@ def run_full_analysis(
         # 输出摘要
         if results:
             logger.info("\n===== 分析结果摘要 =====")
-            for r in sorted(results, key=lambda x: x.sentiment_score, reverse=True):
-                status_tag = {
-                    "buy": "[BUY]",
-                    "sell": "[SELL]",
-                    "hold": "[HOLD]",
-                }.get((r.decision_type or "").lower(), "[INFO]")
+            for r in sorted(
+                results,
+                key=lambda x: (
+                    (not getattr(x, "success", True)) and bool(getattr(x, "error_message", None)),
+                    -(getattr(x, "sentiment_score", 0) or 0),
+                ),
+            ):
+                if (not getattr(r, "success", True)) and bool(getattr(r, "error_message", None)):
+                    status_tag = "[FAILED]"
+                elif getattr(r, "operation_advice", "") == "仅拉取数据" or getattr(r, "trend_prediction", "") == "未分析":
+                    status_tag = "[DRY-RUN]"
+                else:
+                    status_tag = {
+                        "buy": "[BUY]",
+                        "sell": "[SELL]",
+                        "hold": "[HOLD]",
+                    }.get((r.decision_type or "").lower(), "[INFO]")
                 logger.info(
                     f"{status_tag} {r.name}({r.code}): {r.operation_advice} | "
                     f"评分 {r.sentiment_score} | {r.trend_prediction}"

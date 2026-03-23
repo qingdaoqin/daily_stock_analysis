@@ -60,6 +60,16 @@ class TestPipelinePrefetchBehavior(unittest.TestCase):
 
         self.assertTrue(any("成功: 1, 失败: 0" in message for message in logs.output))
 
+    def test_run_non_dry_run_counts_failed_analysis_results_as_failures(self):
+        pipeline = self._build_pipeline(
+            process_result=SimpleNamespace(code="PLTA", success=False, error_message="All LLM models failed")
+        )
+
+        with self.assertLogs("src.core.pipeline", level="INFO") as logs:
+            pipeline.run(stock_codes=["PLTA"], dry_run=False, send_notification=False)
+
+        self.assertTrue(any("成功: 0, 失败: 1" in message for message in logs.output))
+
 
 if __name__ == "__main__":
     unittest.main()

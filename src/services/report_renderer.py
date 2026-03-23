@@ -24,6 +24,23 @@ def _get_signal_level(result: AnalysisResult) -> tuple:
     return get_result_signal_level(result)
 
 
+def _is_failed_result(result: AnalysisResult) -> bool:
+    """Return True when the analysis failed and no valid conclusion was produced."""
+    return (not getattr(result, "success", True)) and bool(getattr(result, "error_message", None))
+
+
+def _truncate_display_text(value: Any, max_length: int) -> str:
+    """Truncate long display text with a visible ellipsis."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if len(text) <= max_length:
+        return text
+    if max_length <= 3:
+        return text[:max_length]
+    return text[: max_length - 3].rstrip() + "..."
+
+
 def _escape_md(text: str) -> str:
     """Escape markdown special chars (*ST etc)."""
     if not text:
@@ -98,8 +115,13 @@ def render(
         logger.debug("Report template not found: %s", template_path)
         return None
 
-    # Build template context with pre-computed signal levels (sorted by score)
-    sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
+    sorted_results = sorted(
+        results,
+        key=lambda result: (
+            _is_failed_result(result),
+            -(getattr(result, "sentiment_score", 0) or 0),
+        ),
+    )
     sorted_enriched = []
     for r in sorted_results:
         st, se, _ = _get_signal_level(r)
@@ -109,11 +131,18 @@ def render(
             "signal_text": st,
             "signal_emoji": se,
             "stock_name": _escape_md(rn),
+            "is_failed": _is_failed_result(r),
+            "failure_text": _truncate_display_text(
+                getattr(r, "error_message", None) or getattr(r, "analysis_summary", None) or "分析失败",
+                140,
+            ),
         })
 
-    buy_count = sum(1 for r in results if getattr(r, "decision_type", "") == "buy")
-    sell_count = sum(1 for r in results if getattr(r, "decision_type", "") == "sell")
-    hold_count = sum(1 for r in results if getattr(r, "decision_type", "") in ("hold", ""))
+    successful_results = [r for r in results if not _is_failed_result(r)]
+    failed_count = len(results) - len(successful_results)
+    buy_count = sum(1 for r in successful_results if getattr(r, "decision_type", "") == "buy")
+    sell_count = sum(1 for r in successful_results if getattr(r, "decision_type", "") == "sell")
+    hold_count = sum(1 for r in successful_results if getattr(r, "decision_type", "") in ("hold", ""))
 
     report_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -129,6 +158,7 @@ def render(
         "buy_count": buy_count,
         "sell_count": sell_count,
         "hold_count": hold_count,
+        "failed_count": failed_count,
         "escape_md": _escape_md,
         "clean_sniper": _clean_sniper_value,
         "failed_checks": failed_checks,

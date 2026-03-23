@@ -85,6 +85,42 @@ LITELLM_MODEL=deepseek/deepseek-chat
 LITELLM_FALLBACK_MODELS=openai/gpt-4o-mini,anthropic/claude-3-5-sonnet
 ```
 
+### 示例：Google 默认，Claude 备用，Qwen 再备用
+```env
+# 1. 渠道顺序可以按你的偏好写；这里声明 google / claude / qwen 三个渠道
+LLM_CHANNELS=google,claude,qwen
+
+# 2. Google Gemini
+LLM_GOOGLE_API_KEY=AIza...
+LLM_GOOGLE_MODELS=gemini-2.5-flash
+
+# 3. Anthropic Claude
+LLM_CLAUDE_API_KEY=sk-ant-xxx
+LLM_CLAUDE_MODELS=claude-3-5-sonnet-20241022
+
+# 4. 千问（通常走 OpenAI 兼容接口）
+LLM_QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_QWEN_API_KEY=sk-xxx
+LLM_QWEN_MODELS=qwen-plus
+
+# 5. 指定默认模型和自动切换顺序
+LITELLM_MODEL=gemini/gemini-2.5-flash
+LITELLM_FALLBACK_MODELS=anthropic/claude-3-5-sonnet-20241022,openai/qwen-plus
+```
+
+上面这组配置的运行顺序是：
+
+1. 先调用 Google Gemini
+2. 如果默认模型失败，再切到 Claude
+3. 如果 Claude 也失败，再切到 Qwen
+
+如果你不显式写 `LITELLM_MODEL` 和 `LITELLM_FALLBACK_MODELS`，系统也会按 `LLM_CHANNELS` 的声明顺序自动推断：
+
+1. 第一个渠道的第一个模型作为默认模型
+2. 后续渠道里的模型按顺序作为 fallback
+
+也就是说，`LLM_CHANNELS=google,claude,qwen` 在最简单场景下，本身就已经表达了“Google 主、Claude 备、Qwen 再备”。
+
 > **致命避坑说明**：如果你启用了 `LLM_CHANNELS`，那么你直接写在外面的 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY` 将**全部失效（系统一律无视）**！二者**选其一即可**，千万不要既写了新手模式又写了渠道模式结果产生冲突。
 
 ---

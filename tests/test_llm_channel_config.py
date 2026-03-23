@@ -193,6 +193,46 @@ class LLMChannelConfigTestCase(unittest.TestCase):
         self.assertEqual(params["model"], "openai/my-model")
         self.assertEqual(config.llm_channels[0]["protocol"], "openai")
 
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_qwen_channel_name_alias_maps_to_openai_protocol(self, _mock_parse_yaml, _mock_setup_env) -> None:
+        env = {
+            "LLM_CHANNELS": "qwen",
+            "LLM_QWEN_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "LLM_QWEN_API_KEY": "sk-test-value",
+            "LLM_QWEN_MODELS": "qwen-plus",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.llm_channels[0]["protocol"], "openai")
+        self.assertEqual(config.llm_channels[0]["models"], ["openai/qwen-plus"])
+        self.assertEqual(config.litellm_model, "openai/qwen-plus")
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_channel_order_infers_primary_and_fallback_models(self, _mock_parse_yaml, _mock_setup_env) -> None:
+        env = {
+            "LLM_CHANNELS": "google,claude,qwen",
+            "LLM_GOOGLE_API_KEY": "google-test-key",
+            "LLM_GOOGLE_MODELS": "gemini-2.5-flash",
+            "LLM_CLAUDE_API_KEY": "claude-test-key",
+            "LLM_CLAUDE_MODELS": "claude-3-5-sonnet-20241022",
+            "LLM_QWEN_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "LLM_QWEN_API_KEY": "qwen-test-key",
+            "LLM_QWEN_MODELS": "qwen-plus",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.litellm_model, "gemini/gemini-2.5-flash")
+        self.assertEqual(
+            config.litellm_fallback_models,
+            ["anthropic/claude-3-5-sonnet-20241022", "openai/qwen-plus"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

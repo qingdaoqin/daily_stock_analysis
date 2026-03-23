@@ -77,6 +77,10 @@ def resolve_llm_channel_protocol(
     channel_name: Optional[str] = None,
 ) -> str:
     """Resolve the effective protocol for a channel."""
+    raw_protocol = (protocol or "").strip().lower().replace("-", "_")
+    if raw_protocol in {"qwen", "tongyi", "dashscope", "bailian"}:
+        return "openai"
+
     explicit = canonicalize_llm_channel_protocol(protocol)
     if explicit in SUPPORTED_LLM_CHANNEL_PROTOCOLS:
         return explicit
@@ -90,6 +94,9 @@ def resolve_llm_channel_protocol(
 
     # Infer from channel name (e.g. "deepseek" -> deepseek, "gemini" -> gemini)
     if channel_name:
+        raw_channel_name = channel_name.strip().lower().replace("-", "_")
+        if raw_channel_name in {"qwen", "tongyi", "dashscope", "bailian"}:
+            return "openai"
         name_protocol = canonicalize_llm_channel_protocol(channel_name)
         if name_protocol in SUPPORTED_LLM_CHANNEL_PROTOCOLS:
             return name_protocol

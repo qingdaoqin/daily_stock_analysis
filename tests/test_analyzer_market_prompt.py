@@ -80,6 +80,34 @@ class TestAnalyzerMarketPrompt(unittest.TestCase):
         self.assertIn("中国政策与产业监管属于核心主因", prompt)
         self.assertIn("是否满足 MA5>MA10>MA20 多头排列", prompt)
 
+    def test_prompt_keeps_markdown_tables_but_removes_prompt_emojis(self) -> None:
+        analyzer = self._make_analyzer()
+        context = {
+            "code": "AAPL",
+            "stock_name": "Apple",
+            "date": "2026-03-23",
+            "today": {"close": 180.0, "ma5": 178.0, "ma10": 175.0, "ma20": 170.0},
+            "market_context": {
+                "market": "us",
+                "market_label": "美股",
+                "official_source_priority": "SEC 披露、财报电话会、公司指引",
+                "analysis_focus": "先看 SEC/财报/指引，再判断政策变量。",
+                "policy_scope": "中国政策只有在存在 China exposure 时才提高权重。",
+            },
+        }
+
+        prompt = analyzer._format_prompt(context, "Apple", news_context="news")
+
+        self.assertIn("| 项目 | 数据 |", prompt)
+        self.assertIn("## 股票基础信息", prompt)
+        self.assertNotIn("## 📊 股票基础信息", prompt)
+        self.assertNotIn("## 📰 舆情情报", prompt)
+        self.assertNotIn("❓", prompt)
+        self.assertNotIn("✅", prompt)
+        self.assertNotIn("⚠️", prompt)
+        self.assertNotIn("⚪", prompt)
+        self.assertNotIn("❌", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -235,6 +235,31 @@ LLM_PRIMARY_MODELS=deepseek-chat
 LITELLM_MODEL=openai/deepseek-chat
 ```
 
+如果你要“默认一个供应商，失败后自动切到备用”，直接写成这样：
+
+```env
+LLM_CHANNELS=google,claude,qwen
+
+LLM_GOOGLE_API_KEY=AIza...
+LLM_GOOGLE_MODELS=gemini-2.5-flash
+
+LLM_CLAUDE_API_KEY=sk-ant-xxx
+LLM_CLAUDE_MODELS=claude-3-5-sonnet-20241022
+
+LLM_QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_QWEN_API_KEY=sk-xxx
+LLM_QWEN_MODELS=qwen-plus
+
+LITELLM_MODEL=gemini/gemini-2.5-flash
+LITELLM_FALLBACK_MODELS=anthropic/claude-3-5-sonnet-20241022,openai/qwen-plus
+```
+
+这表示：
+
+1. 默认先走 Google Gemini
+2. Google 失败后切 Claude
+3. Claude 再失败后切 Qwen
+
 保存后也可以在 Web 设置页继续编辑同一组字段；不会要求额外配置文件。
 
 如果同时启用了 `LITELLM_CONFIG`，YAML 仍然是运行时主模型 / fallback / Vision 的唯一来源；渠道编辑器只保存渠道条目，不会覆盖 YAML 的运行时选择。

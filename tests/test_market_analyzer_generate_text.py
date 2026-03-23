@@ -9,7 +9,8 @@ Covers:
   does NOT trigger AttributeError (regression guard for the old bypass bug)
 """
 import sys
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
 
 # Stub heavy dependencies before project imports
 for _mod in ("litellm", "google.generativeai", "google.genai", "anthropic"):
@@ -67,6 +68,122 @@ class TestAnalyzerGenerateText:
             gen_cfg = kwargs["generation_config"]
             assert gen_cfg["max_tokens"] == 2048
             assert gen_cfg["temperature"] == 0.7
+
+    def test_call_litellm_retries_gemini_rate_limit_with_backoff(self):
+        from src.analyzer import GeminiAnalyzer
+
+        analyzer = GeminiAnalyzer.__new__(GeminiAnalyzer)
+        analyzer._router = None
+
+        cfg = MagicMock()
+        cfg.litellm_model = "gemini/gemini-2.5-flash"
+        cfg.litellm_fallback_models = []
+        cfg.llm_model_list = []
+        cfg.gemini_max_retries = 2
+        cfg.gemini_retry_delay = 3.0
+
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+            usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+        )
+
+        with patch("src.analyzer.get_config", return_value=cfg), \
+             patch("src.analyzer.get_api_keys_for_model", return_value=["sk-test"]), \
+             patch("src.analyzer.extra_litellm_params", return_value={}), \
+             patch("src.analyzer.get_configured_llm_models", return_value=[]), \
+             patch("src.analyzer.get_thinking_extra_body", return_value=None), \
+             patch("src.analyzer.time.sleep") as mock_sleep, \
+             patch(
+                 "src.analyzer.litellm.completion",
+                 side_effect=[Exception("429 RESOURCE_EXHAUSTED"), Exception("rate limit"), response],
+             ) as mock_completion:
+            text, model_used, usage = analyzer._call_litellm(
+                "prompt",
+                generation_config={"max_tokens": 256, "temperature": 0.3},
+            )
+
+        assert text == "ok"
+        assert model_used == "gemini/gemini-2.5-flash"
+        assert usage == {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+        assert mock_completion.call_count == 3
+        mock_sleep.assert_has_calls([call(3.0), call(6.0)])
+
+    def test_call_litellm_uses_fallback_after_retry_exhausted(self):
+        from src.analyzer import GeminiAnalyzer
+
+        analyzer = GeminiAnalyzer.__new__(GeminiAnalyzer)
+        analyzer._router = None
+
+        cfg = MagicMock()
+        cfg.litellm_model = "gemini/gemini-2.5-flash"
+        cfg.litellm_fallback_models = ["openai/gpt-4o-mini"]
+        cfg.llm_model_list = []
+        cfg.gemini_max_retries = 2
+        cfg.gemini_retry_delay = 1.5
+
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="fallback ok"))],
+            usage=None,
+        )
+        seen_models = []
+
+        def _fake_completion(**kwargs):
+            seen_models.append(kwargs["model"])
+            if kwargs["model"] == "gemini/gemini-2.5-flash":
+                raise Exception("429 RESOURCE_EXHAUSTED")
+            return response
+
+        with patch("src.analyzer.get_config", return_value=cfg), \
+             patch("src.analyzer.get_api_keys_for_model", return_value=["sk-test"]), \
+             patch("src.analyzer.extra_litellm_params", return_value={}), \
+             patch("src.analyzer.get_configured_llm_models", return_value=[]), \
+             patch("src.analyzer.get_thinking_extra_body", return_value=None), \
+             patch("src.analyzer.time.sleep") as mock_sleep, \
+             patch("src.analyzer.litellm.completion", side_effect=_fake_completion):
+            text, model_used, usage = analyzer._call_litellm(
+                "prompt",
+                generation_config={"max_tokens": 256, "temperature": 0.3},
+            )
+
+        assert text == "fallback ok"
+        assert model_used == "openai/gpt-4o-mini"
+        assert usage == {}
+        assert seen_models == [
+            "gemini/gemini-2.5-flash",
+            "gemini/gemini-2.5-flash",
+            "gemini/gemini-2.5-flash",
+            "openai/gpt-4o-mini",
+        ]
+        mock_sleep.assert_has_calls([call(1.5), call(3.0)])
+
+    def test_call_litellm_does_not_retry_non_retryable_error(self):
+        from src.analyzer import GeminiAnalyzer
+
+        analyzer = GeminiAnalyzer.__new__(GeminiAnalyzer)
+        analyzer._router = None
+
+        cfg = MagicMock()
+        cfg.litellm_model = "gemini/gemini-2.5-flash"
+        cfg.litellm_fallback_models = []
+        cfg.llm_model_list = []
+        cfg.gemini_max_retries = 3
+        cfg.gemini_retry_delay = 2.0
+
+        with patch("src.analyzer.get_config", return_value=cfg), \
+             patch("src.analyzer.get_api_keys_for_model", return_value=["sk-test"]), \
+             patch("src.analyzer.extra_litellm_params", return_value={}), \
+             patch("src.analyzer.get_configured_llm_models", return_value=[]), \
+             patch("src.analyzer.get_thinking_extra_body", return_value=None), \
+             patch("src.analyzer.time.sleep") as mock_sleep, \
+             patch("src.analyzer.litellm.completion", side_effect=Exception("invalid api key")) as mock_completion:
+            with pytest.raises(Exception, match="All LLM models failed"):
+                analyzer._call_litellm(
+                    "prompt",
+                    generation_config={"max_tokens": 256, "temperature": 0.3},
+                )
+
+        assert mock_completion.call_count == 1
+        mock_sleep.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

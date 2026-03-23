@@ -783,6 +783,46 @@ class GeminiAnalyzer:
         """Check if LiteLLM is properly configured with at least one API key."""
         return self._router is not None or self._litellm_available
 
+    def _get_model_retry_policy(self, model: str, config: Config) -> Tuple[int, float]:
+        """Return retry/backoff settings for the current model."""
+        provider = (model.split("/", 1)[0] if "/" in model else model).strip().lower()
+        if provider in {"gemini", "vertex_ai"}:
+            return (
+                max(0, int(getattr(config, "gemini_max_retries", 0) or 0)),
+                max(0.0, float(getattr(config, "gemini_retry_delay", 0.0) or 0.0)),
+            )
+        return 0, 0.0
+
+    def _is_retryable_llm_error(self, error: Exception) -> bool:
+        """Best-effort detection for transient LLM failures worth retrying."""
+        for attr_name in ("status_code", "code"):
+            value = getattr(error, attr_name, None)
+            if str(value).strip() == "429":
+                return True
+
+        response = getattr(error, "response", None)
+        response_status = getattr(response, "status_code", None)
+        if str(response_status).strip() == "429":
+            return True
+
+        text = str(error).lower()
+        retryable_markers = (
+            "429",
+            "resource_exhausted",
+            "rate limit",
+            "ratelimit",
+            "too many requests",
+            "quota",
+            "temporarily unavailable",
+            "service unavailable",
+            "timeout",
+            "timed out",
+            "deadline exceeded",
+            "connection reset",
+            "connection aborted",
+        )
+        return any(marker in text for marker in retryable_markers)
+
     def _call_litellm(self, prompt: str, generation_config: dict) -> Tuple[str, str, Dict[str, Any]]:
         """Call LLM via litellm with fallback across configured models.
 
@@ -814,53 +854,75 @@ class GeminiAnalyzer:
 
         last_error = None
         for model in models_to_try:
-            try:
-                model_short = model.split("/")[-1] if "/" in model else model
-                call_kwargs: Dict[str, Any] = {
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": self.SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                }
-                extra = get_thinking_extra_body(model_short)
-                if extra:
-                    call_kwargs["extra_body"] = extra
+            max_retries, retry_delay = self._get_model_retry_policy(model, config)
+            attempt = 0
 
-                _router_model_names = set(get_configured_llm_models(config.llm_model_list))
-                if use_channel_router and self._router and model in _router_model_names:
-                    # Channel / YAML path: Router manages key + base_url per model
-                    response = self._router.completion(**call_kwargs)
-                elif self._router and model == config.litellm_model and not use_channel_router:
-                    # Legacy path: Router only for primary model multi-key
-                    response = self._router.completion(**call_kwargs)
-                else:
-                    # Legacy/direct-env path: direct call (also handles direct-env
-                    # providers like groq/ or bedrock/ that are not in the Router
-                    # model_list even when channel mode is active)
-                    keys = get_api_keys_for_model(model, config)
-                    if keys:
-                        call_kwargs["api_key"] = keys[0]
-                    call_kwargs.update(extra_litellm_params(model, config))
-                    response = litellm.completion(**call_kwargs)
+            while True:
+                try:
+                    model_short = model.split("/")[-1] if "/" in model else model
+                    call_kwargs: Dict[str, Any] = {
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": self.SYSTEM_PROMPT},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    }
+                    extra = get_thinking_extra_body(model_short)
+                    if extra:
+                        call_kwargs["extra_body"] = extra
 
-                if response and response.choices and response.choices[0].message.content:
-                    usage: Dict[str, Any] = {}
-                    if response.usage:
-                        usage = {
-                            "prompt_tokens": response.usage.prompt_tokens or 0,
-                            "completion_tokens": response.usage.completion_tokens or 0,
-                            "total_tokens": response.usage.total_tokens or 0,
-                        }
-                    return (response.choices[0].message.content, model, usage)
-                raise ValueError("LLM returned empty response")
+                    _router_model_names = set(get_configured_llm_models(config.llm_model_list))
+                    if use_channel_router and self._router and model in _router_model_names:
+                        # Channel / YAML path: Router manages key + base_url per model
+                        response = self._router.completion(**call_kwargs)
+                    elif self._router and model == config.litellm_model and not use_channel_router:
+                        # Legacy path: Router only for primary model multi-key
+                        response = self._router.completion(**call_kwargs)
+                    else:
+                        # Legacy/direct-env path: direct call (also handles direct-env
+                        # providers like groq/ or bedrock/ that are not in the Router
+                        # model_list even when channel mode is active)
+                        keys = get_api_keys_for_model(model, config)
+                        if keys:
+                            call_kwargs["api_key"] = keys[0]
+                        call_kwargs.update(extra_litellm_params(model, config))
+                        response = litellm.completion(**call_kwargs)
 
-            except Exception as e:
-                logger.warning(f"[LiteLLM] {model} failed: {e}")
-                last_error = e
-                continue
+                    if response and response.choices and response.choices[0].message.content:
+                        usage: Dict[str, Any] = {}
+                        if response.usage:
+                            usage = {
+                                "prompt_tokens": response.usage.prompt_tokens or 0,
+                                "completion_tokens": response.usage.completion_tokens or 0,
+                                "total_tokens": response.usage.total_tokens or 0,
+                            }
+                        return (response.choices[0].message.content, model, usage)
+                    raise ValueError("LLM returned empty response")
+
+                except Exception as e:
+                    last_error = e
+                    if self._is_retryable_llm_error(e) and attempt < max_retries:
+                        backoff_seconds = retry_delay * (2 ** attempt) if retry_delay > 0 else 0.0
+                        logger.warning(
+                            "[LiteLLM] %s transient failure, retry %s/%s in %.1fs: %s",
+                            model,
+                            attempt + 1,
+                            max_retries,
+                            backoff_seconds,
+                            e,
+                        )
+                        if backoff_seconds > 0:
+                            time.sleep(backoff_seconds)
+                        attempt += 1
+                        continue
+
+                    if attempt > 0:
+                        logger.warning(f"[LiteLLM] {model} failed after {attempt} retry(s): {e}")
+                    else:
+                        logger.warning(f"[LiteLLM] {model} failed: {e}")
+                    break
 
         raise Exception(f"All LLM models failed (tried {len(models_to_try)} model(s)). Last error: {last_error}")
 

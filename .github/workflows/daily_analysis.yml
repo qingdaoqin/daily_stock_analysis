@@ -254,14 +254,40 @@ jobs:
             python main.py $FORCE_RUN_ARG
           fi
       
+      - name: 准备上传产物
+        if: always()
+        run: |
+          mkdir -p reports logs
+
+          if [ -z "$(find reports -maxdepth 1 -type f 2>/dev/null)" ]; then
+            printf '%s\n' \
+              '未生成分析报告文件。' \
+              '这通常表示分析流程提前结束、未进入报告保存阶段，或本次运行仅产生通知未落盘。' \
+              '运行编号: ${{ github.run_number }}' \
+              '工作流: ${{ github.workflow }}' \
+              '提交: ${{ github.sha }}' \
+              > reports/_artifact_notice.txt
+          fi
+
+          if [ -z "$(find logs -maxdepth 1 -type f 2>/dev/null)" ]; then
+            printf '%s\n' \
+              '未找到日志文件。' \
+              '这通常表示程序尚未初始化日志、提前终止，或本次运行没有生成本地日志。' \
+              '运行编号: ${{ github.run_number }}' \
+              '工作流: ${{ github.workflow }}' \
+              '提交: ${{ github.sha }}' \
+              > logs/_artifact_notice.txt
+          fi
+
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
         if: always()
         with:
           name: analysis-reports-${{ github.run_number }}
           path: |
-            reports/
-            logs/
+            reports/**
+            logs/**
+          if-no-files-found: warn
           retention-days: 30
       
       - name: 显示运行结果

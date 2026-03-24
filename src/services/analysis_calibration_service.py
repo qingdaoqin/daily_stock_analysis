@@ -147,6 +147,32 @@ class AnalysisCalibrationService:
         )
 
     @property
+    def model_backend(self) -> str:
+        backend = str(
+            getattr(
+                self.config,
+                "analysis_learning_model_backend",
+                "tree",
+            )
+        ).strip().lower()
+        if backend in {"tree", "auto", "hist_gradient_boosting"}:
+            return "tree"
+        if backend in {"naive_bayes", "nb"}:
+            return "naive_bayes"
+        return "tree"
+
+    @property
+    def model_market_split(self) -> bool:
+        return bool(getattr(self.config, "analysis_learning_model_market_split", True))
+
+    @property
+    def model_scope_min_samples(self) -> int:
+        return max(
+            12,
+            int(getattr(self.config, "analysis_learning_model_scope_min_samples", 18)),
+        )
+
+    @property
     def model_retrain_interval_seconds(self) -> int:
         minutes = int(
             getattr(
@@ -245,7 +271,12 @@ class AnalysisCalibrationService:
                 "sample_count": len(samples),
             }
 
-        model = SmallCalibrationModel.fit(samples)
+        model = SmallCalibrationModel.fit(
+            samples,
+            preferred_backend=self.model_backend,
+            market_split=self.model_market_split,
+            min_scope_samples=self.model_scope_min_samples,
+        )
         if model is None:
             return {
                 "success": False,
@@ -261,9 +292,12 @@ class AnalysisCalibrationService:
 
         self._small_model = model
         self._last_model_train_ts = now
+        trained_scopes = sorted(model.submodels.keys())
         logger.info(
-            "[LearningLoop] 小型校准模型训练完成: samples=%s validation_accuracy=%s baseline_accuracy=%s path=%s",
+            "[LearningLoop] 学习校准模型训练完成: samples=%s backend=%s scopes=%s validation_accuracy=%s baseline_accuracy=%s path=%s",
             model.sample_count,
+            model.preferred_backend,
+            ",".join(trained_scopes),
             f"{model.validation_accuracy:.3f}" if model.validation_accuracy is not None else "n/a",
             f"{model.baseline_accuracy:.3f}" if model.baseline_accuracy is not None else "n/a",
             self.model_path,
@@ -273,6 +307,8 @@ class AnalysisCalibrationService:
             "sample_count": model.sample_count,
             "validation_accuracy": model.validation_accuracy,
             "baseline_accuracy": model.baseline_accuracy,
+            "backend": model.preferred_backend,
+            "scopes": trained_scopes,
         }
 
     def calibrate_result(self, result: Any, context_snapshot: Optional[Dict[str, Any]] = None) -> Any:
@@ -395,7 +431,7 @@ class AnalysisCalibrationService:
         if profile.applied:
             if model_decision["applied"] and model_decision["suggested_signal"] == profile.suggested_signal:
                 profile.source_scope = (
-                    f"{profile.source_scope}+小型模型" if profile.source_scope else "小型模型"
+                    f"{profile.source_scope}+学习模型" if profile.source_scope else "学习模型"
                 )
                 profile.score_adjustment += int(model_decision["score_adjustment"] or 0)
                 profile.reason = " ".join(
@@ -407,14 +443,14 @@ class AnalysisCalibrationService:
                 and model_decision["confidence"] >= max(0.72, self.model_confidence_threshold + 0.08)
                 and model_decision["suggested_signal"] != profile.suggested_signal
             ):
-                profile.source_scope = "全局+小型模型"
+                profile.source_scope = "全局+学习模型"
                 profile.suggested_signal = "hold"
                 profile.score_adjustment = 0
                 profile.reason = " ".join(
                     token
                     for token in (
                         profile.reason,
-                        "小型校准模型与全局统计结论冲突，已保守降级为观望。",
+                        "学习校准模型与全局统计结论冲突，已保守降级为观望。",
                     )
                     if token
                 ).strip()
@@ -427,7 +463,7 @@ class AnalysisCalibrationService:
             enabled=self.enabled,
             market=market,
             model_used=model_used,
-            source_scope="小型校准模型",
+            source_scope="学习校准模型",
             samples=int(model_decision["prediction_meta"].get("sample_count") or 0),
             threshold=self.model_train_min_samples,
             current_signal=current_signal,
@@ -521,7 +557,8 @@ class AnalysisCalibrationService:
             trend_prediction=trend_prediction,
             context_snapshot=context_snapshot,
         )
-        prediction = self._small_model.predict(features)
+        market = get_market_for_stock(stock_code) or "cn"
+        prediction = self._small_model.predict(features, scope_hint=market)
         if prediction is None:
             return None
 
@@ -538,16 +575,16 @@ class AnalysisCalibrationService:
                     score_adjustment = 4
                 elif suggested_signal == "sell":
                     score_adjustment = -4
-                reason = f"小型校准模型同向支持当前 {current_signal} 信号。"
+                reason = f"学习校准模型同向支持当前 {current_signal} 信号。"
         else:
             high_conf_threshold = max(0.72, self.model_confidence_threshold + 0.10)
             if confidence >= high_conf_threshold:
                 applied = True
                 if current_signal in {"buy", "sell"} and not 30 <= score <= 70:
                     suggested_signal = "hold"
-                    reason = "小型校准模型与当前高强度方向冲突，先保守降级为观望。"
+                    reason = "学习校准模型与当前高强度方向冲突，先保守降级为观望。"
                 else:
-                    reason = f"小型校准模型认为当前场景更接近 {suggested_signal}。"
+                    reason = f"学习校准模型认为当前场景更接近 {suggested_signal}。"
                 if suggested_signal == "buy":
                     score_adjustment = 9
                 elif suggested_signal == "sell":
@@ -555,7 +592,7 @@ class AnalysisCalibrationService:
             elif confidence >= self.model_confidence_threshold and current_signal in {"buy", "sell"}:
                 applied = True
                 suggested_signal = "hold"
-                reason = "小型校准模型对当前方向把握不足，先降级为观望。"
+                reason = "学习校准模型对当前方向把握不足，先降级为观望。"
 
         return {
             "applied": applied,
@@ -581,7 +618,17 @@ class AnalysisCalibrationService:
                 trend_prediction=str(row.get("trend_prediction") or ""),
                 context_snapshot=row.get("context_payload"),
             )
-            samples.append({"features": features, "label": label})
+            samples.append(
+                {
+                    "features": features,
+                    "label": label,
+                    "market": str(
+                        row.get("market")
+                        or get_market_for_stock(str(row.get("code") or ""))
+                        or "cn"
+                    ).strip().lower(),
+                }
+            )
         return samples
 
     def _derive_learning_label(self, row: Dict[str, Any]) -> Optional[str]:

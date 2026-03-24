@@ -465,6 +465,9 @@ class Config:
     analysis_learning_auto_backtest_limit: int = 200
     analysis_learning_model_enabled: bool = True
     analysis_learning_model_path: str = "./data/models/analysis_calibration_model.json"
+    analysis_learning_model_backend: str = "tree"
+    analysis_learning_model_market_split: bool = True
+    analysis_learning_model_scope_min_samples: int = 18
     analysis_learning_model_retrain_interval_minutes: int = 180
     analysis_learning_model_train_min_samples: int = 60
     analysis_learning_model_confidence_threshold: float = 0.62
@@ -994,6 +997,12 @@ class Config:
             analysis_learning_auto_backtest_limit=max(20, int(os.getenv('ANALYSIS_LEARNING_AUTO_BACKTEST_LIMIT', '200'))),
             analysis_learning_model_enabled=parse_env_bool(os.getenv('ANALYSIS_LEARNING_MODEL_ENABLED'), True),
             analysis_learning_model_path=os.getenv('ANALYSIS_LEARNING_MODEL_PATH', './data/models/analysis_calibration_model.json'),
+            analysis_learning_model_backend=os.getenv('ANALYSIS_LEARNING_MODEL_BACKEND', 'tree').strip().lower() or 'tree',
+            analysis_learning_model_market_split=parse_env_bool(os.getenv('ANALYSIS_LEARNING_MODEL_MARKET_SPLIT'), True),
+            analysis_learning_model_scope_min_samples=max(
+                12,
+                int(os.getenv('ANALYSIS_LEARNING_MODEL_SCOPE_MIN_SAMPLES', '18')),
+            ),
             analysis_learning_model_retrain_interval_minutes=max(10, int(os.getenv('ANALYSIS_LEARNING_MODEL_RETRAIN_INTERVAL_MINUTES', '180'))),
             analysis_learning_model_train_min_samples=max(12, int(os.getenv('ANALYSIS_LEARNING_MODEL_TRAIN_MIN_SAMPLES', '60'))),
             analysis_learning_model_confidence_threshold=min(

@@ -42,6 +42,9 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
             analysis_learning_refresh_interval_minutes=60,
             analysis_learning_model_enabled=True,
             analysis_learning_model_path=os.path.join(self._temp_dir.name, "analysis_calibration_model.json"),
+            analysis_learning_model_backend="tree",
+            analysis_learning_model_market_split=True,
+            analysis_learning_model_scope_min_samples=6,
             analysis_learning_model_retrain_interval_minutes=60,
             analysis_learning_model_train_min_samples=6,
             analysis_learning_model_confidence_threshold=0.55,
@@ -225,9 +228,10 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
             service.maybe_refresh_backtests()
         self.assertEqual(mock_run.call_count, 1)
 
-    def test_small_model_trains_and_calibrates_hold_to_buy(self) -> None:
+    def test_learning_model_trains_tree_backend_and_calibrates_hold_to_buy(self) -> None:
         self.config.analysis_learning_min_samples = 10
         self.config.analysis_learning_model_train_min_samples = 6
+        self.config.analysis_learning_model_scope_min_samples = 6
 
         for idx, code in enumerate(("AAPL", "MSFT", "NVDA", "META", "AMZN", "GOOGL"), start=1):
             self._insert_learning_record(
@@ -262,6 +266,8 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
         train_stats = service.maybe_refresh_model()
         self.assertTrue(train_stats.get("success"))
         self.assertTrue(os.path.exists(self.config.analysis_learning_model_path))
+        self.assertEqual(train_stats.get("backend"), "hist_gradient_boosting")
+        self.assertIn("us", train_stats.get("scopes", []))
 
         result = AnalysisResult(
             code="AAPL",
@@ -291,7 +297,9 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
         self.assertEqual(calibrated.operation_advice, "买入")
         self.assertIsInstance(calibrated.calibration_info, dict)
         self.assertIn("model_prediction", calibrated.calibration_info)
-        self.assertEqual(calibrated.calibration_info.get("source_scope"), "小型校准模型")
+        self.assertEqual(calibrated.calibration_info.get("source_scope"), "学习校准模型")
+        self.assertEqual(calibrated.calibration_info["model_prediction"].get("engine"), "hist_gradient_boosting")
+        self.assertEqual(calibrated.calibration_info["model_prediction"].get("scope"), "us")
 
 
 class PipelineLearningLoopTestCase(unittest.TestCase):

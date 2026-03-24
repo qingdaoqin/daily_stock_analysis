@@ -214,6 +214,10 @@ class StockTrendAnalyzer:
                 "slightly_high_reason": "可小仓介入",
                 "high_bias_risk": "严禁追高！",
                 "strong_trend_reason": "可轻仓追踪",
+                "support_ma5_score": 5,
+                "support_ma10_score": 5,
+                "support_ma5_reason": "MA5支撑有效",
+                "support_ma10_reason": "MA10支撑有效",
             },
             "hk": {
                 "base_threshold_floor": 6.0,
@@ -222,6 +226,10 @@ class StockTrendAnalyzer:
                 "slightly_high_reason": "可少量跟踪，但更适合等公告或回踩确认",
                 "high_bias_risk": "不宜重仓追价，等待回踩或公告确认",
                 "strong_trend_reason": "强势趋势中可小仓跟踪，但不宜重仓追价",
+                "support_ma5_score": 2,
+                "support_ma10_score": 4,
+                "support_ma5_reason": "短线均线附近企稳，可作为跟踪参考",
+                "support_ma10_reason": "关键支撑位附近企稳，可作为回测确认",
             },
             "us": {
                 "base_threshold_floor": 7.0,
@@ -230,6 +238,10 @@ class StockTrendAnalyzer:
                 "slightly_high_reason": "趋势延续可轻仓跟踪，避免一次性追价",
                 "high_bias_risk": "追价风险较高，等待回踩、breakout retest 或下一次确认",
                 "strong_trend_reason": "强势趋势中可继续跟踪，但宜分批并设置波动止损",
+                "support_ma5_score": 1,
+                "support_ma10_score": 3,
+                "support_ma5_reason": "短线回踩企稳，可辅助观察但不单独构成买点",
+                "support_ma10_reason": "关键均线回踩企稳，可作为趋势延续确认",
             },
         }
         resolved = dict(profile.get(market, profile["cn"]))
@@ -716,13 +728,13 @@ class StockTrendAnalyzer:
         elif result.volume_status == VolumeStatus.HEAVY_VOLUME_DOWN:
             risks.append("⚠️ 放量下跌，注意风险")
 
-        # === 支撑评分（10分）===
+        # === 支撑评分（按市场区别解释）===
         if result.support_ma5:
-            score += 5
-            reasons.append("✅ MA5支撑有效")
+            score += int(market_profile["support_ma5_score"])
+            reasons.append(f"✅ {market_profile['support_ma5_reason']}")
         if result.support_ma10:
-            score += 5
-            reasons.append("✅ MA10支撑有效")
+            score += int(market_profile["support_ma10_score"])
+            reasons.append(f"✅ {market_profile['support_ma10_reason']}")
 
         # === MACD 评分（15分）===
         macd_scores = {

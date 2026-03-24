@@ -203,3 +203,31 @@ class StockAnalyzerBiasTestCase(unittest.TestCase):
         self.analyzer._generate_signal(result)
         self._assert_contains(result.risk_factors, "不宜重仓追价")
         self._assert_not_contains(result.risk_factors, "严禁追高")
+
+    @patch("src.stock_analyzer.get_config")
+    def test_us_support_reason_is_not_a_share_buy_point(self, mock_get_config: MagicMock) -> None:
+        """US support scoring should not describe MA5 as a direct A-share-style buy point."""
+        mock_get_config.return_value.bias_threshold = 5.0
+        result = _make_result(
+            code="AAPL",
+            trend_status=TrendStatus.BULL,
+            bias_ma5=1.0,
+            support_ma5=True,
+        )
+        self.analyzer._generate_signal(result)
+        self._assert_contains(result.signal_reasons, "短线回踩企稳")
+        self._assert_not_contains(result.signal_reasons, "MA5支撑有效")
+
+    @patch("src.stock_analyzer.get_config")
+    def test_hk_support_reason_prefers_confirmation_language(self, mock_get_config: MagicMock) -> None:
+        """HK support scoring should use confirmation wording instead of direct A-share-style MA support."""
+        mock_get_config.return_value.bias_threshold = 5.0
+        result = _make_result(
+            code="0700",
+            trend_status=TrendStatus.BULL,
+            bias_ma5=1.0,
+            support_ma10=True,
+        )
+        self.analyzer._generate_signal(result)
+        self._assert_contains(result.signal_reasons, "关键支撑位附近企稳")
+        self._assert_not_contains(result.signal_reasons, "MA10支撑有效")

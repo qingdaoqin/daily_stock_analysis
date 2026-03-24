@@ -28,8 +28,11 @@ class TestAnalyzerMarketPrompt(unittest.TestCase):
         self.assertIn("A 股、港股和美股", analyzer.SYSTEM_PROMPT)
         self.assertIn("China exposure", analyzer.SYSTEM_PROMPT)
         self.assertNotIn("A 股投资分析师", analyzer.SYSTEM_PROMPT.splitlines()[0])
-        self.assertIn("美股：乖离率 > 5% 只代表追价风险", analyzer.SYSTEM_PROMPT)
+        self.assertIn("A股：存在涨跌停、T+1 和做空限制", analyzer.SYSTEM_PROMPT)
+        self.assertIn("美股：不存在 A股式涨跌停/T+1 约束", analyzer.SYSTEM_PROMPT)
+        self.assertIn("美股：不存在 A股式涨跌停/T+1 约束", analyzer.SYSTEM_PROMPT)
         self.assertIn("不能仅因离均线较远就把强趋势股直接判成看空", analyzer.SYSTEM_PROMPT)
+        self.assertIn("不强制 MA5 / MA10 模板", analyzer.SYSTEM_PROMPT)
         self.assertIn("震荡偏多/震荡/震荡偏空", analyzer.SYSTEM_PROMPT)
 
     def test_us_prompt_includes_china_exposure_guidance(self) -> None:
@@ -60,6 +63,8 @@ class TestAnalyzerMarketPrompt(unittest.TestCase):
         self.assertIn("中国政策权重：高权重", prompt)
         self.assertIn("SEC/财报/公司指引", prompt)
         self.assertIn("SEC/财报/公司指引是否出现超预期或下修", prompt)
+        self.assertIn("breakout retest", prompt)
+        self.assertIn("不要机械套用 A股 MA5/MA10 模式", prompt)
 
     def test_cn_prompt_keeps_a_share_policy_focus(self) -> None:
         analyzer = self._make_analyzer()
@@ -82,6 +87,7 @@ class TestAnalyzerMarketPrompt(unittest.TestCase):
         self.assertIn("当前市场：A股", prompt)
         self.assertIn("中国政策与产业监管属于核心主因", prompt)
         self.assertIn("是否满足 MA5>MA10>MA20 多头排列", prompt)
+        self.assertIn("涨停/交易约束/T+1", prompt)
 
     def test_prompt_keeps_markdown_tables_but_removes_prompt_emojis(self) -> None:
         analyzer = self._make_analyzer()

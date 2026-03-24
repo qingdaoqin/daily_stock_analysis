@@ -177,3 +177,29 @@ class StockAnalyzerBiasTestCase(unittest.TestCase):
         # else: risks.append 严禁追高 - so we get 严禁追高
         # Because 5.0 is not < 5.0, not > 5.0 when effective=base=5. So we hit the else.
         self._assert_contains(result.risk_factors, "严禁追高")
+
+    @patch("src.stock_analyzer.get_config")
+    def test_us_bias_is_not_treated_like_a_share_chase(self, mock_get_config: MagicMock) -> None:
+        """US stocks should treat moderate bias as tracking risk, not immediate A-share-style rejection."""
+        mock_get_config.return_value.bias_threshold = 5.0
+        result = _make_result(
+            code="AAPL",
+            trend_status=TrendStatus.BULL,
+            bias_ma5=6.0,
+        )
+        self.analyzer._generate_signal(result)
+        self._assert_contains(result.signal_reasons, "趋势延续可轻仓跟踪")
+        self._assert_not_contains(result.risk_factors, "严禁追高")
+
+    @patch("src.stock_analyzer.get_config")
+    def test_hk_high_bias_uses_market_specific_warning(self, mock_get_config: MagicMock) -> None:
+        """HK stocks should not emit the strict A-share chase warning text."""
+        mock_get_config.return_value.bias_threshold = 5.0
+        result = _make_result(
+            code="0700",
+            trend_status=TrendStatus.BULL,
+            bias_ma5=6.5,
+        )
+        self.analyzer._generate_signal(result)
+        self._assert_contains(result.risk_factors, "不宜重仓追价")
+        self._assert_not_contains(result.risk_factors, "严禁追高")

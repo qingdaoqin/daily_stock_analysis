@@ -5,10 +5,10 @@
 ===================================
 
 交易理念核心原则：
-1. 严进策略 - 不追高，追求每笔交易成功率
-2. 趋势交易 - MA5>MA10>MA20 多头排列，顺势而为
-3. 效率优先 - 关注筹码结构好的股票
-4. 买点偏好 - 在 MA5/MA10 附近回踩买入
+1. A股更强调不追高和 MA 回踩
+2. 港股/美股允许趋势跟踪、突破确认和事件催化后的再进场
+3. 趋势交易 - 先看趋势，再结合市场约束决定入场方式
+4. 不同市场不强制共用一套 MA5/MA10 买点模板
 
 技术标准：
 - 多头排列：MA5 > MA10 > MA20
@@ -25,6 +25,7 @@ import pandas as pd
 import numpy as np
 
 from src.config import get_config
+from src.core.trading_calendar import get_market_for_stock
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +202,39 @@ class StockTrendAnalyzer:
     def __init__(self):
         """初始化分析器"""
         pass
+
+    @staticmethod
+    def _resolve_market_profile(code: str) -> Dict[str, Any]:
+        market = get_market_for_stock(code) or "cn"
+        profile = {
+            "cn": {
+                "base_threshold_floor": 5.0,
+                "strong_multiplier": 1.5,
+                "near_ma_reason": "介入好时机",
+                "slightly_high_reason": "可小仓介入",
+                "high_bias_risk": "严禁追高！",
+                "strong_trend_reason": "可轻仓追踪",
+            },
+            "hk": {
+                "base_threshold_floor": 6.0,
+                "strong_multiplier": 1.45,
+                "near_ma_reason": "可结合公告/回踩确认再介入",
+                "slightly_high_reason": "可少量跟踪，但更适合等公告或回踩确认",
+                "high_bias_risk": "不宜重仓追价，等待回踩或公告确认",
+                "strong_trend_reason": "强势趋势中可小仓跟踪，但不宜重仓追价",
+            },
+            "us": {
+                "base_threshold_floor": 7.0,
+                "strong_multiplier": 1.6,
+                "near_ma_reason": "回踩后可考虑分批跟踪",
+                "slightly_high_reason": "趋势延续可轻仓跟踪，避免一次性追价",
+                "high_bias_risk": "追价风险较高，等待回踩、breakout retest 或下一次确认",
+                "strong_trend_reason": "强势趋势中可继续跟踪，但宜分批并设置波动止损",
+            },
+        }
+        resolved = dict(profile.get(market, profile["cn"]))
+        resolved["market"] = market
+        return resolved
     
     def analyze(self, df: pd.DataFrame, code: str) -> TrendAnalysisResult:
         """
@@ -618,12 +652,16 @@ class StockTrendAnalyzer:
         bias = result.bias_ma5
         if bias != bias or bias is None:  # NaN or None defense
             bias = 0.0
-        base_threshold = get_config().bias_threshold
+        market_profile = self._resolve_market_profile(result.code)
+        base_threshold = max(
+            float(get_config().bias_threshold),
+            float(market_profile["base_threshold_floor"]),
+        )
 
         # Strong trend compensation: relax threshold for STRONG_BULL with high strength
         trend_strength = result.trend_strength if result.trend_strength == result.trend_strength else 0.0
         if result.trend_status == TrendStatus.STRONG_BULL and (trend_strength or 0) >= 70:
-            effective_threshold = base_threshold * 1.5
+            effective_threshold = base_threshold * float(market_profile["strong_multiplier"])
             is_strong_trend = True
         else:
             effective_threshold = base_threshold
@@ -642,24 +680,24 @@ class StockTrendAnalyzer:
                 risks.append(f"⚠️ 乖离率过大({bias:.1f}%)，可能破位")
         elif bias < 2:
             score += 18
-            reasons.append(f"✅ 价格贴近MA5({bias:.1f}%)，介入好时机")
+            reasons.append(f"✅ 价格贴近MA5({bias:.1f}%)，{market_profile['near_ma_reason']}")
         elif bias < base_threshold:
             score += 14
-            reasons.append(f"⚡ 价格略高于MA5({bias:.1f}%)，可小仓介入")
+            reasons.append(f"⚡ 价格略高于MA5({bias:.1f}%)，{market_profile['slightly_high_reason']}")
         elif bias > effective_threshold:
             score += 4
             risks.append(
-                f"❌ 乖离率过高({bias:.1f}%>{effective_threshold:.1f}%)，严禁追高！"
+                f"❌ 乖离率过高({bias:.1f}%>{effective_threshold:.1f}%)，{market_profile['high_bias_risk']}"
             )
         elif bias > base_threshold and is_strong_trend:
             score += 10
             reasons.append(
-                f"⚡ 强势趋势中乖离率偏高({bias:.1f}%)，可轻仓追踪"
+                f"⚡ 强势趋势中乖离率偏高({bias:.1f}%)，{market_profile['strong_trend_reason']}"
             )
         else:
             score += 4
             risks.append(
-                f"❌ 乖离率过高({bias:.1f}%>{base_threshold:.1f}%)，严禁追高！"
+                f"❌ 乖离率过高({bias:.1f}%>{base_threshold:.1f}%)，{market_profile['high_bias_risk']}"
             )
 
         # === 量能评分（15分）===

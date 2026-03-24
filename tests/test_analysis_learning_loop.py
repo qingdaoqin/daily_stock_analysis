@@ -332,6 +332,40 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
         self.assertIn("global", model.submodels)
         self.assertIn("us", model.submodels)
 
+    def test_calibration_hold_downgrade_keeps_bullish_hold_bias(self) -> None:
+        self.config.analysis_learning_model_enabled = False
+
+        for idx, code in enumerate(("AAPL", "MSFT", "NVDA"), start=1):
+            self._insert_learning_record(
+                query_id=f"weak-buy-{idx}",
+                code=code,
+                signal="buy",
+                direction_correct=False,
+                simulated_return_pct=-5.0,
+                stock_return_pct=-5.0,
+                market="us",
+            )
+
+        service = AnalysisCalibrationService(db_manager=self.db, config=self.config)
+        result = AnalysisResult(
+            code="AAPL",
+            name="Apple Inc.",
+            sentiment_score=67,
+            trend_prediction="看多",
+            operation_advice="买入",
+            decision_type="buy",
+            analysis_summary="原始分析偏多。",
+            success=True,
+            model_used="gemini/gemini-2.5-flash",
+        )
+
+        calibrated = service.calibrate_result(result)
+
+        self.assertEqual(calibrated.decision_type, "hold")
+        self.assertEqual(calibrated.operation_advice, "持有")
+        self.assertEqual(calibrated.trend_prediction, "震荡偏多")
+        self.assertTrue(52 <= calibrated.sentiment_score <= 59)
+
 
 class PipelineLearningLoopTestCase(unittest.TestCase):
     def test_pipeline_calls_refresh_and_calibration_on_standard_path(self) -> None:

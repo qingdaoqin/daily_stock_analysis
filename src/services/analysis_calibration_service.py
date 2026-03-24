@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -131,6 +132,10 @@ class AnalysisCalibrationService:
     @property
     def min_samples(self) -> int:
         return max(3, int(getattr(self.config, "analysis_learning_min_samples", _DEFAULT_MIN_SAMPLES)))
+
+    @property
+    def stock_scope_min_samples(self) -> int:
+        return max(12, int(math.ceil(self.min_samples * 0.8)))
 
     @property
     def model_enabled(self) -> bool:
@@ -335,6 +340,17 @@ class AnalysisCalibrationService:
 
         suggested_signal = profile.suggested_signal
         original_signal = decision_type
+        hold_bias = "neutral"
+        if suggested_signal == "hold":
+            preferred_hold_signal = original_signal
+            if preferred_hold_signal not in {"buy", "sell"} and profile.best_alternative_stats:
+                alt_signal = str(profile.best_alternative_stats.signal or "").strip().lower()
+                if alt_signal in {"buy", "sell"}:
+                    preferred_hold_signal = alt_signal
+            if preferred_hold_signal == "buy":
+                hold_bias = "bullish"
+            elif preferred_hold_signal == "sell":
+                hold_bias = "bearish"
         updated_score = int(getattr(result, "sentiment_score", 50) or 50) + int(profile.score_adjustment or 0)
         updated_score = max(0, min(100, updated_score))
         if suggested_signal == "buy" and updated_score < 60:
@@ -342,7 +358,11 @@ class AnalysisCalibrationService:
         elif suggested_signal == "sell" and updated_score > 39:
             updated_score = 39
         elif suggested_signal == "hold" and not 40 <= updated_score <= 59:
-            updated_score = 50
+            updated_score = {
+                "bullish": 56,
+                "neutral": 50,
+                "bearish": 44,
+            }.get(hold_bias, 50)
 
         if suggested_signal == "buy":
             result.operation_advice = "买入"
@@ -351,8 +371,13 @@ class AnalysisCalibrationService:
             result.operation_advice = "减仓/卖出"
             result.trend_prediction = "看空"
         else:
-            result.operation_advice = "观望"
-            result.trend_prediction = "震荡"
+            from src.analyzer import (
+                _canonical_operation_advice_with_bias,
+                _canonical_trend_prediction_with_bias,
+            )
+
+            result.operation_advice = _canonical_operation_advice_with_bias("hold", hold_bias)
+            result.trend_prediction = _canonical_trend_prediction_with_bias("hold", hold_bias)
 
         result.decision_type = suggested_signal
         result.sentiment_score = updated_score
@@ -495,7 +520,7 @@ class AnalysisCalibrationService:
         )
 
         scope_candidates = [
-            ("个股", lambda row: row["code"] == stock_code, max(8, self.min_samples // 2)),
+            ("个股", lambda row: row["code"] == stock_code, self.stock_scope_min_samples),
             (
                 "市场+模型",
                 lambda row: row["market"] == market and model_used and row["model_used"] == model_used,
@@ -792,9 +817,13 @@ class AnalysisCalibrationService:
         best_alternative = max(alt_candidates, key=lambda item: (item.accuracy, item.samples), default=None)
 
         if current_signal == "hold":
-            if best_alternative is None or best_alternative.samples < threshold:
+            promotion_threshold = max(threshold + 2, 14)
+            if best_alternative is None or best_alternative.samples < promotion_threshold:
                 return None
-            if best_alternative.accuracy >= 0.72 and 45 <= score <= 60:
+            if (
+                best_alternative.accuracy >= max(0.78, current_stats.accuracy + 0.12)
+                and 46 <= score <= 58
+            ):
                 score_adjustment = 10 if best_alternative.signal == "buy" else -10
                 return {
                     "samples": best_alternative.samples,

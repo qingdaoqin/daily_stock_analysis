@@ -129,7 +129,9 @@ class TestAnalyzerSchemaFallback(unittest.TestCase):
         result = analyzer._parse_response(response, "600519", "股票600519")
         self.assertIsInstance(result, AnalysisResult)
         self.assertEqual(result.name, "贵州茅台")
-        self.assertEqual(result.sentiment_score, 72)
+        self.assertEqual(result.decision_type, "hold")
+        self.assertEqual(result.operation_advice, "持有")
+        self.assertTrue(52 <= result.sentiment_score <= 59)
         self.assertEqual(result.analysis_summary, "技术面向好")
 
     def test_parse_response_reconciles_conflicting_signal_fields(self) -> None:
@@ -179,6 +181,25 @@ class TestAnalyzerSchemaFallback(unittest.TestCase):
         self.assertEqual(result.operation_advice, "观望")
         self.assertEqual(result.trend_prediction, "震荡偏空")
         self.assertTrue(40 <= result.sentiment_score <= 47)
+
+    def test_parse_response_downgrades_weak_buy_without_support_to_hold(self) -> None:
+        """Directional action without score/trend support should downgrade to a bullish hold."""
+        analyzer = GeminiAnalyzer()
+        response = json.dumps({
+            "stock_name": "Apple",
+            "sentiment_score": 50,
+            "trend_prediction": "震荡",
+            "operation_advice": "买入",
+            "decision_type": "buy",
+            "analysis_summary": "方向字段过于激进",
+        })
+
+        result = analyzer._parse_response(response, "AAPL", "Apple")
+
+        self.assertEqual(result.decision_type, "hold")
+        self.assertEqual(result.operation_advice, "持有")
+        self.assertEqual(result.trend_prediction, "震荡偏多")
+        self.assertTrue(52 <= result.sentiment_score <= 59)
 
     def test_parse_response_normalizes_strong_decision_label_but_keeps_buy_signal(self) -> None:
         """Model-facing strong_buy labels should be accepted and mapped to the stable enum."""

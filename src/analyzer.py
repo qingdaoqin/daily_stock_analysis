@@ -339,7 +339,11 @@ def _resolve_consistent_signal(signals: List[str]) -> Tuple[str, bool]:
     return final_signal, has_conflict
 
 
-def _derive_hold_bias(signals: List[str]) -> str:
+def _derive_hold_bias(
+    signals: List[str],
+    *,
+    trend_prediction: str = "",
+) -> str:
     valid_signals = [signal for signal in signals if signal in {"buy", "hold", "sell"}]
     buy_count = valid_signals.count("buy")
     sell_count = valid_signals.count("sell")
@@ -347,7 +351,70 @@ def _derive_hold_bias(signals: List[str]) -> str:
         return "bullish"
     if sell_count > buy_count:
         return "bearish"
+    trend_text = str(trend_prediction or "").strip()
+    if "偏多" in trend_text:
+        return "bullish"
+    if "偏空" in trend_text:
+        return "bearish"
     return "neutral"
+
+
+def _resolve_signal_state(
+    *,
+    decision_signal: str,
+    operation_signal: str,
+    trend_signal: str,
+    score_signal: str,
+    raw_trend_prediction: str = "",
+) -> Tuple[str, bool, str]:
+    """Resolve the stable buy/hold/sell state from top-level signal fields.
+
+    Directional actions still need support from trend or score. When the model
+    emits a weak directional action such as ``buy + 50分 + 震荡``, we downgrade
+    to hold instead of mechanically trusting the action field.
+    """
+    action_signal = decision_signal or operation_signal
+    opposite_pairs = {("buy", "sell"), ("sell", "buy")}
+    hard_conflict = False
+
+    if decision_signal and operation_signal and (decision_signal, operation_signal) in opposite_pairs:
+        hard_conflict = True
+    elif action_signal and trend_signal and (action_signal, trend_signal) in opposite_pairs:
+        hard_conflict = True
+    elif action_signal and score_signal and (action_signal, score_signal) in opposite_pairs:
+        hard_conflict = True
+
+    soft_conflict = False
+    if not hard_conflict and action_signal in {"buy", "sell"}:
+        support_signals = [signal for signal in (trend_signal, score_signal) if signal]
+        directional_support = any(signal == action_signal for signal in support_signals)
+        if support_signals and not directional_support:
+            soft_conflict = True
+
+    has_conflict = hard_conflict or soft_conflict
+    if has_conflict and action_signal in {"buy", "sell"}:
+        final_signal = "hold"
+    elif action_signal:
+        final_signal = action_signal
+    else:
+        final_signal, has_conflict = _resolve_consistent_signal([
+            trend_signal,
+            score_signal,
+        ])
+
+    hold_bias = "neutral"
+    if final_signal == "hold":
+        hold_bias = _derive_hold_bias(
+            [
+                decision_signal,
+                operation_signal,
+                trend_signal,
+                score_signal,
+            ],
+            trend_prediction=raw_trend_prediction,
+        )
+
+    return final_signal, has_conflict, hold_bias
 
 
 def _normalize_dashboard_signal_fields(
@@ -818,37 +885,16 @@ def normalize_analysis_result_signals(result: AnalysisResult) -> AnalysisResult:
     score_signal = _signal_from_sentiment_score(raw_score)
 
     action_signal = decision_signal or operation_signal
-    opposite_pairs = {("buy", "sell"), ("sell", "buy")}
-    hard_conflict = False
-
-    if decision_signal and operation_signal and (decision_signal, operation_signal) in opposite_pairs:
-        hard_conflict = True
-    elif action_signal and trend_signal and (action_signal, trend_signal) in opposite_pairs:
-        hard_conflict = True
-    elif action_signal and score_signal and (action_signal, score_signal) in opposite_pairs:
-        hard_conflict = True
-
-    hold_bias = "neutral"
-    if hard_conflict:
-        final_signal = "hold"
-    elif action_signal:
-        final_signal = action_signal
-    else:
-        final_signal, _ = _resolve_consistent_signal([
-            trend_signal,
-            score_signal,
-        ])
-
-    if final_signal == "hold":
-        hold_bias = _derive_hold_bias([
-            decision_signal,
-            operation_signal,
-            trend_signal,
-            score_signal,
-        ])
+    final_signal, has_conflict, hold_bias = _resolve_signal_state(
+        decision_signal=decision_signal,
+        operation_signal=operation_signal,
+        trend_signal=trend_signal,
+        score_signal=score_signal,
+        raw_trend_prediction=raw_trend_prediction,
+    )
 
     normalized_score = raw_score
-    if raw_score < 0 or raw_score > 100 or hard_conflict:
+    if raw_score < 0 or raw_score > 100 or has_conflict or score_signal not in ("", final_signal):
         normalized_score = _clamp_sentiment_score_to_signal_with_bias(
             max(0, min(100, raw_score)),
             final_signal,
@@ -856,14 +902,23 @@ def normalize_analysis_result_signals(result: AnalysisResult) -> AnalysisResult:
         )
 
     normalized_trend_prediction = raw_trend_prediction
-    if hard_conflict and trend_signal not in ("", final_signal):
-        normalized_trend_prediction = _canonical_trend_prediction_with_bias(final_signal, hold_bias)
+    canonical_trend = _canonical_trend_prediction_with_bias(final_signal, hold_bias)
+    if (
+        has_conflict
+        or trend_signal not in ("", final_signal)
+        or (final_signal == "hold" and hold_bias != "neutral" and str(raw_trend_prediction).strip() != canonical_trend)
+    ):
+        normalized_trend_prediction = canonical_trend
 
     normalized_operation_advice = raw_operation_advice
-    if not action_signal:
-        normalized_operation_advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
-    elif hard_conflict and operation_signal not in ("", final_signal):
-        normalized_operation_advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
+    canonical_advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
+    if (
+        not action_signal
+        or has_conflict
+        or operation_signal not in ("", final_signal)
+        or (final_signal == "hold" and hold_bias != "neutral" and str(raw_operation_advice).strip() != canonical_advice)
+    ):
+        normalized_operation_advice = canonical_advice
 
     result.sentiment_score = normalized_score
     result.trend_prediction = normalized_trend_prediction
@@ -872,7 +927,7 @@ def normalize_analysis_result_signals(result: AnalysisResult) -> AnalysisResult:
     result.dashboard = _normalize_dashboard_signal_fields(
         result.dashboard,
         final_signal,
-        has_conflict=hard_conflict,
+        has_conflict=has_conflict,
         hold_bias=hold_bias,
     )
     return result
@@ -911,11 +966,11 @@ class GeminiAnalyzer:
 
 ## 核心交易理念（必须严格遵守）
 
-### 1. 入场纪律（按市场区别处理）
+### 1. 入场纪律与交易约束（按市场区别处理）
 - **乖离率公式**：(现价 - MA5) / MA5 × 100%
-- A股：乖离率 < 2% 为最佳买点，2-5% 可小仓介入，> 5% 默认观望，严禁追高
-- 港股：大体参照 A股，但对强势龙头和公告催化股可略放宽；> 6% 仍应明确提示“不宜追高”
-- 美股：乖离率 > 5% 只代表追价风险，不等于自动看空或卖出；若财报、指引、业绩或趋势共振，只能给“持有/轻仓跟踪/等回踩”，不得机械转成卖出
+- A股：存在涨跌停、T+1 和做空限制；乖离率 < 2% 为最佳买点，2-5% 可小仓介入，> 5% 默认观望；不要把涨停追入当成默认可执行方案
+- 港股：不存在 A股式涨跌停限制，可结合公告确认位、区间突破回测位或均线支撑入场；> 6% 应提示“不宜重仓追价”
+- 美股：不存在 A股式涨跌停/T+1 约束，趋势跟踪、breakout retest、earnings gap hold 都可作为有效入场；> 5% 只代表追价风险，不等于自动看空或卖出
 
 ### 2. 趋势判断（顺势而为，但不能机械套用）
 - A股：`MA5 > MA10 > MA20` 是买入级信号的重要硬条件
@@ -928,10 +983,10 @@ class GeminiAnalyzer:
 - 获利比例分析：70-90% 获利盘时需警惕获利回吐
 - 平均成本与现价关系：现价高于平均成本 5-15% 为健康
 
-### 4. 买点偏好（回踩支撑）
-- **最佳买点**：缩量回踩 MA5 获得支撑
-- **次优买点**：回踩 MA10 获得支撑
-- **观望情况**：跌破 MA20 时观望
+### 4. 买点偏好（按市场选择，不得机械套用）
+- A股：最佳买点仍是缩量回踩 MA5 / MA10；若临近涨停或成交约束明显，不要给激进追单方案
+- 港股：可使用 MA10 / MA20 回踩、公告确认位、区间突破回测位或前低防守位，不强制 MA5 / MA10 模板
+- 美股：可使用 breakout retest、earnings gap hold、前高突破确认、VWAP / 关键均线回踩或波动收敛再进，不强制 MA5 / MA10 模板
 
 ### 5. 风险排查重点
 - A股：减持公告、业绩预亏、监管处罚、大额解禁、产业政策变化
@@ -997,7 +1052,7 @@ class GeminiAnalyzer:
                 "profit_ratio": 获利比例,
                 "avg_cost": 平均成本,
                 "concentration": 筹码集中度,
-                "chip_health": "健康/一般/警惕"
+                "chip_health": "健康/一般/警惕/不适用"
             }
         },
 
@@ -1011,9 +1066,9 @@ class GeminiAnalyzer:
 
         "battle_plan": {
             "sniper_points": {
-                "ideal_buy": "理想买入点：XX元（在MA5附近）",
-                "secondary_buy": "次优买入点：XX元（在MA10附近）",
-                "stop_loss": "止损位：XX元（跌破MA20或X%）",
+                "ideal_buy": "理想买入点：A股可写MA5附近；港美股可写关键回踩位/突破确认位/VWAP附近",
+                "secondary_buy": "次优买入点：A股可写MA10附近；港美股可写区间回测位/公告确认位/前高回踩位",
+                "stop_loss": "止损位：A股可写跌破MA20；港美股可写前低/缺口回补/ATR或波动阈值",
                 "take_profit": "目标位：XX元（前高/整数关口）"
             },
             "position_strategy": {
@@ -1022,12 +1077,12 @@ class GeminiAnalyzer:
                 "risk_control": "风控策略描述"
             },
             "action_checklist": [
-            "通过/警示/否决 检查项1：多头排列",
-            "通过/警示/否决 检查项2：乖离率合理（强势趋势可放宽）",
-            "通过/警示/否决 检查项3：量能配合",
-            "通过/警示/否决 检查项4：无重大利空",
-            "通过/警示/否决 检查项5：筹码健康",
-            "通过/警示/否决 检查项6：PE估值合理"
+            "通过/警示/否决 检查项1：趋势结构成立（A股看多头排列；港美股可看趋势延续/突破确认）",
+            "通过/警示/否决 检查项2：入场位与波动匹配（非A股不强制 MA5/MA10）",
+            "通过/警示/否决 检查项3：量能/成交活跃度配合",
+            "通过/警示/否决 检查项4：官方披露无重大利空",
+            "通过/警示/否决 检查项5：筹码或持仓结构可接受",
+            "通过/警示/否决 检查项6：估值或事件催化支持"
             ]
         }
     },
@@ -1059,9 +1114,9 @@ class GeminiAnalyzer:
 ## 评分标准
 
 ### 强烈买入（80-100分）：
-- 通过：MA5 > MA10 > MA20
-- 通过：低乖离率，<2%，最佳买点
-- 通过：缩量回调或放量突破
+- 通过：A股满足多头排列；港美股满足趋势延续或突破确认
+- 通过：入场位与市场波动相匹配，而非单纯追价
+- 通过：缩量回调、放量突破或公告/财报催化确认
 - 通过：筹码集中健康
 - 通过：消息面有利好催化
 
@@ -1078,7 +1133,7 @@ class GeminiAnalyzer:
 
 ### 卖出/减仓（0-39分）：
 - 否决：空头排列
-- 否决：跌破MA20
+- 否决：关键趋势位/缺口/前低被破坏
 - 否决：放量下跌
 - 否决：重大利空
 
@@ -1608,7 +1663,14 @@ class GeminiAnalyzer:
         # 添加趋势分析结果（基于交易理念的预判）
         if 'trend_analysis' in context:
             trend = context['trend_analysis']
-            bias_warning = "超过5%，严禁追高！" if trend.get('bias_ma5', 0) > 5 else "安全范围"
+            market = self._resolve_market_context(context).get("market", "cn")
+            bias_value = float(trend.get('bias_ma5', 0) or 0)
+            if market == "us":
+                bias_warning = "追价风险较高，宜等回踩/突破确认" if bias_value > 5 else "可结合趋势跟踪判断"
+            elif market == "hk":
+                bias_warning = "不宜重仓追价，宜等公告或回踩确认" if bias_value > 6 else "可结合公告/量价判断"
+            else:
+                bias_warning = "超过5%，严禁追高！" if bias_value > 5 else "安全范围"
             prompt += f"""
 ### 趋势分析预判（基于交易理念）
 | 指标 | 数值 | 判定 |
@@ -1790,20 +1852,21 @@ class GeminiAnalyzer:
 2. `China exposure` 是高/中/低？中国政策是否应该成为核心因子，还是只能低权重引用？
 3. 是否存在 insider selling、诉讼、监管调查、short interest 或 put/call 异动？
 4. 估值与业绩增速是否匹配？消息面会不会改变估值锚？
-5. 技术面是否支持追踪或入场（多头排列、乖离率、量能）？"""
+5. 技术面是否支持趋势跟踪、breakout retest、earnings gap hold 或回踩再进？不要机械套用 A股 MA5/MA10 模式。"""
         if market == "hk":
             return """### 重点关注（必须明确回答）：
 1. HKEX 公告里是否有业绩、profit warning、配股、回购或分红等关键事项？
 2. 公司对内地业务/客户/资产是否敏感？内地政策该给多高权重？
 3. 是否存在融资摊薄、诉讼调查或明显的盈利下修风险？
 4. 行业景气、南向资金和估值是否支持当前仓位判断？
-5. 技术面是否支持追踪或入场（多头排列、乖离率、量能）？"""
+5. 技术面是否支持区间突破、公告确认位、均线支撑或回测再进？不要机械套用 A股 MA5/MA10 模式。"""
         return """### 重点关注（必须明确回答）：
 1. 是否满足 MA5>MA10>MA20 多头排列？
 2. 当前乖离率是否在安全范围内（<5%）？超过5%必须标注“严禁追高”
 3. 量能是否配合（缩量回调/放量突破）？
 4. 筹码结构是否健康？
-5. 消息面有无重大利空？（减持、处罚、业绩变脸、政策利空等）"""
+5. 消息面有无重大利空？（减持、处罚、业绩变脸、政策利空等）
+6. 是否存在涨停/交易约束/T+1 等执行层限制，导致“理论买点”在实盘中未必可成交？"""
 
     def _build_market_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """构建当日行情快照（展示用）"""
@@ -1956,38 +2019,16 @@ class GeminiAnalyzer:
                 score_signal = _signal_from_sentiment_score(raw_score)
 
                 action_signal = decision_signal or operation_signal
-                opposite_pairs = {("buy", "sell"), ("sell", "buy")}
-                hard_conflict = False
-
-                if decision_signal and operation_signal and (decision_signal, operation_signal) in opposite_pairs:
-                    hard_conflict = True
-                elif action_signal and trend_signal and (action_signal, trend_signal) in opposite_pairs:
-                    hard_conflict = True
-                elif action_signal and score_signal and (action_signal, score_signal) in opposite_pairs:
-                    hard_conflict = True
-
-                hold_bias = "neutral"
-                if hard_conflict:
-                    final_signal = "hold"
-                elif action_signal:
-                    final_signal = action_signal
-                else:
-                    final_signal, _ = _resolve_consistent_signal([
-                        trend_signal,
-                        score_signal,
-                    ])
-
-                has_conflict = hard_conflict
-                if final_signal == "hold":
-                    hold_bias = _derive_hold_bias([
-                        decision_signal,
-                        operation_signal,
-                        trend_signal,
-                        score_signal,
-                    ])
+                final_signal, has_conflict, hold_bias = _resolve_signal_state(
+                    decision_signal=decision_signal,
+                    operation_signal=operation_signal,
+                    trend_signal=trend_signal,
+                    score_signal=score_signal,
+                    raw_trend_prediction=raw_trend_prediction,
+                )
 
                 normalized_score = raw_score
-                if raw_score < 0 or raw_score > 100 or hard_conflict:
+                if raw_score < 0 or raw_score > 100 or has_conflict or score_signal not in ("", final_signal):
                     normalized_score = _clamp_sentiment_score_to_signal_with_bias(
                         max(0, min(100, raw_score)),
                         final_signal,
@@ -1995,14 +2036,23 @@ class GeminiAnalyzer:
                     )
 
                 normalized_trend_prediction = raw_trend_prediction
-                if hard_conflict and trend_signal not in ("", final_signal):
-                    normalized_trend_prediction = _canonical_trend_prediction_with_bias(final_signal, hold_bias)
+                canonical_trend = _canonical_trend_prediction_with_bias(final_signal, hold_bias)
+                if (
+                    has_conflict
+                    or trend_signal not in ("", final_signal)
+                    or (final_signal == "hold" and hold_bias != "neutral" and str(raw_trend_prediction).strip() != canonical_trend)
+                ):
+                    normalized_trend_prediction = canonical_trend
 
                 normalized_operation_advice = raw_operation_advice
-                if not action_signal:
-                    normalized_operation_advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
-                elif hard_conflict and operation_signal not in ("", final_signal):
-                    normalized_operation_advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
+                canonical_advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
+                if (
+                    not action_signal
+                    or has_conflict
+                    or operation_signal not in ("", final_signal)
+                    or (final_signal == "hold" and hold_bias != "neutral" and str(raw_operation_advice).strip() != canonical_advice)
+                ):
+                    normalized_operation_advice = canonical_advice
 
                 dashboard = _normalize_dashboard_signal_fields(
                     dashboard,

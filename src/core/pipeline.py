@@ -17,6 +17,7 @@ import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
+from threading import Lock
 from typing import List, Dict, Any, Optional, Tuple
 
 import pandas as pd
@@ -35,6 +36,7 @@ from src.analyzer import (
 from src.data.stock_mapping import STOCK_NAME_MAP
 from src.notification import NotificationService, NotificationChannel
 from src.search_service import SearchService
+from src.services.analysis_calibration_service import AnalysisCalibrationService
 from src.enums import ReportType
 from src.stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
 from src.core.trading_calendar import get_market_for_stock, is_market_open
@@ -86,6 +88,8 @@ class StockAnalysisPipeline:
         self.trend_analyzer = StockTrendAnalyzer()  # 趋势分析器
         self.analyzer = GeminiAnalyzer()
         self.notifier = NotificationService(source_message=source_message)
+        self.calibration_service = AnalysisCalibrationService(db_manager=self.db, config=self.config)
+        self._learning_refresh_lock = Lock()
         
         # 初始化搜索服务
         self.search_service = SearchService(
@@ -112,6 +116,53 @@ class StockAnalysisPipeline:
             logger.info("搜索服务已启用 (Tavily/SerpAPI)")
         else:
             logger.warning("搜索服务未启用（未配置 API Key）")
+
+    def _maybe_refresh_learning_loop(self) -> None:
+        """Periodically refresh incremental backtests for the evolution loop."""
+        if not getattr(self.calibration_service, "enabled", False):
+            return
+
+        interval_seconds = getattr(self.calibration_service, "refresh_interval_seconds", 0)
+        now = time.time()
+        last_refresh = getattr(self.calibration_service, "_last_refresh_ts", 0.0)
+        if last_refresh and interval_seconds > 0 and now - last_refresh < interval_seconds:
+            return
+
+        with self._learning_refresh_lock:
+            last_refresh = getattr(self.calibration_service, "_last_refresh_ts", 0.0)
+            now = time.time()
+            if last_refresh and interval_seconds > 0 and now - last_refresh < interval_seconds:
+                return
+            self.calibration_service.maybe_refresh_backtests()
+
+    def _apply_result_calibration(
+        self,
+        result: Optional[AnalysisResult],
+        *,
+        stock_name: str,
+        code: str,
+    ) -> Optional[AnalysisResult]:
+        """Apply history-driven calibration without breaking the main pipeline."""
+        if result is None:
+            return None
+
+        try:
+            calibrated = self.calibration_service.calibrate_result(result)
+            info = getattr(calibrated, "calibration_info", None) or {}
+            if info.get("applied"):
+                logger.info(
+                    "%s(%s) 回测校准已应用: %s -> %s, scope=%s, samples=%s",
+                    stock_name,
+                    code,
+                    info.get("current_signal"),
+                    info.get("suggested_signal"),
+                    info.get("source_scope"),
+                    info.get("samples"),
+                )
+            return calibrated
+        except Exception as e:
+            logger.warning(f"{stock_name}({code}) 应用回测校准失败: {e}")
+            return result
 
     def fetch_and_save_stock_data(
         self, 
@@ -188,6 +239,8 @@ class StockAnalysisPipeline:
             AnalysisResult 或 None（如果分析失败）
         """
         try:
+            self._maybe_refresh_learning_loop()
+
             # 获取股票名称（优先从实时行情获取真实名称）
             stock_name = self.fetcher_manager.get_stock_name(code)
 
@@ -409,6 +462,9 @@ class StockAnalysisPipeline:
             # Step 7.7: price_position fallback
             if result:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
+
+            # Step 7.8: 历史回测校准（普通分析链）
+            result = self._apply_result_calibration(result, stock_name=stock_name, code=code)
 
             # Step 8: 保存分析历史记录
             if result:
@@ -706,6 +762,10 @@ class StockAnalysisPipeline:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
 
             resolved_stock_name = result.name if result and result.name else stock_name
+
+            # 历史回测校准（Agent 链复用同一套公共逻辑）
+            result = self._apply_result_calibration(result, stock_name=resolved_stock_name, code=code)
+            resolved_stock_name = result.name if result and result.name else resolved_stock_name
 
             # 兼容旧路径：若本轮未预取情报，则至少持久化一轮新闻搜索结果。
             if not intel_results and self.search_service.is_available:

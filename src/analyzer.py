@@ -718,6 +718,7 @@ class AnalysisResult:
 
     # ========== 历史对比（Report Engine P0）==========
     query_id: Optional[str] = None  # 本次分析 query_id，用于历史对比时排除本次记录
+    calibration_info: Optional[Dict[str, Any]] = None  # 回测校准/进化信息（如有）
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -754,6 +755,7 @@ class AnalysisResult:
             'current_price': self.current_price,
             'change_pct': self.change_pct,
             'model_used': self.model_used,
+            'calibration_info': self.calibration_info,
         }
 
     def get_core_conclusion(self) -> str:

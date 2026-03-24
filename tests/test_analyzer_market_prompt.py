@@ -42,6 +42,17 @@ class TestAnalyzerMarketPrompt(unittest.TestCase):
             "stock_name": "Apple",
             "date": "2026-03-23",
             "today": {"close": 180.0, "ma5": 178.0, "ma10": 175.0, "ma20": 170.0},
+            "trend_analysis": {
+                "trend_status": "强势多头",
+                "ma_alignment": "多头排列",
+                "trend_strength": 88,
+                "bias_ma5": 1.1,
+                "bias_ma10": 2.0,
+                "volume_status": "正常",
+                "volume_trend": "量能正常",
+                "buy_signal": "买入",
+                "signal_score": 76,
+            },
             "market_context": {
                 "market": "us",
                 "market_label": "美股",
@@ -65,6 +76,7 @@ class TestAnalyzerMarketPrompt(unittest.TestCase):
         self.assertIn("SEC/财报/公司指引是否出现超预期或下修", prompt)
         self.assertIn("breakout retest", prompt)
         self.assertIn("不要机械套用 A股 MA5/MA10 模式", prompt)
+        self.assertIn("优先看趋势延续/突破确认，再结合财报、市场环境和估值", prompt)
 
     def test_cn_prompt_keeps_a_share_policy_focus(self) -> None:
         analyzer = self._make_analyzer()
@@ -73,6 +85,17 @@ class TestAnalyzerMarketPrompt(unittest.TestCase):
             "stock_name": "贵州茅台",
             "date": "2026-03-23",
             "today": {"close": 1500.0, "ma5": 1490.0, "ma10": 1480.0, "ma20": 1460.0},
+            "trend_analysis": {
+                "trend_status": "多头排列",
+                "ma_alignment": "MA5>MA10>MA20",
+                "trend_strength": 82,
+                "bias_ma5": 1.6,
+                "bias_ma10": 2.4,
+                "volume_status": "缩量回调",
+                "volume_trend": "量能配合",
+                "buy_signal": "买入",
+                "signal_score": 74,
+            },
             "market_context": {
                 "market": "cn",
                 "market_label": "A股",
@@ -88,6 +111,7 @@ class TestAnalyzerMarketPrompt(unittest.TestCase):
         self.assertIn("中国政策与产业监管属于核心主因", prompt)
         self.assertIn("是否满足 MA5>MA10>MA20 多头排列", prompt)
         self.assertIn("涨停/交易约束/T+1", prompt)
+        self.assertIn("MA5>MA10>MA20 为买入级硬条件", prompt)
 
     def test_prompt_keeps_markdown_tables_but_removes_prompt_emojis(self) -> None:
         analyzer = self._make_analyzer()

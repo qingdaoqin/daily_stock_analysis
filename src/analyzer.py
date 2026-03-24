@@ -1665,6 +1665,11 @@ class GeminiAnalyzer:
             trend = context['trend_analysis']
             market = self._resolve_market_context(context).get("market", "cn")
             bias_value = float(trend.get('bias_ma5', 0) or 0)
+            ma_alignment_hint = {
+                "cn": "MA5>MA10>MA20 为买入级硬条件",
+                "hk": "优先看趋势结构，再结合公告催化和关键支撑位",
+                "us": "优先看趋势延续/突破确认，再结合财报、市场环境和估值",
+            }.get(market, "按市场规则判断趋势结构")
             if market == "us":
                 bias_warning = "追价风险较高，宜等回踩/突破确认" if bias_value > 5 else "可结合趋势跟踪判断"
             elif market == "hk":
@@ -1676,7 +1681,7 @@ class GeminiAnalyzer:
 | 指标 | 数值 | 判定 |
 |------|------|------|
 | 趋势状态 | {trend.get('trend_status', '未知')} | |
-| 均线排列 | {trend.get('ma_alignment', '未知')} | MA5>MA10>MA20为多头 |
+| 均线排列 | {trend.get('ma_alignment', '未知')} | {ma_alignment_hint} |
 | 趋势强度 | {trend.get('trend_strength', 0)}/100 | |
 | **乖离率(MA5)** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
 | 乖离率(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |

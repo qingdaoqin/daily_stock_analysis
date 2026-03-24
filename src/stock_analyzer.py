@@ -174,10 +174,10 @@ class StockTrendAnalyzer:
     股票趋势分析器
 
     基于用户交易理念实现：
-    1. 趋势判断 - MA5>MA10>MA20 多头排列
-    2. 乖离率检测 - 不追高，偏离 MA5 超过 5% 不买
-    3. 量能分析 - 偏好缩量回调
-    4. 买点识别 - 回踩 MA5/MA10 支撑
+    1. 趋势判断 - 按市场区分多头结构与趋势延续
+    2. 乖离率检测 - 不追高，但港美股允许趋势跟踪
+    3. 量能分析 - 关注缩量回踩、放量突破与放量下跌
+    4. 买点识别 - A股偏 MA 回踩，港美股偏确认位/趋势延续
     5. MACD 指标 - 趋势确认和金叉死叉信号
     6. RSI 指标 - 超买超卖判断
     """
@@ -214,6 +214,9 @@ class StockTrendAnalyzer:
                 "slightly_high_reason": "可小仓介入",
                 "high_bias_risk": "严禁追高！",
                 "strong_trend_reason": "可轻仓追踪",
+                "pullback_near_reason": "回踩买点",
+                "pullback_mid_reason": "观察支撑",
+                "deep_pullback_risk": "可能破位",
                 "support_ma5_score": 5,
                 "support_ma10_score": 5,
                 "support_ma5_reason": "MA5支撑有效",
@@ -226,6 +229,9 @@ class StockTrendAnalyzer:
                 "slightly_high_reason": "可少量跟踪，但更适合等公告或回踩确认",
                 "high_bias_risk": "不宜重仓追价，等待回踩或公告确认",
                 "strong_trend_reason": "强势趋势中可小仓跟踪，但不宜重仓追价",
+                "pullback_near_reason": "回踩后可结合公告或区间确认再介入",
+                "pullback_mid_reason": "观察关键支撑与公告确认位",
+                "deep_pullback_risk": "回撤过深，警惕区间失守",
                 "support_ma5_score": 2,
                 "support_ma10_score": 4,
                 "support_ma5_reason": "短线均线附近企稳，可作为跟踪参考",
@@ -238,6 +244,9 @@ class StockTrendAnalyzer:
                 "slightly_high_reason": "趋势延续可轻仓跟踪，避免一次性追价",
                 "high_bias_risk": "追价风险较高，等待回踩、breakout retest 或下一次确认",
                 "strong_trend_reason": "强势趋势中可继续跟踪，但宜分批并设置波动止损",
+                "pullback_near_reason": "回踩后可考虑继续跟踪，但需结合市场环境确认",
+                "pullback_mid_reason": "观察趋势线、VWAP 或关键均线附近是否重新企稳",
+                "deep_pullback_risk": "回撤过深，趋势可能转弱",
                 "support_ma5_score": 1,
                 "support_ma10_score": 3,
                 "support_ma5_reason": "短线回踩企稳，可辅助观察但不单独构成买点",
@@ -493,8 +502,8 @@ class StockTrendAnalyzer:
     def _analyze_support_resistance(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """
         分析支撑压力位
-        
-        买点偏好：回踩 MA5/MA10 获得支撑
+
+        A股更偏 MA5/MA10 回踩支撑，港美股更偏关键均线或确认位
         """
         price = result.current_price
         
@@ -683,13 +692,13 @@ class StockTrendAnalyzer:
             # Price below MA5 (pullback)
             if bias > -3:
                 score += 20
-                reasons.append(f"✅ 价格略低于MA5({bias:.1f}%)，回踩买点")
+                reasons.append(f"✅ 价格略低于MA5({bias:.1f}%)，{market_profile['pullback_near_reason']}")
             elif bias > -5:
                 score += 16
-                reasons.append(f"✅ 价格回踩MA5({bias:.1f}%)，观察支撑")
+                reasons.append(f"✅ 价格回踩MA5({bias:.1f}%)，{market_profile['pullback_mid_reason']}")
             else:
                 score += 8
-                risks.append(f"⚠️ 乖离率过大({bias:.1f}%)，可能破位")
+                risks.append(f"⚠️ 乖离率过大({bias:.1f}%)，{market_profile['deep_pullback_risk']}")
         elif bias < 2:
             score += 18
             reasons.append(f"✅ 价格贴近MA5({bias:.1f}%)，{market_profile['near_ma_reason']}")

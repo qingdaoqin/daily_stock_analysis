@@ -231,3 +231,29 @@ class StockAnalyzerBiasTestCase(unittest.TestCase):
         self.analyzer._generate_signal(result)
         self._assert_contains(result.signal_reasons, "关键支撑位附近企稳")
         self._assert_not_contains(result.signal_reasons, "MA10支撑有效")
+
+    @patch("src.stock_analyzer.get_config")
+    def test_us_negative_bias_uses_tracking_language(self, mock_get_config: MagicMock) -> None:
+        """US pullback reasons should describe tracking/confirmation, not direct A-share buy-point language."""
+        mock_get_config.return_value.bias_threshold = 5.0
+        result = _make_result(
+            code="AAPL",
+            trend_status=TrendStatus.BULL,
+            bias_ma5=-2.0,
+        )
+        self.analyzer._generate_signal(result)
+        self._assert_contains(result.signal_reasons, "回踩后可考虑继续跟踪")
+        self._assert_not_contains(result.signal_reasons, "回踩买点")
+
+    @patch("src.stock_analyzer.get_config")
+    def test_hk_negative_bias_uses_confirmation_language(self, mock_get_config: MagicMock) -> None:
+        """HK pullback reasons should use confirmation wording instead of direct MA buy-point language."""
+        mock_get_config.return_value.bias_threshold = 5.0
+        result = _make_result(
+            code="0700",
+            trend_status=TrendStatus.BULL,
+            bias_ma5=-2.0,
+        )
+        self.analyzer._generate_signal(result)
+        self._assert_contains(result.signal_reasons, "公告或区间确认")
+        self._assert_not_contains(result.signal_reasons, "回踩买点")

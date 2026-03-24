@@ -132,8 +132,12 @@ class StockAnalysisPipeline:
             last_refresh = getattr(self.calibration_service, "_last_refresh_ts", 0.0)
             now = time.time()
             if last_refresh and interval_seconds > 0 and now - last_refresh < interval_seconds:
+                if hasattr(self.calibration_service, "maybe_refresh_model"):
+                    self.calibration_service.maybe_refresh_model()
                 return
             self.calibration_service.maybe_refresh_backtests()
+            if hasattr(self.calibration_service, "maybe_refresh_model"):
+                self.calibration_service.maybe_refresh_model()
 
     def _apply_result_calibration(
         self,
@@ -141,13 +145,14 @@ class StockAnalysisPipeline:
         *,
         stock_name: str,
         code: str,
+        context_snapshot: Optional[Dict[str, Any]] = None,
     ) -> Optional[AnalysisResult]:
         """Apply history-driven calibration without breaking the main pipeline."""
         if result is None:
             return None
 
         try:
-            calibrated = self.calibration_service.calibrate_result(result)
+            calibrated = self.calibration_service.calibrate_result(result, context_snapshot=context_snapshot)
             info = getattr(calibrated, "calibration_info", None) or {}
             if info.get("applied"):
                 logger.info(
@@ -463,18 +468,24 @@ class StockAnalysisPipeline:
             if result:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
 
+            context_snapshot = self._build_context_snapshot(
+                enhanced_context=enhanced_context,
+                news_content=news_context,
+                realtime_quote=realtime_quote,
+                chip_data=chip_data,
+            )
+
             # Step 7.8: 历史回测校准（普通分析链）
-            result = self._apply_result_calibration(result, stock_name=stock_name, code=code)
+            result = self._apply_result_calibration(
+                result,
+                stock_name=stock_name,
+                code=code,
+                context_snapshot=context_snapshot,
+            )
 
             # Step 8: 保存分析历史记录
             if result:
                 try:
-                    context_snapshot = self._build_context_snapshot(
-                        enhanced_context=enhanced_context,
-                        news_content=news_context,
-                        realtime_quote=realtime_quote,
-                        chip_data=chip_data
-                    )
                     self.db.save_analysis_history(
                         result=result,
                         query_id=query_id,
@@ -764,7 +775,12 @@ class StockAnalysisPipeline:
             resolved_stock_name = result.name if result and result.name else stock_name
 
             # 历史回测校准（Agent 链复用同一套公共逻辑）
-            result = self._apply_result_calibration(result, stock_name=resolved_stock_name, code=code)
+            result = self._apply_result_calibration(
+                result,
+                stock_name=resolved_stock_name,
+                code=code,
+                context_snapshot=initial_context,
+            )
             resolved_stock_name = result.name if result and result.name else resolved_stock_name
 
             # 兼容旧路径：若本轮未预取情报，则至少持久化一轮新闻搜索结果。

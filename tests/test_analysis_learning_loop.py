@@ -40,6 +40,13 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
             analysis_learning_history_limit=100,
             analysis_learning_auto_backtest_limit=50,
             analysis_learning_refresh_interval_minutes=60,
+            analysis_learning_model_enabled=True,
+            analysis_learning_model_path=os.path.join(self._temp_dir.name, "analysis_calibration_model.json"),
+            analysis_learning_model_retrain_interval_minutes=60,
+            analysis_learning_model_train_min_samples=6,
+            analysis_learning_model_confidence_threshold=0.55,
+            analysis_learning_label_band_pct=2.0,
+            backtest_neutral_band_pct=2.0,
         )
 
     def tearDown(self) -> None:
@@ -54,7 +61,15 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
         signal: str,
         direction_correct: bool,
         simulated_return_pct: float,
+        stock_return_pct: float,
         model_used: str = "gemini/gemini-2.5-flash",
+        market: str = "us",
+        sentiment_score: int | None = None,
+        change_pct: float | None = None,
+        trend_strength: float | None = None,
+        signal_score: int | None = None,
+        bias_ma5: float | None = None,
+        china_exposure_level: str = "",
     ) -> None:
         advice_map = {
             "buy": "买入",
@@ -67,6 +82,18 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
             "sell": "看空",
         }
         created_at = datetime(2024, 1, 1, 0, 0, 0)
+        score_value = sentiment_score if sentiment_score is not None else (
+            72 if signal == "buy" else 28 if signal == "sell" else 50
+        )
+        context_snapshot = self._make_context_snapshot(
+            market=market,
+            signal=signal,
+            change_pct=change_pct,
+            trend_strength=trend_strength,
+            signal_score=signal_score,
+            bias_ma5=bias_ma5,
+            china_exposure_level=china_exposure_level,
+        )
 
         with self.db.get_session() as session:
             history = AnalysisHistory(
@@ -74,7 +101,7 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
                 code=code,
                 name=code,
                 report_type="simple",
-                sentiment_score=70 if signal == "buy" else 30 if signal == "sell" else 50,
+                sentiment_score=score_value,
                 operation_advice=advice_map[signal],
                 trend_prediction=trend_map[signal],
                 analysis_summary="test",
@@ -83,7 +110,9 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
                     "operation_advice": advice_map[signal],
                     "trend_prediction": trend_map[signal],
                     "model_used": model_used,
+                    "sentiment_score": score_value,
                 }, ensure_ascii=False),
+                context_snapshot=json.dumps(context_snapshot, ensure_ascii=False),
                 created_at=created_at,
             )
             session.add(history)
@@ -99,9 +128,50 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
                     operation_advice=advice_map[signal],
                     direction_correct=direction_correct,
                     simulated_return_pct=simulated_return_pct,
+                    stock_return_pct=stock_return_pct,
                 )
             )
             session.commit()
+
+    @staticmethod
+    def _make_context_snapshot(
+        *,
+        market: str,
+        signal: str,
+        change_pct: float | None = None,
+        trend_strength: float | None = None,
+        signal_score: int | None = None,
+        bias_ma5: float | None = None,
+        china_exposure_level: str = "",
+    ) -> dict:
+        bullish = signal == "buy"
+        bearish = signal == "sell"
+        return {
+            "enhanced_context": {
+                "market": market,
+                "market_context": {
+                    "market": market,
+                    "china_exposure": {"level": china_exposure_level} if china_exposure_level else {},
+                },
+                "realtime": {
+                    "change_pct": change_pct if change_pct is not None else (3.6 if bullish else -3.8 if bearish else 0.4),
+                    "volume_ratio": 1.4 if bullish else 0.7 if bearish else 1.0,
+                    "turnover_rate": 6.0 if bullish else 2.0 if bearish else 3.0,
+                },
+                "trend_analysis": {
+                    "trend_strength": trend_strength if trend_strength is not None else (86 if bullish else 24 if bearish else 50),
+                    "signal_score": signal_score if signal_score is not None else (88 if bullish else 22 if bearish else 50),
+                    "bias_ma5": bias_ma5 if bias_ma5 is not None else (0.8 if bullish else -0.9 if bearish else 0.0),
+                    "bias_ma10": 0.5 if bullish else -0.6 if bearish else 0.0,
+                },
+                "chip": {
+                    "profit_ratio": 78 if bullish else 28 if bearish else 50,
+                    "concentration_90": 12 if bullish else 28 if bearish else 18,
+                    "concentration_70": 8 if bullish else 20 if bearish else 12,
+                },
+                "is_index_etf": False,
+            }
+        }
 
     def test_calibrate_result_uses_historical_counter_evidence(self) -> None:
         # US market: sell signals have been wrong, buy signals have been right.
@@ -112,6 +182,8 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
                 signal="sell",
                 direction_correct=False,
                 simulated_return_pct=-6.0,
+                stock_return_pct=6.0,
+                china_exposure_level="high",
             )
         for idx, code in enumerate(("META", "GOOGL", "AMZN", "TSLA"), start=1):
             self._insert_learning_record(
@@ -120,6 +192,8 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
                 signal="buy",
                 direction_correct=True,
                 simulated_return_pct=8.0,
+                stock_return_pct=8.0,
+                china_exposure_level="high",
             )
 
         service = AnalysisCalibrationService(db_manager=self.db, config=self.config)
@@ -150,6 +224,74 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
             service.maybe_refresh_backtests()
             service.maybe_refresh_backtests()
         self.assertEqual(mock_run.call_count, 1)
+
+    def test_small_model_trains_and_calibrates_hold_to_buy(self) -> None:
+        self.config.analysis_learning_min_samples = 10
+        self.config.analysis_learning_model_train_min_samples = 6
+
+        for idx, code in enumerate(("AAPL", "MSFT", "NVDA", "META", "AMZN", "GOOGL"), start=1):
+            self._insert_learning_record(
+                query_id=f"bull-{idx}",
+                code=code,
+                signal="buy",
+                direction_correct=True,
+                simulated_return_pct=7.0,
+                stock_return_pct=7.0,
+                change_pct=4.2,
+                trend_strength=90,
+                signal_score=92,
+                bias_ma5=1.1,
+                china_exposure_level="high",
+            )
+        for idx, code in enumerate(("BABA", "NIO", "PDD", "JD", "BIDU", "LI"), start=1):
+            self._insert_learning_record(
+                query_id=f"bear-{idx}",
+                code=code,
+                signal="sell",
+                direction_correct=True,
+                simulated_return_pct=0.0,
+                stock_return_pct=-7.0,
+                change_pct=-4.1,
+                trend_strength=20,
+                signal_score=18,
+                bias_ma5=-1.2,
+                china_exposure_level="low",
+            )
+
+        service = AnalysisCalibrationService(db_manager=self.db, config=self.config)
+        train_stats = service.maybe_refresh_model()
+        self.assertTrue(train_stats.get("success"))
+        self.assertTrue(os.path.exists(self.config.analysis_learning_model_path))
+
+        result = AnalysisResult(
+            code="AAPL",
+            name="Apple Inc.",
+            sentiment_score=54,
+            trend_prediction="震荡",
+            operation_advice="观望",
+            decision_type="hold",
+            analysis_summary="原始分析偏中性。",
+            success=True,
+            model_used="gemini/gemini-2.5-flash",
+        )
+        calibrated = service.calibrate_result(
+            result,
+            context_snapshot=self._make_context_snapshot(
+                market="us",
+                signal="buy",
+                change_pct=4.5,
+                trend_strength=94,
+                signal_score=95,
+                bias_ma5=1.2,
+                china_exposure_level="high",
+            ),
+        )
+
+        self.assertEqual(calibrated.decision_type, "buy")
+        self.assertEqual(calibrated.operation_advice, "买入")
+        self.assertIsInstance(calibrated.calibration_info, dict)
+        self.assertIn("model_prediction", calibrated.calibration_info)
+        self.assertEqual(calibrated.calibration_info.get("source_scope"), "小型校准模型")
 
 
 class PipelineLearningLoopTestCase(unittest.TestCase):
@@ -183,6 +325,7 @@ class PipelineLearningLoopTestCase(unittest.TestCase):
             pipeline.calibration_service.enabled = True
             pipeline.calibration_service.refresh_interval_seconds = 0
             pipeline.calibration_service._last_refresh_ts = 0.0
+            pipeline.calibration_service.maybe_refresh_model = MagicMock()
 
             pipeline.fetcher_manager.get_stock_name.return_value = "Apple Inc."
             pipeline.fetcher_manager.get_realtime_quote.return_value = None
@@ -209,12 +352,15 @@ class PipelineLearningLoopTestCase(unittest.TestCase):
                 analysis_summary="test",
             )
             pipeline.analyzer.analyze.return_value = raw_result
-            pipeline.calibration_service.calibrate_result.side_effect = lambda result: result
+            pipeline.calibration_service.calibrate_result.side_effect = (
+                lambda result, context_snapshot=None: result
+            )
 
             result = pipeline.analyze_stock("AAPL", ReportType.SIMPLE, "q-learn")
 
             self.assertIsNotNone(result)
             pipeline.calibration_service.maybe_refresh_backtests.assert_called_once()
+            pipeline.calibration_service.maybe_refresh_model.assert_called_once()
             pipeline.calibration_service.calibrate_result.assert_called_once()
 
 

@@ -459,6 +459,16 @@ class Config:
     backtest_min_age_days: int = 14
     backtest_engine_version: str = "v1"
     backtest_neutral_band_pct: float = 2.0
+    analysis_learning_refresh_interval_minutes: int = 60
+    analysis_learning_min_samples: int = 20
+    analysis_learning_history_limit: int = 800
+    analysis_learning_auto_backtest_limit: int = 200
+    analysis_learning_model_enabled: bool = True
+    analysis_learning_model_path: str = "./data/models/analysis_calibration_model.json"
+    analysis_learning_model_retrain_interval_minutes: int = 180
+    analysis_learning_model_train_min_samples: int = 60
+    analysis_learning_model_confidence_threshold: float = 0.62
+    analysis_learning_label_band_pct: float = 2.0
     
     # === 日志配置 ===
     log_dir: str = "./logs"  # 日志文件目录
@@ -978,6 +988,27 @@ class Config:
             backtest_min_age_days=int(os.getenv('BACKTEST_MIN_AGE_DAYS', '14')),
             backtest_engine_version=os.getenv('BACKTEST_ENGINE_VERSION', 'v1'),
             backtest_neutral_band_pct=float(os.getenv('BACKTEST_NEUTRAL_BAND_PCT', '2.0')),
+            analysis_learning_refresh_interval_minutes=max(1, int(os.getenv('ANALYSIS_LEARNING_REFRESH_INTERVAL_MINUTES', '60'))),
+            analysis_learning_min_samples=max(3, int(os.getenv('ANALYSIS_LEARNING_MIN_SAMPLES', '20'))),
+            analysis_learning_history_limit=max(50, int(os.getenv('ANALYSIS_LEARNING_HISTORY_LIMIT', '800'))),
+            analysis_learning_auto_backtest_limit=max(20, int(os.getenv('ANALYSIS_LEARNING_AUTO_BACKTEST_LIMIT', '200'))),
+            analysis_learning_model_enabled=parse_env_bool(os.getenv('ANALYSIS_LEARNING_MODEL_ENABLED'), True),
+            analysis_learning_model_path=os.getenv('ANALYSIS_LEARNING_MODEL_PATH', './data/models/analysis_calibration_model.json'),
+            analysis_learning_model_retrain_interval_minutes=max(10, int(os.getenv('ANALYSIS_LEARNING_MODEL_RETRAIN_INTERVAL_MINUTES', '180'))),
+            analysis_learning_model_train_min_samples=max(12, int(os.getenv('ANALYSIS_LEARNING_MODEL_TRAIN_MIN_SAMPLES', '60'))),
+            analysis_learning_model_confidence_threshold=min(
+                0.95,
+                max(0.5, float(os.getenv('ANALYSIS_LEARNING_MODEL_CONFIDENCE_THRESHOLD', '0.62'))),
+            ),
+            analysis_learning_label_band_pct=max(
+                0.5,
+                float(
+                    os.getenv(
+                        'ANALYSIS_LEARNING_LABEL_BAND_PCT',
+                        os.getenv('BACKTEST_NEUTRAL_BAND_PCT', '2.0'),
+                    )
+                ),
+            ),
             log_dir=os.getenv('LOG_DIR', './logs'),
             log_level=os.getenv('LOG_LEVEL', 'INFO'),
             max_workers=int(os.getenv('MAX_WORKERS', '3')),

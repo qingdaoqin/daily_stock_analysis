@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from src.analyzer import AnalysisResult
 from src.core.pipeline import StockAnalysisPipeline
 from src.enums import ReportType
+from src.services.analysis_calibration_model import SmallCalibrationModel
 from src.services.analysis_calibration_service import AnalysisCalibrationService
 from src.storage import AnalysisHistory, BacktestResult, DatabaseManager
 
@@ -300,6 +301,36 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
         self.assertEqual(calibrated.calibration_info.get("source_scope"), "学习校准模型")
         self.assertEqual(calibrated.calibration_info["model_prediction"].get("engine"), "hist_gradient_boosting")
         self.assertEqual(calibrated.calibration_info["model_prediction"].get("scope"), "us")
+
+    def test_learning_model_does_not_fail_when_time_split_train_side_is_single_class(self) -> None:
+        samples = []
+        for idx in range(18):
+            samples.append(
+                {
+                    "features": {"score_norm": 0.85, "current_signal_bias": 1.0, "change_pct_norm": 0.4},
+                    "label": "buy",
+                    "market": "us",
+                }
+            )
+        for idx in range(2):
+            samples.append(
+                {
+                    "features": {"score_norm": 0.18, "current_signal_bias": -1.0, "change_pct_norm": -0.5},
+                    "label": "sell",
+                    "market": "us",
+                }
+            )
+
+        model = SmallCalibrationModel.fit(
+            samples,
+            preferred_backend="tree",
+            market_split=True,
+            min_scope_samples=12,
+        )
+
+        self.assertIsNotNone(model)
+        self.assertIn("global", model.submodels)
+        self.assertIn("us", model.submodels)
 
 
 class PipelineLearningLoopTestCase(unittest.TestCase):

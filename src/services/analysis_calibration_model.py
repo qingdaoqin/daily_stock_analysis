@@ -47,6 +47,7 @@ class SmallCalibrationPrediction:
     probabilities: Dict[str, float]
     sample_count: int
     validation_accuracy: Optional[float] = None
+    validation_count: int = 0
     baseline_accuracy: Optional[float] = None
     engine: str = _NB_BACKEND
     scope: str = _DEFAULT_SCOPE
@@ -58,6 +59,7 @@ class SmallCalibrationPrediction:
             "probabilities": dict(self.probabilities),
             "sample_count": self.sample_count,
             "validation_accuracy": self.validation_accuracy,
+            "validation_count": self.validation_count,
             "baseline_accuracy": self.baseline_accuracy,
             "engine": self.engine,
             "scope": self.scope,
@@ -187,7 +189,17 @@ class SmallCalibrationModel:
             }
         )
         if len(labels) < 2:
-            return None
+            labels = sorted(
+                {
+                    str(sample.get("label") or "").strip().lower()
+                    for sample in ordered
+                    if str(sample.get("label") or "").strip()
+                }
+            )
+            if len(labels) < 2:
+                return None
+            train_samples = ordered
+            validation_samples = []
 
         backend = cls._resolve_backend(
             preferred_backend=preferred_backend,
@@ -463,6 +475,7 @@ class SmallCalibrationModel:
             probabilities=probabilities,
             sample_count=int(submodel.get("sample_count") or self.sample_count),
             validation_accuracy=submodel.get("validation_accuracy"),
+            validation_count=int(submodel.get("validation_count") or 0),
             baseline_accuracy=submodel.get("baseline_accuracy"),
             engine=engine,
             scope=scope,

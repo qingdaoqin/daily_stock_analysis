@@ -562,6 +562,14 @@ class AnalysisCalibrationService:
         if prediction is None:
             return None
 
+        if (
+            prediction.validation_accuracy is not None
+            and prediction.validation_count >= 6
+            and prediction.baseline_accuracy is not None
+            and prediction.validation_accuracy < max(0.35, prediction.baseline_accuracy - 0.02)
+        ):
+            return None
+
         suggested_signal = prediction.predicted_signal
         confidence = float(prediction.confidence or 0.0)
         applied = False

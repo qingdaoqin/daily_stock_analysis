@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 # AkShare result cache: (timestamp, name_to_code_dict)
 _akshare_cache: Optional[tuple[float, Dict[str, str]]] = None
 _AKSHARE_CACHE_TTL = 3600  # 1 hour
+_DEFAULT_FUZZY_CUTOFF = 0.8
+_CJK_FUZZY_CUTOFF = 0.75
 
 
 def _is_code_like(s: str) -> bool:
@@ -147,7 +149,8 @@ def resolve_name_to_code(name: str) -> Optional[str]:
     # e.g. '中国' matching arbitrary company names in a pool of 5000+ stocks.
     # Use a higher cutoff (0.8) to reduce mis-hits on longer inputs as well.
     if len(s) > 2:
-        matches = difflib.get_close_matches(s, list(all_name_to_code.keys()), n=1, cutoff=0.8)
+        cutoff = _CJK_FUZZY_CUTOFF if any("\u4e00" <= ch <= "\u9fff" for ch in s) else _DEFAULT_FUZZY_CUTOFF
+        matches = difflib.get_close_matches(s, list(all_name_to_code.keys()), n=1, cutoff=cutoff)
         if matches:
             logger.debug(f"[NameResolver] 命中模糊匹配: input={s}, matched={matches[0]}")
             return all_name_to_code[matches[0]]

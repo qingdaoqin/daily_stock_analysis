@@ -168,10 +168,23 @@ def _parse_items_from_text(text: str) -> List[Tuple[str, Optional[str], str]]:
         try:
             from json_repair import repair_json
 
-            parsed_data = repair_json(cleaned, return_objects=True)
-            logger.debug("[ImageExtractor] json.loads failed, repaired malformed JSON response")
+            repaired = repair_json(cleaned, return_objects=True)
+            if isinstance(repaired, list):
+                parsed_data = repaired
+                logger.debug("[ImageExtractor] json.loads failed, repaired malformed JSON response")
+            elif isinstance(repaired, str):
+                parsed_data = json.loads(repaired)
+                logger.debug("[ImageExtractor] json.loads failed, parsed repaired JSON string response")
+            else:
+                parsed_data = None
         except Exception:
-            parsed_data = None
+            parsed_data = _repair_common_json_items(cleaned)
+            if parsed_data is not None:
+                logger.debug("[ImageExtractor] json_repair unavailable; applied safe fallback repair")
+        if parsed_data is None:
+            parsed_data = _repair_common_json_items(cleaned)
+            if parsed_data is not None:
+                logger.debug("[ImageExtractor] json_repair returned unusable content; applied safe fallback repair")
 
     if isinstance(parsed_data, list):
         seen: set[str] = set()
@@ -205,6 +218,30 @@ def _parse_items_from_text(text: str) -> List[Tuple[str, Optional[str], str]]:
     if not codes:
         logger.info("[ImageExtractor] 无法解析为结构化 items，且 legacy code 提取为空")
     return [(c, None, "medium") for c in codes]
+
+
+def _repair_common_json_items(text: str) -> Optional[List[dict]]:
+    """Apply a tiny set of safe repairs when json_repair is unavailable."""
+    if not text:
+        return None
+
+    repaired = re.sub(r",(\s*[}\]])", r"\1", text)
+    stripped = repaired.strip()
+
+    # Common truncated shape from LLM output:
+    # [{"code":"600519","name":"贵州茅台","confidence":"high"
+    if stripped.startswith("[") and not stripped.endswith("]"):
+        open_braces = stripped.count("{")
+        close_braces = stripped.count("}")
+        if open_braces > close_braces:
+            stripped += "}" * (open_braces - close_braces)
+        stripped += "]"
+
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, list) else None
 
 
 def _resolve_vision_model() -> str:

@@ -39,9 +39,6 @@ jobs:
     timeout-minutes: 60
     
     steps:
-      - name: 随机延迟（避免固定时间访问）
-        run: sleep $((RANDOM % 60))  # 随机延迟0-60秒启动
-      
       - name: 检出代码
         uses: actions/checkout@v5
 
@@ -50,18 +47,26 @@ jobs:
         id: market_window
         run: |
           NY_DOW="$(TZ='America/New_York' date '+%u')"
-          NY_TIME="$(TZ='America/New_York' date '+%H:%M')"
+          NY_HOUR="$(TZ='America/New_York' date '+%H')"
+          NY_MINUTE="$(TZ='America/New_York' date '+%M')"
+          NY_TIME="${NY_HOUR}:${NY_MINUTE}"
           echo "ny_dow=$NY_DOW" >> "$GITHUB_OUTPUT"
+          echo "ny_hour=$NY_HOUR" >> "$GITHUB_OUTPUT"
+          echo "ny_minute=$NY_MINUTE" >> "$GITHUB_OUTPUT"
           echo "ny_time=$NY_TIME" >> "$GITHUB_OUTPUT"
           echo "🕘 当前纽约时间: $NY_TIME (weekday=$NY_DOW)"
 
-          if [ "$NY_DOW" -ge 1 ] && [ "$NY_DOW" -le 5 ] && [ "$NY_TIME" = "09:00" ]; then
+          if [ "$NY_DOW" -ge 1 ] && [ "$NY_DOW" -le 5 ] && [ "$NY_HOUR" = "09" ] && [ "$NY_MINUTE" -lt 30 ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
-            echo "✅ 命中美股开盘前半小时窗口，继续执行"
+            echo "✅ 命中美股开盘前半小时窗口（09:00-09:29 ET），继续执行"
           else
             echo "should_run=false" >> "$GITHUB_OUTPUT"
             echo "⏭️ 当前不在美股开盘前半小时窗口，后续步骤跳过"
           fi
+
+      - name: 随机延迟（避免固定时间访问）
+        if: github.event_name != 'schedule' || steps.market_window.outputs.should_run == 'true'
+        run: sleep $((RANDOM % 60))  # 随机延迟0-60秒启动
       
       - name: 设置 Python 环境
         if: github.event_name != 'schedule' || steps.market_window.outputs.should_run == 'true'

@@ -1,10 +1,13 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 每 6 小时运行一次
-  # GitHub Actions cron 使用 UTC，对应北京时间约为 02:00、08:00、14:00、20:00
+  # 定时触发 - 对齐美股开盘前半小时
+  # GitHub Actions cron 使用 UTC，无法直接按美东时区处理夏令时。
+  # 这里在工作日 13:00 / 14:00 UTC 各触发一次，再由后续步骤按纽约时间做 09:00 门控，
+  # 因此实际分析只会在美股开盘前半小时执行一次。
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 13 * * 1-5'
+    - cron: '0 14 * * 1-5'
   
   # 手动触发
   workflow_dispatch:
@@ -41,23 +44,45 @@ jobs:
       
       - name: 检出代码
         uses: actions/checkout@v5
+
+      - name: 检查美股开盘前窗口
+        if: github.event_name == 'schedule'
+        id: market_window
+        run: |
+          NY_DOW="$(TZ='America/New_York' date '+%u')"
+          NY_TIME="$(TZ='America/New_York' date '+%H:%M')"
+          echo "ny_dow=$NY_DOW" >> "$GITHUB_OUTPUT"
+          echo "ny_time=$NY_TIME" >> "$GITHUB_OUTPUT"
+          echo "🕘 当前纽约时间: $NY_TIME (weekday=$NY_DOW)"
+
+          if [ "$NY_DOW" -ge 1 ] && [ "$NY_DOW" -le 5 ] && [ "$NY_TIME" = "09:00" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "✅ 命中美股开盘前半小时窗口，继续执行"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "⏭️ 当前不在美股开盘前半小时窗口，后续步骤跳过"
+          fi
       
       - name: 设置 Python 环境
+        if: github.event_name != 'schedule' || steps.market_window.outputs.should_run == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
       
       - name: 安装依赖
+        if: github.event_name != 'schedule' || steps.market_window.outputs.should_run == 'true'
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
       
       - name: 创建必要目录
+        if: github.event_name != 'schedule' || steps.market_window.outputs.should_run == 'true'
         run: |
           mkdir -p data logs reports
       
       - name: 执行股票分析
+        if: github.event_name != 'schedule' || steps.market_window.outputs.should_run == 'true'
         env:
           # ==========================================
           # AI 配置
@@ -159,7 +184,7 @@ jobs:
           # 自选股配置
           # ==========================================
           STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST || '600519' }}
-          MARKET_REVIEW_REGION: ${{ vars.MARKET_REVIEW_REGION || secrets.MARKET_REVIEW_REGION || 'cn' }}
+          MARKET_REVIEW_REGION: ${{ vars.MARKET_REVIEW_REGION || secrets.MARKET_REVIEW_REGION || 'us' }}
           
           # ==========================================
           # 运行配置 ⬅️ 新增！
@@ -255,7 +280,7 @@ jobs:
           fi
       
       - name: 准备上传产物
-        if: always()
+        if: always() && (github.event_name != 'schedule' || steps.market_window.outputs.should_run == 'true')
         run: |
           mkdir -p reports logs
 
@@ -281,7 +306,7 @@ jobs:
 
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
-        if: always()
+        if: always() && (github.event_name != 'schedule' || steps.market_window.outputs.should_run == 'true')
         with:
           name: analysis-reports-${{ github.run_number }}
           path: |
@@ -291,7 +316,7 @@ jobs:
           retention-days: 30
       
       - name: 显示运行结果
-        if: always()
+        if: always() && (github.event_name != 'schedule' || steps.market_window.outputs.should_run == 'true')
         run: |
           echo ""
           echo "=========================================="

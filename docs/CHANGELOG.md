@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 🔇 **实时行情降级提示收口为单次告警** — 分析主流程获取股票名称时不再提前触发一次实时行情查询，避免每只股票重复命中 quote 链路；当某个前置实时数据源失败但后续 fallback 成功时，不再输出“实时行情获取失败”级别提示，只有在实时行情开关关闭或全部数据源都不可用时，才提示已降级为历史收盘价继续分析。
 - [新功能] 集成 Longbridge OpenAPI 作为美股/港股可选数据源；配置 `LONGBRIDGE_*` 后优先使用长桥获取日线与实时行情，YFinance / AkShare 兜底；未配置时行为与此前一致。长桥联调请使用 `tests/longbridge_live_smoke.py`（手动脚本，不参与 pytest 收集）。
 - [文档] 澄清 README（中/英/繁）中长桥「首选 / 兜底 / 未配置不调用」的边界；`docs/README_EN.md` / `docs/README_CHT.md` 顶部导航与完整指南链接改为 `./` 相对路径，避免在文档子目录下解析错误；`LONGBRIDGE_PRINT_QUOTE_PACKAGES` 与代码及 `.env.example` 对齐为未设置时默认关闭。
+- [修复] SSE 任务流断开时 CancelledError 被静默吞掉问题 — 修复 SSE 流中断时异常未向上抛出导致故障无日志可查的问题，现在正确 re-raise CancelledError（fixes #967）
 - [修复] Agent SSE 流清理阶段静默吞掉后台执行器异常 — 流结束时后台任务异常现在正确记录并上报，避免错误无法感知（fixes #969）
 
 ## [3.11.0] - 2026-03-27

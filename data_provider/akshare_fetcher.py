@@ -279,7 +279,7 @@ class AkshareFetcher(BaseFetcher):
         self.sleep_max = sleep_max
         self._last_request_time: Optional[float] = None
         # 东财补丁开启才执行打补丁操作
-        if get_config().enable_eastmoney_patch:
+        if getattr(get_config(), "enable_eastmoney_patch", False):
             eastmoney_patch()
     
     def _set_random_user_agent(self) -> None:

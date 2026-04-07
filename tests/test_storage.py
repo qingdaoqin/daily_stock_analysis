@@ -2,9 +2,12 @@
 import unittest
 import sys
 import os
+from datetime import date
 
 # Ensure src module can be imported
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+import pandas as pd
 
 from src.storage import DatabaseManager
 
@@ -88,6 +91,50 @@ class TestStorage(unittest.TestCase):
         )
 
         self.assertEqual({item["session_id"] for item in sessions}, {"feishu_u1", "feishu_u1:ask_600519"})
+
+        DatabaseManager.reset_instance()
+
+    def test_save_daily_data_uses_upsert_semantics(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+
+        first = pd.DataFrame(
+            [
+                {
+                    "date": date(2026, 4, 7),
+                    "open": 10.0,
+                    "high": 11.0,
+                    "low": 9.5,
+                    "close": 10.5,
+                    "volume": 1000,
+                    "amount": 10500,
+                    "pct_chg": 1.0,
+                }
+            ]
+        )
+        second = pd.DataFrame(
+            [
+                {
+                    "date": date(2026, 4, 7),
+                    "open": 10.0,
+                    "high": 11.2,
+                    "low": 9.5,
+                    "close": 11.0,
+                    "volume": 2000,
+                    "amount": 22000,
+                    "pct_chg": 4.8,
+                }
+            ]
+        )
+
+        self.assertEqual(db.save_daily_data(first, "AAPL", "test"), 1)
+        self.assertEqual(db.save_daily_data(second, "AAPL", "test"), 1)
+
+        rows = db.get_latest_data("AAPL", 1)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].close, 11.0)
+        self.assertEqual(rows[0].volume, 2000)
 
         DatabaseManager.reset_instance()
 

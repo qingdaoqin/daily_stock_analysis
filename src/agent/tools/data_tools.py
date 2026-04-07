@@ -421,6 +421,35 @@ get_stock_info_tool = ToolDefinition(
 
 
 # ============================================================
+# get_capital_flow
+# ============================================================
+
+def _handle_get_capital_flow(stock_code: str) -> dict:
+    """Get compact capital-flow context for a stock."""
+    manager = _get_fetcher_manager()
+    context = manager.get_capital_flow_context(stock_code)
+    if context is None:
+        return {"error": f"No capital flow data available for {stock_code}"}
+    return context
+
+
+get_capital_flow_tool = ToolDefinition(
+    name="get_capital_flow",
+    description="Get capital-flow context for a stock, including major fund inflow/outflow "
+                "signals when available. Most useful for A-shares and HK names with fund-flow data.",
+    parameters=[
+        ToolParameter(
+            name="stock_code",
+            type="string",
+            description="Stock code, e.g., '600519' (A-share), 'hk00700' (HK), 'AAPL' (US)",
+        ),
+    ],
+    handler=_handle_get_capital_flow,
+    category="data",
+)
+
+
+# ============================================================
 # get_portfolio_snapshot
 # ============================================================
 
@@ -537,5 +566,6 @@ ALL_DATA_TOOLS = [
     get_chip_distribution_tool,
     get_analysis_context_tool,
     get_stock_info_tool,
+    get_capital_flow_tool,
     get_portfolio_snapshot_tool,
 ]

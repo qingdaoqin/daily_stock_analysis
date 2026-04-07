@@ -90,16 +90,21 @@ class StockAnalysisPipeline:
         self.notifier = NotificationService(source_message=source_message)
         self.calibration_service = AnalysisCalibrationService(db_manager=self.db, config=self.config)
         self._learning_refresh_lock = Lock()
+        self._single_stock_notify_lock = Lock()
         
         # 初始化搜索服务
-        self.search_service = SearchService(
-            bocha_keys=self.config.bocha_api_keys,
-            tavily_keys=self.config.tavily_api_keys,
-            brave_keys=self.config.brave_api_keys,
-            serpapi_keys=self.config.serpapi_keys,
-            minimax_keys=self.config.minimax_api_keys,
-            news_max_age_days=self.config.news_max_age_days,
-        )
+        self.search_service = None
+        try:
+            self.search_service = SearchService(
+                bocha_keys=self.config.bocha_api_keys,
+                tavily_keys=self.config.tavily_api_keys,
+                brave_keys=self.config.brave_api_keys,
+                serpapi_keys=self.config.serpapi_keys,
+                minimax_keys=self.config.minimax_api_keys,
+                news_max_age_days=self.config.news_max_age_days,
+            )
+        except Exception as e:
+            logger.warning("搜索服务初始化失败，后续将按 fail-open 跳过情报搜索: %s", e)
         
         logger.info(f"调度器初始化完成，最大并发数: {self.max_workers}")
         logger.info("已启用趋势分析器 (MA5>MA10>MA20 多头判断)")
@@ -112,7 +117,7 @@ class StockAnalysisPipeline:
             logger.info("筹码分布分析已启用")
         else:
             logger.info("筹码分布分析已禁用")
-        if self.search_service.is_available:
+        if self.search_service and self.search_service.is_available:
             logger.info("搜索服务已启用 (Tavily/SerpAPI)")
         else:
             logger.warning("搜索服务未启用（未配置 API Key）")
@@ -138,6 +143,31 @@ class StockAnalysisPipeline:
             self.calibration_service.maybe_refresh_backtests()
             if hasattr(self.calibration_service, "maybe_refresh_model"):
                 self.calibration_service.maybe_refresh_model()
+
+    def _send_single_stock_notification(
+        self,
+        result: AnalysisResult,
+        report_type: ReportType,
+    ) -> None:
+        """Send one stock notification in a serialized path to avoid shared-notifier races."""
+        if not result or not self.notifier.is_available():
+            return
+
+        with self._single_stock_notify_lock:
+            if report_type == ReportType.FULL:
+                report_content = self.notifier.generate_dashboard_report([result])
+                logger.info("[%s] 使用完整报告格式", result.code)
+            elif report_type == ReportType.BRIEF:
+                report_content = self.notifier.generate_brief_report([result])
+                logger.info("[%s] 使用简洁报告格式", result.code)
+            else:
+                report_content = self.notifier.generate_single_stock_report(result)
+                logger.info("[%s] 使用精简报告格式", result.code)
+
+            if self.notifier.send(report_content, email_stock_codes=[result.code]):
+                logger.info("[%s] 单股推送成功", result.code)
+            else:
+                logger.warning("[%s] 单股推送失败", result.code)
 
     def _apply_result_calibration(
         self,
@@ -189,9 +219,10 @@ class StockAnalysisPipeline:
         Returns:
             Tuple[是否成功, 错误信息]
         """
+        stock_name = code
         try:
             # 首先获取股票名称
-            stock_name = self.fetcher_manager.get_stock_name(code)
+            stock_name = self.fetcher_manager.get_stock_name(code, allow_realtime=False)
 
             today = date.today()
             # 注意：这里用自然日 date.today() 做“断点续传”判断。
@@ -243,11 +274,12 @@ class StockAnalysisPipeline:
         Returns:
             AnalysisResult 或 None（如果分析失败）
         """
+        stock_name = code
         try:
             self._maybe_refresh_learning_loop()
 
             # 获取股票名称（优先从实时行情获取真实名称）
-            stock_name = self.fetcher_manager.get_stock_name(code)
+            stock_name = self.fetcher_manager.get_stock_name(code, allow_realtime=False)
 
             # Step 1: 获取实时行情（量比、换手率等）- 使用统一入口，自动故障切换
             realtime_quote = None
@@ -341,11 +373,12 @@ class StockAnalysisPipeline:
 
             market_intel_summary: Dict[str, Any] = {}
             try:
-                market_intel_summary = self.search_service.build_market_intel_summary(
-                    code,
-                    stock_name,
-                    {},
-                )
+                if self.search_service:
+                    market_intel_summary = self.search_service.build_market_intel_summary(
+                        code,
+                        stock_name,
+                        {},
+                    )
             except Exception as e:
                 logger.debug(f"{stock_name}({code}) 构建市场摘要失败，使用兜底标签: {e}")
             if not isinstance(market_intel_summary, dict):
@@ -362,7 +395,7 @@ class StockAnalysisPipeline:
             # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
             news_context = None
             intel_results: Dict[str, Any] = {}
-            if self.search_service.can_run_comprehensive_intel(code):
+            if self.search_service and self.search_service.can_run_comprehensive_intel(code):
                 logger.info(f"{stock_name}({code}) 开始多维度情报搜索...")
                 try:
                     intel_results = self.search_service.search_comprehensive_intel(
@@ -784,7 +817,7 @@ class StockAnalysisPipeline:
             resolved_stock_name = result.name if result and result.name else resolved_stock_name
 
             # 兼容旧路径：若本轮未预取情报，则至少持久化一轮新闻搜索结果。
-            if not intel_results and self.search_service.is_available:
+            if not intel_results and self.search_service and self.search_service.is_available:
                 try:
                     news_response = self.search_service.search_stock_news(
                         stock_code=code,
@@ -1192,27 +1225,6 @@ class StockAnalysisPipeline:
                         f"评分 {result.sentiment_score}"
                     )
                 
-                # 单股推送模式（#55）：每分析完一只股票立即推送
-                if single_stock_notify and self.notifier.is_available():
-                    try:
-                        # 根据报告类型选择生成方法
-                        if report_type == ReportType.FULL:
-                            report_content = self.notifier.generate_dashboard_report([result])
-                            logger.info(f"[{code}] 使用完整报告格式")
-                        elif report_type == ReportType.BRIEF:
-                            report_content = self.notifier.generate_brief_report([result])
-                            logger.info(f"[{code}] 使用简洁报告格式")
-                        else:
-                            report_content = self.notifier.generate_single_stock_report(result)
-                            logger.info(f"[{code}] 使用精简报告格式")
-                        
-                        if self.notifier.send(report_content, email_stock_codes=[code]):
-                            logger.info(f"[{code}] 单股推送成功")
-                        else:
-                            logger.warning(f"[{code}] 单股推送失败")
-                    except Exception as e:
-                        logger.error(f"[{code}] 单股推送异常: {e}")
-            
             return result
             
         except Exception as e:
@@ -1299,7 +1311,7 @@ class StockAnalysisPipeline:
                     self.process_single_stock,
                     code,
                     skip_analysis=dry_run,
-                    single_stock_notify=single_stock_notify and send_notification,
+                    single_stock_notify=False,
                     report_type=report_type,  # Issue #119: 传递报告类型
                     analysis_query_id=uuid.uuid4().hex,
                 ): code
@@ -1313,6 +1325,11 @@ class StockAnalysisPipeline:
                     result = future.result()
                     if result:
                         results.append(result)
+                        if single_stock_notify and send_notification and not dry_run:
+                            try:
+                                self._send_single_stock_notification(result, report_type)
+                            except Exception as e:
+                                logger.error("[%s] 单股推送异常: %s", code, e)
 
                     # Issue #128: 分析间隔 - 在个股分析和大盘分析之间添加延迟
                     if idx < len(stock_codes) - 1 and analysis_delay > 0:

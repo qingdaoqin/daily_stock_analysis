@@ -23,6 +23,7 @@ _EXPORTS: Dict[str, Tuple[str, str]] = {
     "PytdxFetcher": ("data_provider.pytdx_fetcher", "PytdxFetcher"),
     "BaostockFetcher": ("data_provider.baostock_fetcher", "BaostockFetcher"),
     "YfinanceFetcher": ("data_provider.yfinance_fetcher", "YfinanceFetcher"),
+    "LongbridgeFetcher": ("data_provider.longbridge_fetcher", "LongbridgeFetcher"),
     "is_us_index_code": ("data_provider.us_index_mapping", "is_us_index_code"),
     "is_us_stock_code": ("data_provider.us_index_mapping", "is_us_stock_code"),
     "get_us_index_yf_symbol": ("data_provider.us_index_mapping", "get_us_index_yf_symbol"),

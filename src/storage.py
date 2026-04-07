@@ -17,8 +17,9 @@ import hashlib
 import json
 import logging
 import re
+import time
 from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar
 
 import pandas as pd
 from sqlalchemy import (
@@ -39,18 +40,21 @@ from sqlalchemy import (
     or_,
     delete,
     desc,
+    event,
     func,
 )
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import (
     declarative_base,
     sessionmaker,
     Session,
 )
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from src.config import get_config
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 # SQLAlchemy ORM 基类
 Base = declarative_base()
@@ -653,13 +657,29 @@ class DatabaseManager:
         if db_url is None:
             config = get_config()
             db_url = config.get_db_url()
+        else:
+            config = get_config()
+
+        self._sqlite_wal_enabled = bool(getattr(config, "sqlite_wal_enabled", True))
+        self._sqlite_busy_timeout_ms = int(getattr(config, "sqlite_busy_timeout_ms", 5000) or 5000)
+        self._sqlite_write_retry_max = max(1, int(getattr(config, "sqlite_write_retry_max", 3) or 3))
+        self._sqlite_write_retry_base_delay = float(
+            getattr(config, "sqlite_write_retry_base_delay", 0.2) or 0.2
+        )
+
+        engine_kwargs = {
+            "echo": False,
+            "pool_pre_ping": True,
+        }
+        if str(db_url).startswith("sqlite"):
+            engine_kwargs["connect_args"] = {
+                "timeout": max(self._sqlite_busy_timeout_ms / 1000.0, 1.0),
+            }
         
         # 创建数据库引擎
-        self._engine = create_engine(
-            db_url,
-            echo=False,  # 设为 True 可查看 SQL 语句
-            pool_pre_ping=True,  # 连接健康检查
-        )
+        self._engine = create_engine(db_url, **engine_kwargs)
+        if str(db_url).startswith("sqlite"):
+            self._install_sqlite_pragma_handler(self._engine)
         
         # 创建 Session 工厂
         self._SessionLocal = sessionmaker(
@@ -709,6 +729,86 @@ class DatabaseManager:
                 logger.debug("数据库引擎已清理")
         except Exception as e:
             logger.warning(f"清理数据库引擎时出错: {e}")
+
+    def _install_sqlite_pragma_handler(self, engine) -> None:
+        """Install SQLite pragmas for better concurrency on every new connection."""
+        if getattr(engine.dialect, "name", "") != "sqlite":
+            return
+
+        @event.listens_for(engine, "connect")
+        def _set_sqlite_pragmas(dbapi_connection, _connection_record):
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute(f"PRAGMA busy_timeout={int(self._sqlite_busy_timeout_ms)}")
+                cursor.execute("PRAGMA foreign_keys=ON")
+                if self._sqlite_wal_enabled:
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                    cursor.execute("PRAGMA synchronous=NORMAL")
+            finally:
+                cursor.close()
+
+    def _is_retryable_sqlite_error(self, exc: Exception) -> bool:
+        """Return True when the exception looks like a transient SQLite lock issue."""
+        if getattr(self._engine.dialect, "name", "") != "sqlite":
+            return False
+        message = str(exc).lower()
+        retry_markers = (
+            "database is locked",
+            "database table is locked",
+            "database schema is locked",
+            "database is busy",
+        )
+        return any(marker in message for marker in retry_markers)
+
+    def _run_write_transaction(
+        self,
+        worker: Callable[[Session], T],
+        *,
+        operation_name: str,
+        default: T,
+        fail_open: bool = False,
+    ) -> T:
+        """Run a write transaction with bounded retry for transient SQLite lock errors."""
+        attempts = self._sqlite_write_retry_max if getattr(self._engine.dialect, "name", "") == "sqlite" else 1
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, attempts + 1):
+            with self.get_session() as session:
+                try:
+                    result = worker(session)
+                    session.commit()
+                    return result
+                except OperationalError as exc:
+                    session.rollback()
+                    last_error = exc
+                    if attempt < attempts and self._is_retryable_sqlite_error(exc):
+                        delay = self._sqlite_write_retry_base_delay * (2 ** (attempt - 1))
+                        logger.warning(
+                            "%s 遇到 SQLite 锁竞争，第 %s/%s 次重试，等待 %.2fs: %s",
+                            operation_name,
+                            attempt,
+                            attempts,
+                            delay,
+                            exc,
+                        )
+                        time.sleep(delay)
+                        continue
+                    if fail_open:
+                        logger.debug("%s 失败（fail-open）: %s", operation_name, exc)
+                        return default
+                    raise
+                except Exception as exc:
+                    session.rollback()
+                    last_error = exc
+                    if fail_open:
+                        logger.debug("%s 失败（fail-open）: %s", operation_name, exc)
+                        return default
+                    raise
+
+        if fail_open:
+            logger.debug("%s 最终失败（fail-open）: %s", operation_name, last_error)
+            return default
+        raise last_error or RuntimeError(f"{operation_name} failed without a captured exception")
     
     def get_session(self) -> Session:
         """
@@ -824,108 +924,104 @@ class DatabaseManager:
         if not response or not response.results:
             return 0
 
-        saved_count = 0
         query_ctx = query_context or {}
         current_query_id = (query_ctx.get("query_id") or "").strip()
+        def _worker(session: Session) -> int:
+            saved_count = 0
+            for item in response.results:
+                title = (item.title or "").strip()
+                url = (item.url or "").strip()
+                source = (item.source or "").strip()
+                snippet = (item.snippet or "").strip()
+                published_date = self._parse_published_date(item.published_date)
 
-        with self.get_session() as session:
-            try:
-                for item in response.results:
-                    title = (item.title or '').strip()
-                    url = (item.url or '').strip()
-                    source = (item.source or '').strip()
-                    snippet = (item.snippet or '').strip()
-                    published_date = self._parse_published_date(item.published_date)
+                if not title and not url:
+                    continue
 
-                    if not title and not url:
-                        continue
+                url_key = url or self._build_fallback_url_key(
+                    code=code,
+                    title=title,
+                    source=source,
+                    published_date=published_date,
+                )
 
-                    url_key = url or self._build_fallback_url_key(
-                        code=code,
-                        title=title,
-                        source=source,
-                        published_date=published_date
-                    )
+                existing = session.execute(
+                    select(NewsIntel).where(NewsIntel.url == url_key)
+                ).scalar_one_or_none()
 
-                    # 优先按 URL 或兜底键去重
-                    existing = session.execute(
-                        select(NewsIntel).where(NewsIntel.url == url_key)
-                    ).scalar_one_or_none()
+                if existing:
+                    existing.name = name or existing.name
+                    existing.dimension = dimension or existing.dimension
+                    existing.query = query or existing.query
+                    existing.provider = response.provider or existing.provider
+                    existing.snippet = snippet or existing.snippet
+                    existing.source = source or existing.source
+                    existing.published_date = published_date or existing.published_date
+                    existing.fetched_at = datetime.now()
 
-                    if existing:
-                        existing.name = name or existing.name
-                        existing.dimension = dimension or existing.dimension
-                        existing.query = query or existing.query
-                        existing.provider = response.provider or existing.provider
-                        existing.snippet = snippet or existing.snippet
-                        existing.source = source or existing.source
-                        existing.published_date = published_date or existing.published_date
-                        existing.fetched_at = datetime.now()
+                    if query_context:
+                        if not existing.query_id and current_query_id:
+                            existing.query_id = current_query_id
+                        existing.query_source = (
+                            query_context.get("query_source") or existing.query_source
+                        )
+                        existing.requester_platform = (
+                            query_context.get("requester_platform") or existing.requester_platform
+                        )
+                        existing.requester_user_id = (
+                            query_context.get("requester_user_id") or existing.requester_user_id
+                        )
+                        existing.requester_user_name = (
+                            query_context.get("requester_user_name") or existing.requester_user_name
+                        )
+                        existing.requester_chat_id = (
+                            query_context.get("requester_chat_id") or existing.requester_chat_id
+                        )
+                        existing.requester_message_id = (
+                            query_context.get("requester_message_id") or existing.requester_message_id
+                        )
+                        existing.requester_query = (
+                            query_context.get("requester_query") or existing.requester_query
+                        )
+                    continue
 
-                        if query_context:
-                            # Keep the first query_id to avoid overwriting historical links.
-                            if not existing.query_id and current_query_id:
-                                existing.query_id = current_query_id
-                            existing.query_source = (
-                                query_context.get("query_source") or existing.query_source
-                            )
-                            existing.requester_platform = (
-                                query_context.get("requester_platform") or existing.requester_platform
-                            )
-                            existing.requester_user_id = (
-                                query_context.get("requester_user_id") or existing.requester_user_id
-                            )
-                            existing.requester_user_name = (
-                                query_context.get("requester_user_name") or existing.requester_user_name
-                            )
-                            existing.requester_chat_id = (
-                                query_context.get("requester_chat_id") or existing.requester_chat_id
-                            )
-                            existing.requester_message_id = (
-                                query_context.get("requester_message_id") or existing.requester_message_id
-                            )
-                            existing.requester_query = (
-                                query_context.get("requester_query") or existing.requester_query
-                            )
-                    else:
-                        try:
-                            with session.begin_nested():
-                                record = NewsIntel(
-                                    code=code,
-                                    name=name,
-                                    dimension=dimension,
-                                    query=query,
-                                    provider=response.provider,
-                                    title=title,
-                                    snippet=snippet,
-                                    url=url_key,
-                                    source=source,
-                                    published_date=published_date,
-                                    fetched_at=datetime.now(),
-                                    query_id=current_query_id or None,
-                                    query_source=query_ctx.get("query_source"),
-                                    requester_platform=query_ctx.get("requester_platform"),
-                                    requester_user_id=query_ctx.get("requester_user_id"),
-                                    requester_user_name=query_ctx.get("requester_user_name"),
-                                    requester_chat_id=query_ctx.get("requester_chat_id"),
-                                    requester_message_id=query_ctx.get("requester_message_id"),
-                                    requester_query=query_ctx.get("requester_query"),
-                                )
-                                session.add(record)
-                                session.flush()
-                            saved_count += 1
-                        except IntegrityError:
-                            # 单条 URL 唯一约束冲突（如并发插入），仅跳过本条，保留本批其余成功项
-                            logger.debug("新闻情报重复（已跳过）: %s %s", code, url_key)
+                try:
+                    with session.begin_nested():
+                        record = NewsIntel(
+                            code=code,
+                            name=name,
+                            dimension=dimension,
+                            query=query,
+                            provider=response.provider,
+                            title=title,
+                            snippet=snippet,
+                            url=url_key,
+                            source=source,
+                            published_date=published_date,
+                            fetched_at=datetime.now(),
+                            query_id=current_query_id or None,
+                            query_source=query_ctx.get("query_source"),
+                            requester_platform=query_ctx.get("requester_platform"),
+                            requester_user_id=query_ctx.get("requester_user_id"),
+                            requester_user_name=query_ctx.get("requester_user_name"),
+                            requester_chat_id=query_ctx.get("requester_chat_id"),
+                            requester_message_id=query_ctx.get("requester_message_id"),
+                            requester_query=query_ctx.get("requester_query"),
+                        )
+                        session.add(record)
+                        session.flush()
+                    saved_count += 1
+                except IntegrityError:
+                    logger.debug("新闻情报重复（已跳过）: %s %s", code, url_key)
 
-                session.commit()
-                logger.info(f"保存新闻情报成功: {code}, 新增 {saved_count} 条")
+            return saved_count
 
-            except Exception as e:
-                session.rollback()
-                logger.error(f"保存新闻情报失败: {e}")
-                raise
-
+        saved_count = self._run_write_transaction(
+            _worker,
+            operation_name=f"保存新闻情报 {code}",
+            default=0,
+        )
+        logger.info("保存新闻情报成功: %s, 新增 %s 条", code, saved_count)
         return saved_count
 
     def save_fundamental_snapshot(
@@ -942,28 +1038,24 @@ class DatabaseManager:
         if not query_id or not code or payload is None:
             return 0
 
-        with self.get_session() as session:
-            try:
-                session.add(
-                    FundamentalSnapshot(
-                        query_id=query_id,
-                        code=code,
-                        payload=self._safe_json_dumps(payload),
-                        source_chain=self._safe_json_dumps(source_chain or []),
-                        coverage=self._safe_json_dumps(coverage or {}),
-                    )
+        def _worker(session: Session) -> int:
+            session.add(
+                FundamentalSnapshot(
+                    query_id=query_id,
+                    code=code,
+                    payload=self._safe_json_dumps(payload),
+                    source_chain=self._safe_json_dumps(source_chain or []),
+                    coverage=self._safe_json_dumps(coverage or {}),
                 )
-                session.commit()
-                return 1
-            except Exception as e:
-                session.rollback()
-                logger.debug(
-                    "基本面快照写入失败（fail-open）: query_id=%s code=%s err=%s",
-                    query_id,
-                    code,
-                    e,
-                )
-                return 0
+            )
+            return 1
+
+        return self._run_write_transaction(
+            _worker,
+            operation_name=f"写入基本面快照 {code}",
+            default=0,
+            fail_open=True,
+        )
 
     def get_recent_news(self, code: str, days: int = 7, limit: int = 20) -> List[NewsIntel]:
         """
@@ -1052,15 +1144,19 @@ class DatabaseManager:
             created_at=datetime.now(),
         )
 
-        with self.get_session() as session:
-            try:
-                session.add(record)
-                session.commit()
-                return 1
-            except Exception as e:
-                session.rollback()
-                logger.error(f"保存分析历史失败: {e}")
-                return 0
+        def _worker(session: Session) -> int:
+            session.add(record)
+            return 1
+
+        try:
+            return self._run_write_transaction(
+                _worker,
+                operation_name=f"保存分析历史 {result.code}",
+                default=0,
+            )
+        except Exception as e:
+            logger.error(f"保存分析历史失败: {e}")
+            return 0
 
     def get_analysis_history(
         self,
@@ -1279,76 +1375,108 @@ class DatabaseManager:
         if df is None or df.empty:
             logger.warning(f"保存数据为空，跳过 {code}")
             return 0
-        
-        saved_count = 0
-        
-        with self.get_session() as session:
-            try:
-                for _, row in df.iterrows():
-                    # 解析日期
-                    row_date = row.get('date')
-                    if isinstance(row_date, str):
-                        row_date = datetime.strptime(row_date, '%Y-%m-%d').date()
-                    elif isinstance(row_date, datetime):
-                        row_date = row_date.date()
-                    elif isinstance(row_date, pd.Timestamp):
-                        row_date = row_date.date()
-                    
-                    # 检查是否已存在
-                    existing = session.execute(
-                        select(StockDaily).where(
-                            and_(
-                                StockDaily.code == code,
-                                StockDaily.date == row_date
-                            )
+
+        payloads: List[Dict[str, Any]] = []
+        now = datetime.now()
+        for _, row in df.iterrows():
+            row_date = row.get("date")
+            if isinstance(row_date, str):
+                row_date = datetime.strptime(row_date, "%Y-%m-%d").date()
+            elif isinstance(row_date, datetime):
+                row_date = row_date.date()
+            elif isinstance(row_date, pd.Timestamp):
+                row_date = row_date.date()
+
+            payloads.append(
+                {
+                    "code": code,
+                    "date": row_date,
+                    "open": row.get("open"),
+                    "high": row.get("high"),
+                    "low": row.get("low"),
+                    "close": row.get("close"),
+                    "volume": row.get("volume"),
+                    "amount": row.get("amount"),
+                    "pct_chg": row.get("pct_chg"),
+                    "ma5": row.get("ma5"),
+                    "ma10": row.get("ma10"),
+                    "ma20": row.get("ma20"),
+                    "volume_ratio": row.get("volume_ratio"),
+                    "data_source": data_source,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+
+        def _worker(session: Session) -> int:
+            if getattr(self._engine.dialect, "name", "") == "sqlite":
+                stmt = sqlite_insert(StockDaily).values(payloads)
+                update_fields = {
+                    "open": stmt.excluded.open,
+                    "high": stmt.excluded.high,
+                    "low": stmt.excluded.low,
+                    "close": stmt.excluded.close,
+                    "volume": stmt.excluded.volume,
+                    "amount": stmt.excluded.amount,
+                    "pct_chg": stmt.excluded.pct_chg,
+                    "ma5": stmt.excluded.ma5,
+                    "ma10": stmt.excluded.ma10,
+                    "ma20": stmt.excluded.ma20,
+                    "volume_ratio": stmt.excluded.volume_ratio,
+                    "data_source": stmt.excluded.data_source,
+                    "updated_at": stmt.excluded.updated_at,
+                }
+                session.execute(
+                    stmt.on_conflict_do_update(
+                        index_elements=["code", "date"],
+                        set_=update_fields,
+                    )
+                )
+                return len(payloads)
+
+            saved_count = 0
+            for payload in payloads:
+                existing = session.execute(
+                    select(StockDaily).where(
+                        and_(
+                            StockDaily.code == payload["code"],
+                            StockDaily.date == payload["date"],
                         )
-                    ).scalar_one_or_none()
-                    
-                    if existing:
-                        # 更新现有记录
-                        existing.open = row.get('open')
-                        existing.high = row.get('high')
-                        existing.low = row.get('low')
-                        existing.close = row.get('close')
-                        existing.volume = row.get('volume')
-                        existing.amount = row.get('amount')
-                        existing.pct_chg = row.get('pct_chg')
-                        existing.ma5 = row.get('ma5')
-                        existing.ma10 = row.get('ma10')
-                        existing.ma20 = row.get('ma20')
-                        existing.volume_ratio = row.get('volume_ratio')
-                        existing.data_source = data_source
-                        existing.updated_at = datetime.now()
-                    else:
-                        # 创建新记录
-                        record = StockDaily(
-                            code=code,
-                            date=row_date,
-                            open=row.get('open'),
-                            high=row.get('high'),
-                            low=row.get('low'),
-                            close=row.get('close'),
-                            volume=row.get('volume'),
-                            amount=row.get('amount'),
-                            pct_chg=row.get('pct_chg'),
-                            ma5=row.get('ma5'),
-                            ma10=row.get('ma10'),
-                            ma20=row.get('ma20'),
-                            volume_ratio=row.get('volume_ratio'),
-                            data_source=data_source,
-                        )
-                        session.add(record)
-                        saved_count += 1
-                
-                session.commit()
-                logger.info(f"保存 {code} 数据成功，新增 {saved_count} 条")
-                
-            except Exception as e:
-                session.rollback()
-                logger.error(f"保存 {code} 数据失败: {e}")
-                raise
-        
-        return saved_count
+                    )
+                ).scalar_one_or_none()
+                if existing:
+                    for key in (
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                        "amount",
+                        "pct_chg",
+                        "ma5",
+                        "ma10",
+                        "ma20",
+                        "volume_ratio",
+                        "data_source",
+                        "updated_at",
+                    ):
+                        setattr(existing, key, payload[key])
+                else:
+                    session.add(StockDaily(**payload))
+                saved_count += 1
+            return saved_count
+
+        try:
+            saved_count = self._run_write_transaction(
+                _worker,
+                operation_name=f"保存日线数据 {code}",
+                default=0,
+            )
+            logger.info("保存 %s 数据成功，新增/更新 %s 条", code, saved_count)
+            return saved_count
+        except Exception as e:
+            logger.error(f"保存 {code} 数据失败: {e}")
+            raise
     
     def get_analysis_context(
         self, 

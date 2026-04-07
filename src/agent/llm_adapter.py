@@ -8,6 +8,7 @@ interface consumed by the AgentExecutor, via LiteLLM.
 
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -56,6 +57,13 @@ _AUTO_THINKING_MODELS: List[str] = ["deepseek-reasoner", "deepseek-r1", "qwq"]
 _OPT_IN_THINKING_MODELS: Dict[str, dict] = {
     "deepseek-chat": {"thinking": {"type": "enabled"}},
 }
+
+
+def _safe_litellm_exc_type(name: str):
+    """Return a litellm exception type when available; otherwise None."""
+    if litellm is None:
+        return None
+    return getattr(litellm, name, None)
 
 
 def _model_matches(model: str, entries: List[str]) -> bool:
@@ -198,6 +206,34 @@ class LLMToolAdapter:
             return model.split("/")[0]
         return model or "none"
 
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        """Return True when the exception looks like a transient rate-limit error."""
+        rate_limit_type = _safe_litellm_exc_type("RateLimitError")
+        if rate_limit_type and isinstance(exc, rate_limit_type):
+            return True
+        message = str(exc).lower()
+        markers = (
+            "rate limit",
+            "resource_exhausted",
+            "429",
+            "too many requests",
+        )
+        return any(marker in message for marker in markers)
+
+    def _is_context_window_error(self, exc: Exception) -> bool:
+        """Return True when the exception is caused by prompt/context length overflow."""
+        context_type = _safe_litellm_exc_type("ContextWindowExceededError")
+        if context_type and isinstance(exc, context_type):
+            return True
+        message = str(exc).lower()
+        markers = (
+            "context window",
+            "maximum context length",
+            "prompt is too long",
+            "context length exceeded",
+        )
+        return any(marker in message for marker in markers)
+
     # ============================================================
     # Unified call
     # ============================================================
@@ -267,7 +303,13 @@ class LLMToolAdapter:
                     timeout=timeout,
                 )
             except Exception as e:
-                logger.warning(f"Agent LLM call failed with {model}: {e}")
+                if self._is_context_window_error(e):
+                    logger.warning("Agent LLM call skipped for %s due to context window overflow: %s", model, e)
+                elif self._is_rate_limit_error(e):
+                    logger.warning("Agent LLM call hit rate limit on %s, backing off before fallback: %s", model, e)
+                    time.sleep(1.5)
+                else:
+                    logger.warning(f"Agent LLM call failed with {model}: {e}")
                 last_error = e
                 continue
 

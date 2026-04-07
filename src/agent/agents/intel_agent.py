@@ -29,6 +29,7 @@ class IntelAgent(BaseAgent):
         "search_stock_news",
         "search_comprehensive_intel",
         "get_stock_info",
+        "get_capital_flow",
     ]
 
     def system_prompt(self, ctx: AgentContext) -> str:
@@ -43,11 +44,12 @@ the given stock, then produce a structured JSON opinion.
 1. Read pre-fetched `market_context`, `intel_report`, and direct official intel first.
 2. Run `search_comprehensive_intel` when you need deeper or fresher context.
 3. Use `search_stock_news` only as a supplement, not as the primary source.
-4. Classify positive catalysts and risk alerts using the correct market logic.
-4. Assess overall sentiment
+4. Use `get_capital_flow` when A-share / HK capital-flow context may change the interpretation.
+5. Classify positive catalysts and risk alerts using the correct market logic.
+6. Assess overall sentiment
 
 ## Risk Detection Priorities
-- A-shares: 减持、解禁、业绩预亏、监管处罚、政策利空
+- A-shares: 减持、解禁、业绩预亏、监管处罚、政策利空、主力资金异动
 - HK equities: HKEX results / profit warning / placement / buyback / dividend
 - US equities: SEC filings, guidance, litigation, Form 4 / 13D / 13G, analyst and earnings reset
 - For US names, Chinese policy should only be highlighted when `market_context.china_exposure`

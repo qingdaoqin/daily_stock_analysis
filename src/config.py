@@ -449,9 +449,18 @@ class Config:
 
     # === 数据库配置 ===
     database_path: str = "./data/stock_analysis.db"
+    sqlite_wal_enabled: bool = True
+    sqlite_busy_timeout_ms: int = 5000
+    sqlite_write_retry_max: int = 3
+    sqlite_write_retry_base_delay: float = 0.2
 
     # 是否保存分析上下文快照（用于历史回溯）
     save_context_snapshot: bool = True
+
+    # === Longbridge 数据源配置 ===
+    longbridge_app_key: Optional[str] = None
+    longbridge_app_secret: Optional[str] = None
+    longbridge_access_token: Optional[str] = None
 
     # === 回测配置 ===
     backtest_enabled: bool = True
@@ -985,7 +994,14 @@ class Config:
             md2img_engine=cls._parse_md2img_engine(os.getenv('MD2IMG_ENGINE', 'wkhtmltoimage')),
             prefetch_realtime_quotes=os.getenv('PREFETCH_REALTIME_QUOTES', 'true').lower() == 'true',
             database_path=os.getenv('DATABASE_PATH', './data/stock_analysis.db'),
+            sqlite_wal_enabled=parse_env_bool(os.getenv('SQLITE_WAL_ENABLED'), True),
+            sqlite_busy_timeout_ms=max(0, int(os.getenv('SQLITE_BUSY_TIMEOUT_MS', '5000'))),
+            sqlite_write_retry_max=max(0, int(os.getenv('SQLITE_WRITE_RETRY_MAX', '3'))),
+            sqlite_write_retry_base_delay=max(0.0, float(os.getenv('SQLITE_WRITE_RETRY_BASE_DELAY', '0.2'))),
             save_context_snapshot=os.getenv('SAVE_CONTEXT_SNAPSHOT', 'true').lower() == 'true',
+            longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,
+            longbridge_app_secret=os.getenv('LONGBRIDGE_APP_SECRET') or None,
+            longbridge_access_token=os.getenv('LONGBRIDGE_ACCESS_TOKEN') or None,
             backtest_enabled=os.getenv('BACKTEST_ENABLED', 'true').lower() == 'true',
             backtest_eval_window_days=int(os.getenv('BACKTEST_EVAL_WINDOW_DAYS', '10')),
             backtest_min_age_days=int(os.getenv('BACKTEST_MIN_AGE_DAYS', '14')),

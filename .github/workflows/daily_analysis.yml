@@ -3,8 +3,10 @@ name: 每日股票分析
 on:
   # 定时触发 - 对齐美股开盘前半小时
   # GitHub Actions cron 使用 UTC，无法直接按美东时区处理夏令时。
-  # 这里在工作日 13:00 / 14:00 UTC 各触发一次，再由后续步骤按纽约时间做 09:00 门控，
-  # 因此实际分析只会在美股开盘前半小时执行一次。
+  # 这里在工作日 13:00 / 14:00 UTC 各触发一次：
+  # - EDT(夏令时, UTC-4) 以 13:00 UTC 为主
+  # - EST(冬令时, UTC-5) 以 14:00 UTC 为主
+  # 后续步骤会按纽约时区和当前夏/冬令时只放行唯一有效槽位，并容忍 GitHub 调度延迟。
   schedule:
     - cron: '0 13 * * 1-5'
     - cron: '0 14 * * 1-5'
@@ -49,19 +51,43 @@ jobs:
           NY_DOW="$(TZ='America/New_York' date '+%u')"
           NY_HOUR="$(TZ='America/New_York' date '+%H')"
           NY_MINUTE="$(TZ='America/New_York' date '+%M')"
+          NY_OFFSET="$(TZ='America/New_York' date '+%z')"
           NY_TIME="${NY_HOUR}:${NY_MINUTE}"
+          SCHEDULE_EXPR="${{ github.event.schedule }}"
           echo "ny_dow=$NY_DOW" >> "$GITHUB_OUTPUT"
           echo "ny_hour=$NY_HOUR" >> "$GITHUB_OUTPUT"
           echo "ny_minute=$NY_MINUTE" >> "$GITHUB_OUTPUT"
+          echo "ny_offset=$NY_OFFSET" >> "$GITHUB_OUTPUT"
           echo "ny_time=$NY_TIME" >> "$GITHUB_OUTPUT"
-          echo "🕘 当前纽约时间: $NY_TIME (weekday=$NY_DOW)"
+          echo "🕘 当前纽约时间: $NY_TIME (offset=$NY_OFFSET, weekday=$NY_DOW)"
+          echo "🗓️ 当前触发 cron: $SCHEDULE_EXPR"
 
-          if [ "$NY_DOW" -ge 1 ] && [ "$NY_DOW" -le 5 ] && [ "$NY_HOUR" = "09" ] && [ "$NY_MINUTE" -lt 30 ]; then
+          SHOULD_RUN=false
+          REASON="不在有效执行窗口"
+
+          if [ "$NY_DOW" -ge 1 ] && [ "$NY_DOW" -le 5 ]; then
+            # EDT: 13:00 UTC 是主槽位；EST: 14:00 UTC 是主槽位。
+            # GitHub schedule 可能延迟几十分钟，放宽到纽约时间 09:00-10:59，
+            # 但只允许当前夏/冬令时对应的那个主槽位继续执行，避免双跑。
+            if [ "$NY_OFFSET" = "-0400" ] && [ "$SCHEDULE_EXPR" = "0 13 * * 1-5" ] && [ "$NY_HOUR" -ge 9 ] && [ "$NY_HOUR" -le 10 ]; then
+              SHOULD_RUN=true
+              REASON="EDT 主槽位命中（13:00 UTC），且在延迟容忍窗口 09:00-10:59 ET 内"
+            elif [ "$NY_OFFSET" = "-0500" ] && [ "$SCHEDULE_EXPR" = "0 14 * * 1-5" ] && [ "$NY_HOUR" -ge 9 ] && [ "$NY_HOUR" -le 10 ]; then
+              SHOULD_RUN=true
+              REASON="EST 主槽位命中（14:00 UTC），且在延迟容忍窗口 09:00-10:59 ET 内"
+            else
+              REASON="当前触发槽位与纽约夏/冬令时不匹配，或已超出延迟容忍窗口"
+            fi
+          else
+            REASON="当前不是纽约工作日"
+          fi
+
+          if [ "$SHOULD_RUN" = "true" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
-            echo "✅ 命中美股开盘前半小时窗口（09:00-09:29 ET），继续执行"
+            echo "✅ $REASON，继续执行"
           else
             echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "⏭️ 当前不在美股开盘前半小时窗口，后续步骤跳过"
+            echo "⏭️ $REASON，后续步骤跳过"
           fi
 
       - name: 随机延迟（避免固定时间访问）

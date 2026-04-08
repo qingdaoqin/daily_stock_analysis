@@ -255,6 +255,14 @@ def _compute_trading_day_filter(
     return (filtered_codes, effective_region, should_skip_all)
 
 
+def _iter_effective_config_warnings(config: Config, stock_codes: Optional[List[str]]) -> List[str]:
+    """Filter config warnings that are superseded by explicit CLI inputs."""
+    warnings = list(config.validate())
+    if stock_codes:
+        warnings = [warning for warning in warnings if warning != "未配置自选股列表 (STOCK_LIST)"]
+    return warnings
+
+
 def run_full_analysis(
     config: Config,
     args: argparse.Namespace,
@@ -272,6 +280,9 @@ def run_full_analysis(
 
         # Issue #373: Trading day filter (per-stock, per-market)
         effective_codes = stock_codes if stock_codes is not None else config.stock_list
+        if not effective_codes:
+            logger.error("未配置自选股列表，请在 .env 文件中设置 STOCK_LIST")
+            return
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
             config, args, effective_codes
         )
@@ -543,16 +554,16 @@ def main() -> int:
     logger.info(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
 
-    # 验证配置
-    warnings = config.validate()
-    for warning in warnings:
-        logger.warning(warning)
-
     # 解析股票列表（统一为大写 Issue #355）
     stock_codes = None
     if args.stocks:
         stock_codes = [canonical_stock_code(c) for c in args.stocks.split(',') if (c or "").strip()]
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
+
+    # 验证配置
+    warnings = _iter_effective_config_warnings(config, stock_codes)
+    for warning in warnings:
+        logger.warning(warning)
 
     # === 处理 --webui / --webui-only 参数，映射到 --serve / --serve-only ===
     if args.webui:

@@ -1480,7 +1480,14 @@ class Config:
 
         # 如果 .env 文件不存在或未配置，才尝试从系统环境变量读取
         if stock_list_raw is None:
-            stock_list_raw = os.getenv('STOCK_LIST')
+            env_stock_list = os.getenv('STOCK_LIST')
+            if env_stock_list is None:
+                return
+            # GitHub Actions / shell 占位空值不应覆盖已有配置；只有 .env
+            # 中显式声明 STOCK_LIST= 才视为“清空列表”。
+            if str(env_stock_list).strip() == '':
+                return
+            stock_list_raw = env_stock_list
 
         if stock_list_raw is None:
             return

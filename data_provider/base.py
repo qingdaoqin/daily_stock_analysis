@@ -805,9 +805,17 @@ class DataFetcherManager:
             logger.error(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
             raise DataFetchError(error_summary)
 
-        for attempt, fetcher in enumerate(self._fetchers, start=1):
+        general_fetchers = list(self._fetchers)
+        if _market_tag(stock_code) == "cn":
+            general_fetchers = [
+                fetcher for fetcher in general_fetchers
+                if fetcher.name != "LongbridgeFetcher"
+            ]
+        general_total_fetchers = len(general_fetchers)
+
+        for attempt, fetcher in enumerate(general_fetchers, start=1):
             try:
-                logger.info(f"[数据源尝试 {attempt}/{total_fetchers}] [{fetcher.name}] 获取 {stock_code}...")
+                logger.info(f"[数据源尝试 {attempt}/{general_total_fetchers}] [{fetcher.name}] 获取 {stock_code}...")
                 df = fetcher.get_daily_data(
                     stock_code=stock_code,
                     start_date=start_date,
@@ -827,12 +835,12 @@ class DataFetcherManager:
                 error_type, error_reason = summarize_exception(e)
                 error_msg = f"[{fetcher.name}] ({error_type}) {error_reason}"
                 logger.warning(
-                    f"[数据源失败 {attempt}/{total_fetchers}] [{fetcher.name}] {stock_code}: "
+                    f"[数据源失败 {attempt}/{general_total_fetchers}] [{fetcher.name}] {stock_code}: "
                     f"error_type={error_type}, reason={error_reason}"
                 )
                 errors.append(error_msg)
-                if attempt < total_fetchers:
-                    next_fetcher = self._fetchers[attempt]
+                if attempt < general_total_fetchers:
+                    next_fetcher = general_fetchers[attempt]
                     logger.info(f"[数据源切换] {stock_code}: [{fetcher.name}] -> [{next_fetcher.name}]")
                 # 继续尝试下一个数据源
                 continue

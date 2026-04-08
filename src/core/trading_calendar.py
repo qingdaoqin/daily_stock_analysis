@@ -40,6 +40,27 @@ MARKET_TIMEZONE = {
 }
 
 
+def _normalize_market_code(code: str) -> str:
+    """Normalize exchange-prefixed/suffixed stock codes for market detection."""
+    normalized = (code or "").strip().upper()
+    if not normalized:
+        return ""
+
+    for suffix in (".SH", ".SZ", ".SS", ".BJ"):
+        if normalized.endswith(suffix):
+            digits = normalized[: -len(suffix)]
+            if digits.isdigit() and len(digits) in (5, 6):
+                return digits
+
+    for prefix in ("SH", "SZ", "SS", "BJ"):
+        if normalized.startswith(prefix):
+            digits = normalized[len(prefix):]
+            if digits.isdigit() and len(digits) in (5, 6):
+                return digits
+
+    return normalized
+
+
 def _is_hk_stock_code(code: str) -> bool:
     """Lightweight HK code detector without importing heavy fetcher modules."""
     normalized = (code or "").strip().upper()
@@ -61,13 +82,14 @@ def get_market_for_stock(code: str) -> Optional[str]:
     """
     if not code or not isinstance(code, str):
         return None
-    code = (code or "").strip().upper()
+    raw_code = (code or "").strip().upper()
+    code = _normalize_market_code(raw_code)
 
     from data_provider.us_index_mapping import is_us_stock_code, is_us_index_code
 
-    if is_us_stock_code(code) or is_us_index_code(code):
+    if is_us_stock_code(raw_code) or is_us_index_code(raw_code) or is_us_stock_code(code) or is_us_index_code(code):
         return "us"
-    if _is_hk_stock_code(code):
+    if _is_hk_stock_code(raw_code) or _is_hk_stock_code(code):
         return "hk"
     # A-share: 6-digit numeric
     if code.isdigit() and len(code) == 6:

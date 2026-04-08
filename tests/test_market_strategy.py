@@ -97,6 +97,12 @@ class TestMarketReviewRegionResolution(unittest.TestCase):
     def test_get_market_for_stock_recognizes_four_digit_hk_code(self):
         self.assertEqual(get_market_for_stock("0700"), "hk")
 
+    def test_get_market_for_stock_recognizes_a_share_suffix_code(self):
+        self.assertEqual(get_market_for_stock("600519.SH"), "cn")
+
+    def test_get_market_for_stock_recognizes_a_share_prefixed_code(self):
+        self.assertEqual(get_market_for_stock("SZ000001"), "cn")
+
 
 if __name__ == "__main__":
     unittest.main()

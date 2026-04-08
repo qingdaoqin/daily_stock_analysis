@@ -6,7 +6,8 @@ on:
   # 这里在工作日 13:00 / 14:00 UTC 各触发一次：
   # - EDT(夏令时, UTC-4) 以 13:00 UTC 为主
   # - EST(冬令时, UTC-5) 以 14:00 UTC 为主
-  # 后续步骤会按纽约时区和当前夏/冬令时只放行唯一有效槽位，并容忍 GitHub 调度延迟。
+  # 后续步骤会按纽约时区和当前夏/冬令时只放行唯一有效槽位。
+  # 不再额外要求命中某个“纽约时间窗口”，避免 GitHub schedule 延迟导致整条任务被跳过。
   schedule:
     - cron: '0 13 * * 1-5'
     - cron: '0 14 * * 1-5'
@@ -67,16 +68,16 @@ jobs:
 
           if [ "$NY_DOW" -ge 1 ] && [ "$NY_DOW" -le 5 ]; then
             # EDT: 13:00 UTC 是主槽位；EST: 14:00 UTC 是主槽位。
-            # GitHub schedule 可能延迟几十分钟，放宽到纽约时间 09:00-10:59，
-            # 但只允许当前夏/冬令时对应的那个主槽位继续执行，避免双跑。
-            if [ "$NY_OFFSET" = "-0400" ] && [ "$SCHEDULE_EXPR" = "0 13 * * 1-5" ] && [ "$NY_HOUR" -ge 9 ] && [ "$NY_HOUR" -le 10 ]; then
+            # GitHub schedule 可能延迟较久，但只要当前触发槽位与纽约夏/冬令时匹配，
+            # 就继续执行，避免“已经调度但因为晚了几十分钟/一小时而被跳过”。
+            if [ "$NY_OFFSET" = "-0400" ] && [ "$SCHEDULE_EXPR" = "0 13 * * 1-5" ]; then
               SHOULD_RUN=true
-              REASON="EDT 主槽位命中（13:00 UTC），且在延迟容忍窗口 09:00-10:59 ET 内"
-            elif [ "$NY_OFFSET" = "-0500" ] && [ "$SCHEDULE_EXPR" = "0 14 * * 1-5" ] && [ "$NY_HOUR" -ge 9 ] && [ "$NY_HOUR" -le 10 ]; then
+              REASON="EDT 主槽位命中（13:00 UTC）"
+            elif [ "$NY_OFFSET" = "-0500" ] && [ "$SCHEDULE_EXPR" = "0 14 * * 1-5" ]; then
               SHOULD_RUN=true
-              REASON="EST 主槽位命中（14:00 UTC），且在延迟容忍窗口 09:00-10:59 ET 内"
+              REASON="EST 主槽位命中（14:00 UTC）"
             else
-              REASON="当前触发槽位与纽约夏/冬令时不匹配，或已超出延迟容忍窗口"
+              REASON="当前触发槽位与纽约夏/冬令时不匹配"
             fi
           else
             REASON="当前不是纽约工作日"

@@ -63,7 +63,8 @@ def _safe_litellm_exc_type(name: str):
     """Return a litellm exception type when available; otherwise None."""
     if litellm is None:
         return None
-    return getattr(litellm, name, None)
+    exc_type = getattr(litellm, name, None)
+    return exc_type if isinstance(exc_type, type) and issubclass(exc_type, BaseException) else None
 
 
 def _model_matches(model: str, entries: List[str]) -> bool:

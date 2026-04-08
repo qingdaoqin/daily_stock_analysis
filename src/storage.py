@@ -1497,13 +1497,19 @@ class DatabaseManager:
         """
         if target_date is None:
             target_date = date.today()
-        # 注意：尽管入参提供了 target_date，但当前实现实际使用的是“最新两天数据”（get_latest_data），
-        # 并不会按 target_date 精确取当日/前一交易日的上下文。
-        # 因此若未来需要支持“按历史某天复盘/重算”的可解释性，这里需要调整。
-        # 该行为目前保留（按需求不改逻辑）。
-        
-        # 获取最近2天数据
-        recent_data = self.get_latest_data(code, days=2)
+
+        with self.get_session() as session:
+            recent_data = session.execute(
+                select(StockDaily)
+                .where(
+                    and_(
+                        StockDaily.code == code,
+                        StockDaily.date <= target_date,
+                    )
+                )
+                .order_by(desc(StockDaily.date))
+                .limit(2)
+            ).scalars().all()
         
         if not recent_data:
             logger.warning(f"未找到 {code} 的数据")

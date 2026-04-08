@@ -102,6 +102,29 @@ class TestPrefetchStockNames(unittest.TestCase):
         hk_fetcher.get_stock_name.assert_called_once_with("0700")
         cn_fetcher.get_stock_name.assert_not_called()
 
+    def test_get_stock_name_falls_back_to_akshare_for_hk_codes(self):
+        manager = DataFetcherManager.__new__(DataFetcherManager)
+        yfinance_fetcher = MagicMock()
+        yfinance_fetcher.name = "YfinanceFetcher"
+        yfinance_fetcher.get_stock_name.return_value = ""
+        longbridge_fetcher = MagicMock()
+        longbridge_fetcher.name = "LongbridgeFetcher"
+        longbridge_fetcher.get_stock_name.return_value = ""
+        akshare_fetcher = MagicMock()
+        akshare_fetcher.name = "AkshareFetcher"
+        akshare_fetcher.get_stock_name.return_value = "腾讯控股"
+        manager._fetchers = [akshare_fetcher, longbridge_fetcher, yfinance_fetcher]
+        manager.get_realtime_quote = MagicMock()
+
+        with patch.dict("data_provider.base.STOCK_NAME_MAP", {}, clear=True):
+            name = DataFetcherManager.get_stock_name(manager, "0700", allow_realtime=False)
+
+        self.assertEqual(name, "腾讯控股")
+        manager.get_realtime_quote.assert_not_called()
+        yfinance_fetcher.get_stock_name.assert_called_once_with("0700")
+        longbridge_fetcher.get_stock_name.assert_called_once_with("0700")
+        akshare_fetcher.get_stock_name.assert_called_once_with("0700")
+
     def test_get_stock_name_does_not_fallback_to_cn_fetchers_for_invalid_us_code(self):
         manager = DataFetcherManager.__new__(DataFetcherManager)
         cn_fetcher = MagicMock()

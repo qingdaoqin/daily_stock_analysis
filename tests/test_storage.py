@@ -11,6 +11,7 @@ import pandas as pd
 
 from src.storage import DatabaseManager
 
+
 class TestStorage(unittest.TestCase):
     
     def test_parse_sniper_value(self):
@@ -135,6 +136,45 @@ class TestStorage(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].close, 11.0)
         self.assertEqual(rows[0].volume, 2000)
+
+        DatabaseManager.reset_instance()
+
+    def test_get_analysis_context_honors_target_date(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+
+        data = pd.DataFrame(
+            [
+                {
+                    "date": date(2026, 4, 4),
+                    "open": 10.0,
+                    "high": 10.5,
+                    "low": 9.8,
+                    "close": 10.2,
+                    "volume": 1000,
+                    "amount": 10200,
+                    "pct_chg": 1.0,
+                },
+                {
+                    "date": date(2026, 4, 7),
+                    "open": 10.2,
+                    "high": 10.8,
+                    "low": 10.0,
+                    "close": 10.6,
+                    "volume": 1200,
+                    "amount": 12720,
+                    "pct_chg": 3.9,
+                },
+            ]
+        )
+        db.save_daily_data(data, "AAPL", "test")
+
+        context = db.get_analysis_context("AAPL", target_date=date(2026, 4, 4))
+
+        self.assertIsNotNone(context)
+        self.assertEqual(context["today"]["date"], date(2026, 4, 4))
+        self.assertEqual(context["today"]["close"], 10.2)
+        self.assertNotIn("yesterday", context)
 
         DatabaseManager.reset_instance()
 

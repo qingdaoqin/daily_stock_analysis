@@ -1650,6 +1650,67 @@ class AkshareFetcher(BaseFetcher):
 
         return None
 
+    def get_stock_name(self, stock_code: str) -> Optional[str]:
+        """获取股票名称，港股优先支持 Akshare 行情列表兜底。"""
+        normalized = normalize_stock_code(stock_code)
+
+        if hasattr(self, "_stock_name_cache") and normalized in self._stock_name_cache:
+            return self._stock_name_cache[normalized]
+
+        if not hasattr(self, "_stock_name_cache"):
+            self._stock_name_cache = {}
+
+        try:
+            import akshare as ak
+        except Exception as exc:
+            logger.debug(f"[Akshare] 导入失败，无法获取股票名称 {normalized}: {exc}")
+            return None
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            if _is_hk_code(normalized):
+                raw_code = normalized.strip().lower()
+                if raw_code.endswith(".hk"):
+                    raw_code = raw_code[:-3]
+                if raw_code.startswith("hk"):
+                    raw_code = raw_code[2:]
+                code = raw_code.zfill(5)
+
+                try:
+                    df = ak.stock_hk_spot_em()
+                except Exception as exc:
+                    logger.info(f"[Akshare] stock_hk_spot_em 获取名称失败 {normalized}: {exc}，尝试备用接口")
+                    df = ak.stock_hk_spot()
+
+                if df is not None and not df.empty:
+                    row = df[df["代码"].astype(str).str.zfill(5) == code]
+                    if not row.empty:
+                        name = str(row.iloc[0].get("名称", "")).strip()
+                        if name:
+                            self._stock_name_cache[normalized] = name
+                            return name
+                return None
+
+            if normalized.isdigit() and len(normalized) == 6:
+                try:
+                    df = ak.stock_zh_a_spot_em()
+                except Exception:
+                    df = ak.stock_zh_a_spot()
+
+                if df is not None and not df.empty:
+                    row = df[df["代码"].astype(str) == normalized]
+                    if not row.empty:
+                        name = str(row.iloc[0].get("名称", "")).strip()
+                        if name:
+                            self._stock_name_cache[normalized] = name
+                            return name
+        except Exception as exc:
+            logger.debug(f"[Akshare] 获取股票名称失败 {normalized}: {exc}")
+
+        return None
+
     def _calc_market_stats(
         self,
         df: pd.DataFrame,

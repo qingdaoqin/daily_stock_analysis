@@ -1277,11 +1277,22 @@ class DataFetcherManager:
         # 3. 依次尝试各个数据源
         fetchers = list(self._fetchers)
         market = _market_tag(stock_code)
-        if market in {"us", "hk"}:
+        if market == "us":
             fetchers = [
                 fetcher for fetcher in fetchers
                 if fetcher.name in {"YfinanceFetcher", "LongbridgeFetcher"}
             ]
+        elif market == "hk":
+            preferred_order = {
+                "YfinanceFetcher": 0,
+                "LongbridgeFetcher": 1,
+                "AkshareFetcher": 2,
+            }
+            fetchers = [
+                fetcher for fetcher in fetchers
+                if fetcher.name in preferred_order
+            ]
+            fetchers.sort(key=lambda fetcher: preferred_order.get(fetcher.name, 99))
 
         for fetcher in fetchers:
             if hasattr(fetcher, 'get_stock_name'):

@@ -138,6 +138,28 @@ class TestRefreshStockList:
 
         assert cfg.stock_list == ["AAPL", "TSLA"]
 
+    def test_refresh_stock_list_clears_list_when_env_explicitly_empty(self):
+        cfg = _make_config(stock_list=["AAPL", "TSLA"])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env_path = Path(tmp_dir) / ".env"
+            env_path.write_text("STOCK_LIST=\n", encoding="utf-8")
+            with patch.dict(os.environ, {"ENV_FILE": str(env_path)}, clear=False):
+                cfg.refresh_stock_list()
+
+        assert cfg.stock_list == []
+
+
+class TestLoadFromEnvStockList:
+    def test_load_from_env_does_not_fallback_to_sample_stocks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env_path = Path(tmp_dir) / ".env"
+            env_path.write_text("STOCK_LIST=\n", encoding="utf-8")
+            with patch.dict(os.environ, {"ENV_FILE": str(env_path), "STOCK_LIST": ""}, clear=False):
+                Config.reset_instance()
+                cfg = Config._load_from_env()
+
+        assert cfg.stock_list == []
+
 
 # ---------------------------------------------------------------------------
 # validate_structured() — LLM availability (three-tier check)

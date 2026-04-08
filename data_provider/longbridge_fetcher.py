@@ -188,7 +188,7 @@ def _is_hk_code(stock_code: str) -> bool:
         return digits.isdigit() and 1 <= len(digits) <= 5
     if normalized.endswith(".HK"):
         return True
-    if normalized.isdigit() and len(normalized) == 5:
+    if normalized.isdigit() and 1 <= len(normalized) <= 5:
         return True
     return False
 

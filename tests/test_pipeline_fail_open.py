@@ -4,6 +4,7 @@
 import os
 import sys
 import unittest
+from datetime import date
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -65,6 +66,25 @@ class TestPipelineFailOpen(unittest.TestCase):
         pipeline.process_single_stock.assert_called_once()
         self.assertEqual(pipeline.process_single_stock.call_args.kwargs["single_stock_notify"], False)
         pipeline._send_single_stock_notification.assert_called_once()
+
+    @patch("src.core.pipeline.get_market_today", return_value=date(2026, 4, 7))
+    @patch("src.core.pipeline.get_market_for_stock", return_value="us")
+    def test_fetch_and_save_stock_data_uses_market_local_today(
+        self, _mock_market, _mock_market_today
+    ) -> None:
+        pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.fetcher_manager = MagicMock()
+        pipeline.fetcher_manager.get_stock_name.return_value = "Apple"
+        pipeline.fetcher_manager.get_daily_data.return_value = (MagicMock(empty=False), "YfinanceFetcher")
+        pipeline.db = MagicMock()
+        pipeline.db.has_today_data.return_value = True
+
+        success, error = pipeline.fetch_and_save_stock_data("AAPL")
+
+        self.assertTrue(success)
+        self.assertIsNone(error)
+        pipeline.db.has_today_data.assert_called_once_with("AAPL", date(2026, 4, 7))
+        pipeline.fetcher_manager.get_daily_data.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -704,9 +704,7 @@ class Config:
             if (c or "").strip()
         ]
         
-        # 如果没有配置，使用默认的示例股票
-        if not stock_list:
-            stock_list = ['600519', '000001', '300750']
+        # 不再回退到示例股票，避免未配置时悄悄分析假样本。
         
         # === LiteLLM multi-key parsing ===
         # GEMINI_API_KEYS (comma-separated) > GEMINI_API_KEY (single)
@@ -1473,24 +1471,27 @@ class Config:
         # 也能获取到最新的股票列表配置
         env_file = os.getenv("ENV_FILE")
         env_path = Path(env_file) if env_file else (Path(__file__).parent.parent / '.env')
-        stock_list_str = ''
+        stock_list_raw = None
         if env_path.exists():
             # 直接从 .env 文件读取最新的配置
             env_values = dotenv_values(env_path)
-            stock_list_str = (env_values.get('STOCK_LIST') or '').strip()
+            if 'STOCK_LIST' in env_values:
+                stock_list_raw = env_values.get('STOCK_LIST')
 
         # 如果 .env 文件不存在或未配置，才尝试从系统环境变量读取
-        if not stock_list_str:
-            stock_list_str = os.getenv('STOCK_LIST', '')
+        if stock_list_raw is None:
+            stock_list_raw = os.getenv('STOCK_LIST')
+
+        if stock_list_raw is None:
+            return
+
+        stock_list_str = str(stock_list_raw).strip()
 
         stock_list = [
             (c or "").strip().upper()
             for c in stock_list_str.split(',')
             if (c or "").strip()
         ]
-
-        if not stock_list:
-            stock_list = self.stock_list or ['600519', '000001', '300750']
 
         self.stock_list = stock_list
     

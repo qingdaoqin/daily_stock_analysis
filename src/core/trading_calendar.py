@@ -125,6 +125,30 @@ def get_open_markets_today() -> Set[str]:
     return result
 
 
+def get_market_today(market: Optional[str]) -> date:
+    """
+    Return today's date in the market's local timezone.
+
+    Args:
+        market: 'cn' | 'hk' | 'us' | None
+
+    Returns:
+        Local calendar date for the given market; falls back to server-local date
+        when market is unknown or timezone resolution fails.
+    """
+    if market not in MARKET_TIMEZONE:
+        return date.today()
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(MARKET_TIMEZONE[market])
+        return datetime.now(tz).date()
+    except Exception as e:
+        logger.warning("get_market_today fail-open for %s: %s", market, e)
+        return date.today()
+
+
 def compute_effective_region(
     config_region: str, open_markets: Set[str]
 ) -> Optional[str]:

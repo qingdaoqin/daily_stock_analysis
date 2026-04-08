@@ -39,7 +39,7 @@ from src.search_service import SearchService
 from src.services.analysis_calibration_service import AnalysisCalibrationService
 from src.enums import ReportType
 from src.stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
-from src.core.trading_calendar import get_market_for_stock, is_market_open
+from src.core.trading_calendar import get_market_for_stock, get_market_today, is_market_open
 from bot.models import BotMessage
 
 
@@ -224,12 +224,13 @@ class StockAnalysisPipeline:
             # 首先获取股票名称
             stock_name = self.fetcher_manager.get_stock_name(code, allow_realtime=False)
 
-            today = date.today()
+            market = get_market_for_stock(code)
+            today = get_market_today(market)
             # 注意：这里用自然日 date.today() 做“断点续传”判断。
             # 若在周末/节假日/非交易日运行，或机器时区不在中国，可能出现：
             # - 数据库已有最新交易日数据但仍会重复拉取（has_today_data 返回 False）
             # - 或在跨日/时区偏移时误判“今日已有数据”
-            # 该行为目前保留（按需求不改逻辑），但如需更严谨可改为“最新交易日/数据源最新日期”判断。
+            # 这里改为“按股票所属市场本地日期”判断，降低美股/港股跨时区误判。
             
             # 断点续传检查：如果今日数据已存在，跳过
             if not force_refresh and self.db.has_today_data(code, today):
@@ -357,7 +358,7 @@ class StockAnalysisPipeline:
             # Step 3: 趋势分析（基于交易理念）— 在 Agent 分支之前执行，供两条路径共用
             trend_result: Optional[TrendAnalysisResult] = None
             try:
-                end_date = date.today()
+                end_date = get_market_today(get_market_for_stock(code))
                 start_date = end_date - timedelta(days=89)  # ~60 trading days for MA60
                 historical_bars = self.db.get_data_range(code, start_date, end_date)
                 if historical_bars:
@@ -463,10 +464,11 @@ class StockAnalysisPipeline:
 
             if context is None:
                 logger.warning(f"{stock_name}({code}) 无法获取历史行情数据，将仅基于新闻和实时行情分析")
+                market_today = get_market_today(get_market_for_stock(code))
                 context = {
                     'code': code,
                     'stock_name': stock_name,
-                    'date': date.today().isoformat(),
+                    'date': market_today.isoformat(),
                     'data_missing': True,
                     'today': {},
                     'yesterday': {}
@@ -657,7 +659,7 @@ class StockAnalysisPipeline:
                 enhanced['ma_status'] = self._compute_ma_status(
                     price, trend_result.ma5, trend_result.ma10, trend_result.ma20
                 )
-                enhanced['date'] = date.today().isoformat()
+                enhanced['date'] = get_market_today(get_market_for_stock(context.get('code', ''))).isoformat()
                 if yesterday_close is not None:
                     try:
                         yc = float(yesterday_close)
@@ -1013,7 +1015,8 @@ class StockAnalysisPipeline:
         if not enable_realtime_tech:
             return df
         market = get_market_for_stock(code)
-        if market and not is_market_open(market, date.today()):
+        market_today = get_market_today(market)
+        if market and not is_market_open(market, market_today):
             return df
 
         last_val = df['date'].max()
@@ -1031,7 +1034,7 @@ class StockAnalysisPipeline:
         amt = getattr(realtime_quote, 'amount', None)
         pct = getattr(realtime_quote, 'change_pct', None)
 
-        if last_date >= date.today():
+        if last_date >= market_today:
             # Update last row with realtime close (copy to avoid mutating caller's df)
             df = df.copy()
             idx = df.index[-1]
@@ -1052,7 +1055,7 @@ class StockAnalysisPipeline:
             # Append virtual today row
             new_row = {
                 'code': code,
-                'date': date.today(),
+                'date': market_today,
                 'open': open_p,
                 'high': high_p,
                 'low': low_p,

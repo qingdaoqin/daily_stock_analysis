@@ -118,10 +118,11 @@ class TestAugmentHistoricalWithRealtime(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertNotIn("close", result.columns)
 
+    @patch("src.core.pipeline.get_market_today", return_value=date.today())
     @patch("src.core.pipeline.is_market_open", return_value=True)
     @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
     def test_appends_row_when_last_date_before_today(
-        self, _mock_market, _mock_open
+        self, _mock_market, _mock_open, _mock_market_today
     ) -> None:
         df = _make_historical_df(last_date=date.today() - timedelta(days=1))
         quote = _make_realtime_quote(price=15.72)
@@ -131,10 +132,11 @@ class TestAugmentHistoricalWithRealtime(unittest.TestCase):
         self.assertEqual(last["close"], 15.72)
         self.assertEqual(last["date"], date.today())
 
+    @patch("src.core.pipeline.get_market_today", return_value=date.today())
     @patch("src.core.pipeline.is_market_open", return_value=True)
     @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
     def test_updates_last_row_when_last_date_is_today(
-        self, _mock_market, _mock_open
+        self, _mock_market, _mock_open, _mock_market_today
     ) -> None:
         df = _make_historical_df(last_date=date.today(), days=25)
         df.loc[df.index[-1], "date"] = date.today()
@@ -142,6 +144,17 @@ class TestAugmentHistoricalWithRealtime(unittest.TestCase):
         result = self.pipeline._augment_historical_with_realtime(df, quote, "600519")
         self.assertEqual(len(result), len(df))
         self.assertEqual(result.iloc[-1]["close"], 16.0)
+
+    @patch("src.core.pipeline.get_market_today", return_value=date(2026, 4, 7))
+    @patch("src.core.pipeline.is_market_open", return_value=True)
+    @patch("src.core.pipeline.get_market_for_stock", return_value="us")
+    def test_uses_market_local_date_for_us_append(
+        self, _mock_market, _mock_open, _mock_market_today
+    ) -> None:
+        df = _make_historical_df(last_date=date(2026, 4, 6))
+        quote = _make_realtime_quote(price=16.0)
+        result = self.pipeline._augment_historical_with_realtime(df, quote, "AAPL")
+        self.assertEqual(result.iloc[-1]["date"], date(2026, 4, 7))
 
 
 class TestComputeMaStatus(unittest.TestCase):

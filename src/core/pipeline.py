@@ -460,7 +460,8 @@ class StockAnalysisPipeline:
                 )
 
             # Step 5: 获取分析上下文（技术面数据）
-            context = self.db.get_analysis_context(code)
+            analysis_date = get_market_today(get_market_for_stock(code))
+            context = self.db.get_analysis_context(code, target_date=analysis_date)
 
             if context is None:
                 logger.warning(f"{stock_name}({code}) 无法获取历史行情数据，将仅基于新闻和实时行情分析")
@@ -1150,6 +1151,18 @@ class StockAnalysisPipeline:
             })
 
         return context
+
+    @staticmethod
+    def _filter_supported_stock_codes(stock_codes: List[str]) -> List[str]:
+        """Drop syntactically unsupported stock codes before entering the pipeline."""
+        filtered_codes: List[str] = []
+        for code in stock_codes:
+            market = get_market_for_stock(code)
+            if market is None:
+                logger.warning("无法识别股票代码，已跳过: %s", code)
+                continue
+            filtered_codes.append(code)
+        return filtered_codes
     
     def process_single_stock(
         self,
@@ -1181,6 +1194,9 @@ class StockAnalysisPipeline:
             AnalysisResult 或 None
         """
         logger.info(f"========== 开始处理 {code} ==========")
+
+        if not self._filter_supported_stock_codes([code]):
+            return None
         
         try:
             # Step 1: 获取并保存数据
@@ -1269,6 +1285,11 @@ class StockAnalysisPipeline:
         
         if not stock_codes:
             logger.error("未配置自选股列表，请在 .env 文件中设置 STOCK_LIST")
+            return []
+
+        stock_codes = self._filter_supported_stock_codes(list(stock_codes))
+        if not stock_codes:
+            logger.error("未识别到有效股票代码，请检查 STOCK_LIST 或命令行传入的股票列表")
             return []
         
         logger.info(f"===== 开始分析 {len(stock_codes)} 只股票 =====")

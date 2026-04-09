@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -368,7 +368,11 @@ class AnalysisCalibrationServiceTestCase(unittest.TestCase):
 
 
 class PipelineLearningLoopTestCase(unittest.TestCase):
-    def test_pipeline_calls_refresh_and_calibration_on_standard_path(self) -> None:
+    @patch("src.core.pipeline.get_market_today", return_value=date(2026, 3, 24))
+    @patch("src.core.pipeline.get_market_for_stock", return_value="us")
+    def test_pipeline_calls_refresh_and_calibration_on_standard_path(
+        self, _mock_market, _mock_market_today
+    ) -> None:
         with patch("src.core.pipeline.get_config") as mock_config, \
              patch("src.core.pipeline.get_db") as mock_db, \
              patch("src.core.pipeline.DataFetcherManager"), \
@@ -432,6 +436,10 @@ class PipelineLearningLoopTestCase(unittest.TestCase):
             result = pipeline.analyze_stock("AAPL", ReportType.SIMPLE, "q-learn")
 
             self.assertIsNotNone(result)
+            pipeline.db.get_analysis_context.assert_called_once_with(
+                "AAPL",
+                target_date=date(2026, 3, 24),
+            )
             pipeline.calibration_service.maybe_refresh_backtests.assert_called_once()
             pipeline.calibration_service.maybe_refresh_model.assert_called_once()
             pipeline.calibration_service.calibrate_result.assert_called_once()

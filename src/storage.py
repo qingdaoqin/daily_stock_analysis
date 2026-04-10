@@ -758,7 +758,7 @@ class DatabaseManager:
             if ":memory:" in url_str:
                 return False
             # file-based SQLite URLs look like sqlite:///path or sqlite:////abs/path
-            return url_str.startswith("sqlite")
+            return url_str.startswith("sqlite:")
         except Exception:
             return False
 

@@ -154,6 +154,7 @@ def _clamp_sentiment_score_to_signal_with_bias(score: int, signal: str, hold_bia
         "bearish": (40, 47),
     }
     bands = {
+        # Upper bound extended from 79 → 100 to allow "强烈买入" (score >= 80)
         "buy": (60, 100),
         "hold": hold_bands.get(hold_bias, hold_bands["neutral"]),
         "sell": (0, 39),

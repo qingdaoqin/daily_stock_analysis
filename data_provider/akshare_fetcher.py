@@ -314,7 +314,7 @@ class AkshareFetcher(BaseFetcher):
                             self_session.headers['User-Agent'] = ua
 
                     requests.Session.__init__ = _patched_init
-            requests.Session._dsa_user_agent = random_ua
+                requests.Session._dsa_user_agent = random_ua
             logger.debug(f"设置 User-Agent: {random_ua[:50]}...")
         except Exception as e:
             logger.debug(f"设置 User-Agent 失败: {e}")

@@ -636,7 +636,7 @@ class TushareFetcher(BaseFetcher):
                 price=price,
                 change_pct=round(change_pct, 2),
                 change_amount=round(change_amount, 2),
-                volume=safe_int(row['volume']),  # 保持股为单位（与其他数据源一致）
+                volume=safe_int(row['volume']),  # ts.get_realtime_quotes (旧版Sina接口) 返回股，无需转换
                 amount=safe_float(row['amount']),
                 high=safe_float(row['high']),
                 low=safe_float(row['low']),

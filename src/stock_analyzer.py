@@ -260,16 +260,15 @@ class StockTrendAnalyzer:
 
         # A-share sub-type adjustments: ST(±5%), 科创板/创业板(±20%), 北交所(±30%)
         if market == "cn":
-            normalized_code = (code or "").strip().split(".")[0]
             if is_st_stock(stock_name):
                 resolved["base_threshold_floor"] = 3.0
                 resolved["strong_multiplier"] = 1.3
                 resolved["high_bias_risk"] = "ST 股涨跌停仅 ±5%，严禁追高！"
-            elif is_bse_code(normalized_code):
+            elif is_bse_code(code):
                 resolved["base_threshold_floor"] = 10.0
                 resolved["strong_multiplier"] = 1.6
                 resolved["high_bias_risk"] = "北交所涨跌幅 ±30%，高乖离率风险极大！"
-            elif is_kc_cy_stock(normalized_code):
+            elif is_kc_cy_stock(code):
                 resolved["base_threshold_floor"] = 8.0
                 resolved["strong_multiplier"] = 1.6
                 resolved["high_bias_risk"] = "科创板/创业板涨跌幅 ±20%，注意追高风险！"

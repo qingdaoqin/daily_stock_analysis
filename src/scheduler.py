@@ -14,12 +14,12 @@
 """
 
 import logging
+import re
 import signal
-import sys
-import time
 import threading
+import time
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +63,17 @@ class Scheduler:
     - 优雅退出
     """
     
-    def __init__(self, schedule_time: str = "18:00"):
+    def __init__(
+        self,
+        schedule_time: str = "18:00",
+        schedule_time_provider: Optional[Callable[[], str]] = None,
+    ):
         """
         初始化调度器
-        
+
         Args:
             schedule_time: 每日执行时间，格式 "HH:MM"
+            schedule_time_provider: 可选回调，运行期间定期调用以检测时间变更
         """
         try:
             import schedule
@@ -76,29 +81,94 @@ class Scheduler:
         except ImportError:
             logger.error("schedule 库未安装，请执行: pip install schedule")
             raise ImportError("请安装 schedule 库: pip install schedule")
-        
+
         self.schedule_time = schedule_time
+        self._schedule_time_provider = schedule_time_provider
         self.shutdown_handler = GracefulShutdown()
         self._task_callback: Optional[Callable] = None
+        self._daily_job: Optional[Any] = None
         self._running = False
         
     def set_daily_task(self, task: Callable, run_immediately: bool = True):
         """
         设置每日定时任务
-        
+
         Args:
             task: 要执行的任务函数（无参数）
             run_immediately: 是否在设置后立即执行一次
         """
         self._task_callback = task
-        
-        # 设置每日定时任务
-        self.schedule.every().day.at(self.schedule_time).do(self._safe_run_task)
-        logger.info(f"已设置每日定时任务，执行时间: {self.schedule_time}")
-        
+        if not self._configure_daily_task(self.schedule_time):
+            raise ValueError(f"无效的定时执行时间: {self.schedule_time!r}")
+
         if run_immediately:
             logger.info("立即执行一次任务...")
             self._safe_run_task()
+
+    @staticmethod
+    def _is_valid_schedule_time(schedule_time: str) -> bool:
+        """Validate time string in HH:MM 24-hour format."""
+        candidate = (schedule_time or "").strip()
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", candidate):
+            return False
+        return True
+
+    def _cancel_daily_job(self) -> None:
+        """Remove the currently registered daily job if one exists."""
+        if self._daily_job is None:
+            return
+
+        if hasattr(self.schedule, "cancel_job"):
+            self.schedule.cancel_job(self._daily_job)
+        else:  # pragma: no cover - compatibility fallback
+            jobs = getattr(self.schedule, "jobs", None)
+            if isinstance(jobs, list) and self._daily_job in jobs:
+                jobs.remove(self._daily_job)
+
+        self._daily_job = None
+
+    def _configure_daily_task(self, schedule_time: str) -> bool:
+        """(Re)register the daily job at the requested time."""
+        candidate = (schedule_time or "").strip()
+        if not self._is_valid_schedule_time(candidate):
+            logger.warning(
+                "检测到无效的定时执行时间 %r，继续沿用当前时间 %s",
+                schedule_time,
+                self.schedule_time,
+            )
+            return False
+
+        previous_time = self.schedule_time
+        self._cancel_daily_job()
+        self._daily_job = self.schedule.every().day.at(candidate).do(self._safe_run_task)
+        self.schedule_time = candidate
+
+        if previous_time == candidate:
+            logger.info("已设置每日定时任务，执行时间: %s", self.schedule_time)
+        else:
+            logger.info(
+                "检测到 SCHEDULE_TIME 变更，已将每日定时任务从 %s 更新为 %s",
+                previous_time,
+                self.schedule_time,
+            )
+        return True
+
+    def _refresh_daily_schedule_if_needed(self) -> None:
+        """Reload daily schedule time from the latest runtime config if needed."""
+        if self._task_callback is None or self._schedule_time_provider is None:
+            return
+
+        try:
+            latest_schedule_time = (self._schedule_time_provider() or "").strip()
+        except Exception as exc:  # pragma: no cover - defensive branch
+            logger.warning("读取最新 SCHEDULE_TIME 失败，继续沿用 %s: %s", self.schedule_time, exc)
+            return
+
+        if not latest_schedule_time or latest_schedule_time == self.schedule_time:
+            return
+
+        if self._configure_daily_task(latest_schedule_time):
+            logger.info("更新后的下次执行时间: %s", self._get_next_run_time())
     
     def _safe_run_task(self):
         """安全执行任务（带异常捕获）"""
@@ -120,21 +190,22 @@ class Scheduler:
     def run(self):
         """
         运行调度器主循环
-        
+
         阻塞运行，直到收到退出信号
         """
         self._running = True
         logger.info("调度器开始运行...")
         logger.info(f"下次执行时间: {self._get_next_run_time()}")
-        
+
         while self._running and not self.shutdown_handler.should_shutdown:
+            self._refresh_daily_schedule_if_needed()
             self.schedule.run_pending()
             time.sleep(30)  # 每30秒检查一次
-            
+
             # 每小时打印一次心跳
             if datetime.now().minute == 0 and datetime.now().second < 30:
                 logger.info(f"调度器运行中... 下次执行: {self._get_next_run_time()}")
-        
+
         logger.info("调度器已停止")
     
     def _get_next_run_time(self) -> str:

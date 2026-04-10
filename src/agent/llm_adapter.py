@@ -20,7 +20,14 @@ except Exception:  # pragma: no cover - optional dependency
     litellm = None
     Router = None
 
-from src.config import get_config, get_api_keys_for_model, extra_litellm_params, get_configured_llm_models
+from src.config import (
+    extra_litellm_params,
+    get_api_keys_for_model,
+    get_config,
+    get_configured_llm_models,
+    get_effective_agent_models_to_try,
+    get_effective_agent_primary_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -180,9 +187,9 @@ class LLMToolAdapter:
             logger.warning("Agent LLM: litellm not installed")
             return
         config = self._config
-        litellm_model = config.litellm_model
+        litellm_model = get_effective_agent_primary_model(config)
         if not litellm_model:
-            logger.warning("Agent LLM: LITELLM_MODEL not configured")
+            logger.warning("Agent LLM: no effective primary model configured")
             return
 
         self._litellm_available = True
@@ -246,7 +253,7 @@ class LLMToolAdapter:
     @property
     def primary_provider(self) -> str:
         """Provider name extracted from litellm_model prefix."""
-        model = self._config.litellm_model or ""
+        model = get_effective_agent_primary_model(self._config)
         if "/" in model:
             return model.split("/")[0]
         return model or "none"
@@ -288,6 +295,7 @@ class LLMToolAdapter:
         messages: List[Dict[str, Any]],
         tools: List[dict],
         provider: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> LLMResponse:
         """Send messages + tool declarations to LLM, return normalized response.
 
@@ -296,11 +304,12 @@ class LLMToolAdapter:
                       [{"role": "system"/"user"/"assistant"/"tool", "content": ...}, ...]
             tools: OpenAI-format tool declarations; litellm converts to each provider's format.
             provider: Ignored (kept for backward compatibility).
+            timeout: Optional timeout in seconds for the completion call.
 
         Returns:
             LLMResponse with either content (final answer) or tool_calls.
         """
-        return self.call_completion(messages, tools=tools, provider=provider)
+        return self.call_completion(messages, tools=tools, provider=provider, timeout=timeout)
 
     def call_text(
         self,
@@ -333,11 +342,21 @@ class LLMToolAdapter:
     ) -> LLMResponse:
         """Shared completion path for both tool and text-only calls."""
         config = self._config
-        models_to_try = [config.litellm_model] + (config.litellm_fallback_models or [])
-        models_to_try = [m for m in models_to_try if m]
+        models_to_try = get_effective_agent_models_to_try(config)
+        started_at = time.time()
+        providers = [self._get_model_provider(m) for m in models_to_try]
 
         last_error = None
-        for model in models_to_try:
+        hit_rate_limit = False
+        for idx, model in enumerate(models_to_try):
+            remaining_timeout = timeout
+            if timeout is not None and timeout > 0:
+                remaining_timeout = max(0.0, float(timeout) - (time.time() - started_at))
+                if remaining_timeout <= 0:
+                    last_error = TimeoutError(
+                        f"LLM completion timed out before trying fallback model {model}"
+                    )
+                    break
             try:
                 return self._call_litellm_model(
                     messages,
@@ -345,22 +364,44 @@ class LLMToolAdapter:
                     model,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    timeout=timeout,
+                    timeout=remaining_timeout,
                 )
             except Exception as e:
                 if self._is_context_window_error(e):
-                    logger.warning("Agent LLM call skipped for %s due to context window overflow: %s", model, e)
+                    logger.warning("Agent LLM context window exceeded on %s: %s", model, e)
                 elif self._is_rate_limit_error(e):
-                    logger.warning("Agent LLM call hit rate limit on %s, backing off before fallback: %s", model, e)
-                    time.sleep(1.5)
+                    logger.warning("Agent LLM rate-limited on %s: %s", model, e)
+                    hit_rate_limit = True
+                    # Avoid blind backoff across different providers; cross-provider
+                    # fallback usually means different accounts/rate-limit buckets.
+                    should_backoff = (
+                        idx + 1 < len(models_to_try)
+                        and providers[idx] == providers[idx + 1]
+                    )
+                    if should_backoff:
+                        backoff_sleep = min(2.0, (time.time() - started_at) * 0.1 + 0.5)
+                        if timeout is not None and timeout > 0:
+                            remaining = max(0.0, float(timeout) - (time.time() - started_at))
+                            if remaining > 0:
+                                time.sleep(min(backoff_sleep, remaining))
+                        else:
+                            time.sleep(backoff_sleep)
                 else:
-                    logger.warning(f"Agent LLM call failed with {model}: {e}")
+                    logger.warning("Agent LLM call failed with %s: %s", model, e)
                 last_error = e
                 continue
 
-        error_msg = f"All LLM models failed. Last error: {last_error}"
+        suffix = " (rate-limit encountered during fallback)" if hit_rate_limit else ""
+        error_msg = f"All LLM models failed{suffix}. Last error: {last_error}"
         logger.error(error_msg)
         return LLMResponse(content=error_msg, provider="error")
+
+    @staticmethod
+    def _get_model_provider(model: str) -> str:
+        """Return LiteLLM provider namespace for model fallback grouping."""
+        if "/" in model:
+            return model.split("/", 1)[0]
+        return "openai"
 
     def _call_litellm_model(
         self,

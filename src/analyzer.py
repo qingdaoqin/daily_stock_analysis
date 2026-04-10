@@ -663,6 +663,9 @@ def fill_price_position_if_needed(
             rq = realtime_quote if isinstance(realtime_quote, dict) else (
                 realtime_quote.to_dict() if hasattr(realtime_quote, "to_dict") else {}
             )
+            # current_price == 0 is always invalid (stock price cannot be zero),
+            # so treat it as placeholder even though generic _is_value_placeholder
+            # no longer considers numeric 0 as placeholder.
             if _is_value_placeholder(computed.get("current_price")) or computed.get("current_price") == 0:
                 computed["current_price"] = rq.get("price")
 

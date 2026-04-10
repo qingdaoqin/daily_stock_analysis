@@ -289,11 +289,24 @@ class AkshareFetcher(BaseFetcher):
         """
         设置随机 User-Agent
         
-        通过修改 requests 默认 Session headers 实现反爬策略
+        通过 monkey-patch requests.Session 的默认 headers 实现反爬策略。
+        akshare 内部为每次请求创建新 Session，因此需要在类级别设置默认 headers。
         """
         try:
             random_ua = random.choice(USER_AGENTS)
-            requests.utils.default_headers()['User-Agent'] = random_ua
+            # Patch requests.Session.__init__ once so that every new Session
+            # created by akshare/efinance automatically inherits the UA.
+            if not hasattr(requests.Session, '_original_init_dsa'):
+                requests.Session._original_init_dsa = requests.Session.__init__
+
+                def _patched_init(self_session, *args, **kwargs):
+                    requests.Session._original_init_dsa(self_session, *args, **kwargs)
+                    ua = getattr(requests.Session, '_dsa_user_agent', None)
+                    if ua:
+                        self_session.headers['User-Agent'] = ua
+
+                requests.Session.__init__ = _patched_init
+            requests.Session._dsa_user_agent = random_ua
             logger.debug(f"设置 User-Agent: {random_ua[:50]}...")
         except Exception as e:
             logger.debug(f"设置 User-Agent 失败: {e}")

@@ -341,6 +341,7 @@ class Config:
     # === 新闻与分析筛选配置 ===
     news_max_age_days: int = 3   # 新闻最大时效（天）
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
+    analysis_history_days: int = 60  # LLM 分析时发送的历史 K 线天数（默认 60 交易日）
 
     # === Agent 模式配置 ===
     agent_mode: bool = False
@@ -925,6 +926,7 @@ class Config:
             searxng_base_urls=searxng_base_urls,
             news_max_age_days=max(1, int(os.getenv('NEWS_MAX_AGE_DAYS', '3'))),
             bias_threshold=max(1.0, float(os.getenv('BIAS_THRESHOLD', '5.0'))),
+            analysis_history_days=max(5, int(os.getenv('ANALYSIS_HISTORY_DAYS', '60'))),
             agent_mode=os.getenv('AGENT_MODE', 'false').lower() == 'true',
             _agent_mode_explicit=os.getenv('AGENT_MODE') is not None,
             agent_max_steps=int(os.getenv('AGENT_MAX_STEPS', '10')),

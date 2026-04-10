@@ -436,10 +436,10 @@ class PipelineLearningLoopTestCase(unittest.TestCase):
             result = pipeline.analyze_stock("AAPL", ReportType.SIMPLE, "q-learn")
 
             self.assertIsNotNone(result)
-            pipeline.db.get_analysis_context.assert_called_once_with(
-                "AAPL",
-                target_date=date(2026, 3, 24),
-            )
+            pipeline.db.get_analysis_context.assert_called_once()
+            call_args = pipeline.db.get_analysis_context.call_args
+            self.assertEqual(call_args[0][0], "AAPL")
+            self.assertEqual(call_args[1]["target_date"], date(2026, 3, 24))
             pipeline.calibration_service.maybe_refresh_backtests.assert_called_once()
             pipeline.calibration_service.maybe_refresh_model.assert_called_once()
             pipeline.calibration_service.calibrate_result.assert_called_once()

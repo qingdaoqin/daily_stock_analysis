@@ -1481,23 +1481,27 @@ class DatabaseManager:
     def get_analysis_context(
         self, 
         code: str,
-        target_date: Optional[date] = None
+        target_date: Optional[date] = None,
+        history_days: int = 60
     ) -> Optional[Dict[str, Any]]:
         """
         获取分析所需的上下文数据
         
-        返回今日数据 + 昨日数据的对比信息
+        返回今日数据 + 昨日数据的对比信息 + 近 N 日历史K线
         
         Args:
             code: 股票代码
             target_date: 目标日期（默认今天）
+            history_days: 返回的历史K线天数（默认60，用于 LLM 判断触底反弹/回调）
             
         Returns:
-            包含今日数据、昨日对比等信息的字典
+            包含今日数据、昨日对比、历史K线等信息的字典
         """
         if target_date is None:
             target_date = date.today()
 
+        # 拉取 history_days+1 条记录（today + history_days 天历史）
+        fetch_limit = max(history_days + 1, 2)
         with self.get_session() as session:
             recent_data = session.execute(
                 select(StockDaily)
@@ -1508,7 +1512,7 @@ class DatabaseManager:
                     )
                 )
                 .order_by(desc(StockDaily.date))
-                .limit(2)
+                .limit(fetch_limit)
             ).scalars().all()
         
         if not recent_data:
@@ -1540,6 +1544,23 @@ class DatabaseManager:
             
             # 均线形态判断
             context['ma_status'] = self._analyze_ma_status(today_data)
+
+        # 历史K线（按日期正序，不含今日，用于 LLM 中期趋势判断）
+        if len(recent_data) > 1:
+            history_bars = recent_data[1:]  # 去掉 today
+            history_bars.reverse()  # 按日期正序
+            context['history'] = [
+                {
+                    'date': bar.date.isoformat(),
+                    'open': bar.open,
+                    'high': bar.high,
+                    'low': bar.low,
+                    'close': bar.close,
+                    'volume': bar.volume,
+                    'pct_chg': bar.pct_chg,
+                }
+                for bar in history_bars
+            ]
         
         return context
     

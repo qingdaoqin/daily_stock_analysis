@@ -17,6 +17,7 @@ TushareFetcher - 备用数据源 1 (Priority 2)
 import json as _json
 import logging
 import re
+import threading
 import time
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any
@@ -102,6 +103,7 @@ class TushareFetcher(BaseFetcher):
         self.rate_limit_per_minute = rate_limit_per_minute
         self._call_count = 0  # 当前分钟内的调用次数
         self._minute_start: Optional[float] = None  # 当前计数周期开始时间
+        self._rate_limit_lock = threading.Lock()  # 速率限制线程锁
         self._api: Optional[object] = None  # Tushare API 实例
 
         # 尝试初始化 API
@@ -216,39 +218,47 @@ class TushareFetcher(BaseFetcher):
         1. 检查是否进入新的一分钟
         2. 如果是，重置计数器
         3. 如果当前分钟调用次数超过限制，强制休眠
+        
+        线程安全：使用 Lock 保护计数器操作。
+        sleep 在锁外执行，避免阻塞其他线程。
         """
-        current_time = time.time()
-        
-        # 检查是否需要重置计数器（新的一分钟）
-        if self._minute_start is None:
-            self._minute_start = current_time
-            self._call_count = 0
-        elif current_time - self._minute_start >= 60:
-            # 已经过了一分钟，重置计数器
-            self._minute_start = current_time
-            self._call_count = 0
-            logger.debug("速率限制计数器已重置")
-        
-        # 检查是否超过配额
-        if self._call_count >= self.rate_limit_per_minute:
-            # 计算需要等待的时间（到下一分钟）
-            elapsed = current_time - self._minute_start
-            sleep_time = max(0, 60 - elapsed) + 1  # +1 秒缓冲
+        sleep_time = 0.0
+        with self._rate_limit_lock:
+            current_time = time.time()
             
-            logger.warning(
-                f"Tushare 达到速率限制 ({self._call_count}/{self.rate_limit_per_minute} 次/分钟)，"
-                f"等待 {sleep_time:.1f} 秒..."
-            )
+            # 检查是否需要重置计数器（新的一分钟）
+            if self._minute_start is None:
+                self._minute_start = current_time
+                self._call_count = 0
+            elif current_time - self._minute_start >= 60:
+                # 已经过了一分钟，重置计数器
+                self._minute_start = current_time
+                self._call_count = 0
+                logger.debug("速率限制计数器已重置")
             
+            # 检查是否超过配额
+            if self._call_count >= self.rate_limit_per_minute:
+                # 计算需要等待的时间（到下一分钟）
+                elapsed = current_time - self._minute_start
+                sleep_time = max(0, 60 - elapsed) + 1  # +1 秒缓冲
+                
+                logger.warning(
+                    f"Tushare 达到速率限制 ({self._call_count}/{self.rate_limit_per_minute} 次/分钟)，"
+                    f"等待 {sleep_time:.1f} 秒..."
+                )
+
+        # Sleep outside the lock to avoid blocking other threads
+        if sleep_time > 0:
             time.sleep(sleep_time)
-            
-            # 重置计数器
-            self._minute_start = time.time()
-            self._call_count = 0
-        
-        # 增加调用计数
-        self._call_count += 1
-        logger.debug(f"Tushare 当前分钟调用次数: {self._call_count}/{self.rate_limit_per_minute}")
+            with self._rate_limit_lock:
+                # 重置计数器
+                self._minute_start = time.time()
+                self._call_count = 0
+
+        with self._rate_limit_lock:
+            # 增加调用计数
+            self._call_count += 1
+            logger.debug(f"Tushare 当前分钟调用次数: {self._call_count}/{self.rate_limit_per_minute}")
     
     def _convert_stock_code(self, stock_code: str) -> str:
         """
@@ -397,10 +407,12 @@ class TushareFetcher(BaseFetcher):
             df['date'] = pd.to_datetime(df['date'], format='%Y%m%d')
         
         # 成交量单位转换（Tushare 的 vol 单位是手，需要转换为股）
+        # 注：daily() 和 fund_daily() 的 vol 单位均为手
         if 'volume' in df.columns:
             df['volume'] = df['volume'] * 100
         
         # 成交额单位转换（Tushare 的 amount 单位是千元，转换为元）
+        # 注：daily() 和 fund_daily() 的 amount 单位均为千元
         if 'amount' in df.columns:
             df['amount'] = df['amount'] * 1000
         
@@ -624,7 +636,7 @@ class TushareFetcher(BaseFetcher):
                 price=price,
                 change_pct=round(change_pct, 2),
                 change_amount=round(change_amount, 2),
-                volume=safe_int(row['volume']) // 100,  # 转换为手
+                volume=safe_int(row['volume']),  # ts.get_realtime_quotes (旧版Sina接口) 返回股，无需转换
                 amount=safe_float(row['amount']),
                 high=safe_float(row['high']),
                 low=safe_float(row['low']),

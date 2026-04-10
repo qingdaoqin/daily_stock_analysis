@@ -154,7 +154,8 @@ def _clamp_sentiment_score_to_signal_with_bias(score: int, signal: str, hold_bia
         "bearish": (40, 47),
     }
     bands = {
-        "buy": (60, 79),
+        # Upper bound extended from 79 → 100 to allow "强烈买入" (score >= 80)
+        "buy": (60, 100),
         "hold": hold_bands.get(hold_bias, hold_bands["neutral"]),
         "sell": (0, 39),
     }
@@ -527,11 +528,17 @@ _CHIP_KEYS: tuple = ("profit_ratio", "avg_cost", "concentration", "chip_health")
 
 
 def _is_value_placeholder(v: Any) -> bool:
-    """True if value is empty or placeholder (N/A, 数据缺失, etc.)."""
+    """True if value is empty or placeholder (N/A, 数据缺失, etc.).
+
+    Note: numeric 0 is NOT treated as placeholder — 0 can be a valid value
+    (e.g. bias_ma5 = 0.0%, MACD bar = 0).
+    For chip_structure fields, use ``_is_chip_value_placeholder()`` which
+    additionally treats numeric 0 as placeholder.
+    """
     if v is None:
         return True
-    if isinstance(v, (int, float)) and v == 0:
-        return True
+    if isinstance(v, (int, float)):
+        return False
     s = str(v).strip().lower()
     return s in ("", "n/a", "na", "数据缺失", "未知")
 
@@ -582,6 +589,19 @@ def _build_chip_structure_from_data(chip_data: Any) -> Dict[str, Any]:
     }
 
 
+def _is_chip_value_placeholder(v: Any) -> bool:
+    """Like _is_value_placeholder but also treats numeric 0 as placeholder.
+
+    For chip_structure fields the LLM outputs ``0`` when it has no data,
+    so zero should be treated as "needs to be filled from real data source".
+    """
+    if _is_value_placeholder(v):
+        return True
+    if isinstance(v, (int, float)) and v == 0:
+        return True
+    return False
+
+
 def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> None:
     """When chip_data exists, fill chip_structure placeholder fields from chip_data (in-place)."""
     if not result or not chip_data:
@@ -598,7 +618,7 @@ def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> N
         # Start from a copy of cs to preserve any extra keys the LLM may have added
         merged = dict(cs)
         for k in _CHIP_KEYS:
-            if _is_value_placeholder(merged.get(k)):
+            if _is_chip_value_placeholder(merged.get(k)):
                 merged[k] = filled[k]
         if merged != cs:
             dp["chip_structure"] = merged
@@ -646,7 +666,10 @@ def fill_price_position_if_needed(
             rq = realtime_quote if isinstance(realtime_quote, dict) else (
                 realtime_quote.to_dict() if hasattr(realtime_quote, "to_dict") else {}
             )
-            if _is_value_placeholder(computed.get("current_price")):
+            # current_price == 0 is always invalid (stock price cannot be zero),
+            # so treat it as placeholder even though generic _is_value_placeholder
+            # no longer considers numeric 0 as placeholder.
+            if _is_value_placeholder(computed.get("current_price")) or computed.get("current_price") == 0:
                 computed["current_price"] = rq.get("price")
 
         filled = False
@@ -1590,6 +1613,10 @@ class GeminiAnalyzer:
         today = context.get('today', {})
         market_context_block = self._build_market_context_block(context)
         
+        # Determine currency label based on market
+        market = self._resolve_market_context(context).get("market", "cn")
+        currency = {"cn": "元", "hk": "港元", "us": "美元"}.get(market, "元")
+        
         # ========== 构建决策仪表盘格式的输入 ==========
         prompt = f"""# 决策仪表盘分析请求
 
@@ -1611,13 +1638,13 @@ class GeminiAnalyzer:
 ### 今日行情
 | 指标 | 数值 |
 |------|------|
-| 收盘价 | {today.get('close', 'N/A')} 元 |
-| 开盘价 | {today.get('open', 'N/A')} 元 |
-| 最高价 | {today.get('high', 'N/A')} 元 |
-| 最低价 | {today.get('low', 'N/A')} 元 |
+| 收盘价 | {today.get('close', 'N/A')} {currency} |
+| 开盘价 | {today.get('open', 'N/A')} {currency} |
+| 最高价 | {today.get('high', 'N/A')} {currency} |
+| 最低价 | {today.get('low', 'N/A')} {currency} |
 | 涨跌幅 | {today.get('pct_chg', 'N/A')}% |
-| 成交量 | {self._format_volume(today.get('volume'))} |
-| 成交额 | {self._format_amount(today.get('amount'))} |
+| 成交量 | {self._format_volume(today.get('volume'), market)} |
+| 成交额 | {self._format_amount(today.get('amount'), currency)} |
 
 ### 均线系统（关键判断指标）
 | 均线 | 数值 | 说明 |
@@ -1631,17 +1658,20 @@ class GeminiAnalyzer:
         # 添加实时行情数据（量比、换手率等）
         if 'realtime' in context:
             rt = context['realtime']
+            session_label = context.get('session_label', '')
             prompt += f"""
 ### 实时行情增强数据
+> **数据时效**：{session_label}
+
 | 指标 | 数值 | 解读 |
 |------|------|------|
-| 当前价格 | {rt.get('price', 'N/A')} 元 | |
+| 当前价格 | {rt.get('price', 'N/A')} {currency} | |
 | **量比** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
 | **换手率** | **{rt.get('turnover_rate', 'N/A')}%** | |
 | 市盈率(动态) | {rt.get('pe_ratio', 'N/A')} | |
 | 市净率 | {rt.get('pb_ratio', 'N/A')} | |
-| 总市值 | {self._format_amount(rt.get('total_mv'))} | |
-| 流通市值 | {self._format_amount(rt.get('circ_mv'))} | |
+| 总市值 | {self._format_amount(rt.get('total_mv'), currency)} | |
+| 流通市值 | {self._format_amount(rt.get('circ_mv'), currency)} | |
 | 60日涨跌幅 | {rt.get('change_60d', 'N/A')}% | 中期表现 |
 """
         
@@ -1654,7 +1684,7 @@ class GeminiAnalyzer:
 | 指标 | 数值 | 健康标准 |
 |------|------|----------|
 | **获利比例** | **{profit_ratio:.1%}** | 70-90%时警惕 |
-| 平均成本 | {chip.get('avg_cost', 'N/A')} 元 | 现价应高于5-15% |
+| 平均成本 | {chip.get('avg_cost', 'N/A')} {currency} | 现价应高于5-15% |
 | 90%筹码集中度 | {chip.get('concentration_90', 0):.2%} | <15%为集中 |
 | 70%筹码集中度 | {chip.get('concentration_70', 0):.2%} | |
 | 筹码状态 | {chip.get('chip_status', '未知')} | |
@@ -1705,7 +1735,20 @@ class GeminiAnalyzer:
 - 成交量较昨日变化：{volume_change}倍
 - 价格较昨日变化：{context.get('price_change_ratio', 'N/A')}%
 """
-        
+
+        # 添加历史K线数据（用于中期趋势判断：触底反弹 vs 高位回调）
+        history = context.get('history')
+        if history and len(history) > 0:
+            prompt += f"""
+### 近{len(history)}日历史K线（用于判断中期趋势、触底反弹或高位回调）
+| 日期 | 开盘 | 最高 | 最低 | 收盘 | 涨跌幅 |
+|------|------|------|------|------|--------|
+"""
+            for bar in history:
+                pct = bar.get('pct_chg')
+                pct_str = f"{pct:+.2f}%" if pct is not None else "N/A"
+                prompt += f"| {bar.get('date', '')} | {bar.get('open', 'N/A')} | {bar.get('high', 'N/A')} | {bar.get('low', 'N/A')} | {bar.get('close', 'N/A')} | {pct_str} |\n"
+
         # 添加新闻搜索结果（重点区域）
         prompt += """
 ---
@@ -1772,10 +1815,18 @@ class GeminiAnalyzer:
         
         return prompt
     
-    def _format_volume(self, volume: Optional[float]) -> str:
-        """格式化成交量显示"""
+    def _format_volume(self, volume: Optional[float], market: str = "cn") -> str:
+        """格式化成交量显示（市场感知）"""
         if volume is None:
             return 'N/A'
+        if market == "us":
+            if volume >= 1e6:
+                return f"{volume / 1e6:.2f}M shares"
+            elif volume >= 1e3:
+                return f"{volume / 1e3:.2f}K shares"
+            else:
+                return f"{volume:.0f} shares"
+        # cn / hk 使用中文单位
         if volume >= 1e8:
             return f"{volume / 1e8:.2f} 亿股"
         elif volume >= 1e4:
@@ -1783,16 +1834,16 @@ class GeminiAnalyzer:
         else:
             return f"{volume:.0f} 股"
     
-    def _format_amount(self, amount: Optional[float]) -> str:
-        """格式化成交额显示"""
+    def _format_amount(self, amount: Optional[float], currency: str = "元") -> str:
+        """格式化成交额显示（支持多币种标签）"""
         if amount is None:
             return 'N/A'
         if amount >= 1e8:
-            return f"{amount / 1e8:.2f} 亿元"
+            return f"{amount / 1e8:.2f} 亿{currency}"
         elif amount >= 1e4:
-            return f"{amount / 1e4:.2f} 万元"
+            return f"{amount / 1e4:.2f} 万{currency}"
         else:
-            return f"{amount:.0f} 元"
+            return f"{amount:.0f} {currency}"
 
     def _format_percent(self, value: Optional[float]) -> str:
         """格式化百分比显示"""
@@ -1871,7 +1922,8 @@ class GeminiAnalyzer:
 3. 量能是否配合（缩量回调/放量突破）？
 4. 筹码结构是否健康？
 5. 消息面有无重大利空？（减持、处罚、业绩变脸、政策利空等）
-6. 是否存在涨停/交易约束/T+1 等执行层限制，导致“理论买点”在实盘中未必可成交？"""
+6. 是否存在涨停/交易约束/T+1 等执行层限制，导致“理论买点”在实盘中未必可成交？
+7. 是否为特殊交易规则股票？ST股涨跌停 ±5%，科创板/创业板 ±20%，北交所 ±30%——乖离率阈值需相应调整。"""
 
     def _build_market_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """构建当日行情快照（展示用）"""
@@ -1897,6 +1949,8 @@ class GeminiAnalyzer:
             except (TypeError, ValueError):
                 change_amount = None
 
+        market = self._resolve_market_context(context).get("market", "cn")
+        currency = {"cn": "元", "hk": "港元", "us": "美元"}.get(market, "元")
         snapshot = {
             "date": context.get('date', '未知'),
             "close": self._format_price(close),
@@ -1907,8 +1961,8 @@ class GeminiAnalyzer:
             "pct_chg": self._format_percent(today.get('pct_chg')),
             "change_amount": self._format_price(change_amount),
             "amplitude": self._format_percent(amplitude),
-            "volume": self._format_volume(today.get('volume')),
-            "amount": self._format_amount(today.get('amount')),
+            "volume": self._format_volume(today.get('volume'), market),
+            "amount": self._format_amount(today.get('amount'), currency),
         }
 
         if realtime:

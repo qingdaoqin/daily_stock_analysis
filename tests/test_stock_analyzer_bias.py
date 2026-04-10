@@ -198,7 +198,7 @@ class StockAnalyzerBiasTestCase(unittest.TestCase):
         result = _make_result(
             code="0700",
             trend_status=TrendStatus.BULL,
-            bias_ma5=6.5,
+            bias_ma5=11.0,
         )
         self.analyzer._generate_signal(result)
         self._assert_contains(result.risk_factors, "不宜重仓追价")

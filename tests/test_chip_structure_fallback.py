@@ -32,9 +32,10 @@ class TestIsValuePlaceholder(unittest.TestCase):
     def test_none_is_placeholder(self) -> None:
         self.assertTrue(_is_value_placeholder(None))
 
-    def test_zero_is_placeholder(self) -> None:
-        self.assertTrue(_is_value_placeholder(0))
-        self.assertTrue(_is_value_placeholder(0.0))
+    def test_zero_is_not_placeholder(self) -> None:
+        # Numeric 0 is a valid value (e.g. bias_ma5 = 0.0, MACD bar = 0)
+        self.assertFalse(_is_value_placeholder(0))
+        self.assertFalse(_is_value_placeholder(0.0))
 
     def test_empty_string_is_placeholder(self) -> None:
         self.assertTrue(_is_value_placeholder(""))

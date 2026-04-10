@@ -17,6 +17,7 @@
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Dict, Any, List
 from enum import Enum
@@ -26,6 +27,7 @@ import numpy as np
 
 from src.config import get_config
 from src.core.trading_calendar import get_market_for_stock
+from data_provider.base import is_st_stock, is_kc_cy_stock, is_bse_code
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +206,7 @@ class StockTrendAnalyzer:
         pass
 
     @staticmethod
-    def _resolve_market_profile(code: str) -> Dict[str, Any]:
+    def _resolve_market_profile(code: str, stock_name: str = "") -> Dict[str, Any]:
         market = get_market_for_stock(code) or "cn"
         profile = {
             "cn": {
@@ -223,8 +225,8 @@ class StockTrendAnalyzer:
                 "support_ma10_reason": "MA10支撑有效",
             },
             "hk": {
-                "base_threshold_floor": 6.0,
-                "strong_multiplier": 1.45,
+                "base_threshold_floor": 10.0,
+                "strong_multiplier": 1.5,
                 "near_ma_reason": "可结合公告/回踩确认再介入",
                 "slightly_high_reason": "可少量跟踪，但更适合等公告或回踩确认",
                 "high_bias_risk": "不宜重仓追价，等待回踩或公告确认",
@@ -238,7 +240,7 @@ class StockTrendAnalyzer:
                 "support_ma10_reason": "关键支撑位附近企稳，可作为回测确认",
             },
             "us": {
-                "base_threshold_floor": 7.0,
+                "base_threshold_floor": 15.0,
                 "strong_multiplier": 1.6,
                 "near_ma_reason": "回踩后可考虑分批跟踪",
                 "slightly_high_reason": "趋势延续可轻仓跟踪，避免一次性追价",
@@ -255,20 +257,38 @@ class StockTrendAnalyzer:
         }
         resolved = dict(profile.get(market, profile["cn"]))
         resolved["market"] = market
+
+        # A-share sub-type adjustments: ST(±5%), 科创板/创业板(±20%), 北交所(±30%)
+        if market == "cn":
+            if is_st_stock(stock_name):
+                resolved["base_threshold_floor"] = 3.0
+                resolved["strong_multiplier"] = 1.3
+                resolved["high_bias_risk"] = "ST 股涨跌停仅 ±5%，严禁追高！"
+            elif is_bse_code(code):
+                resolved["base_threshold_floor"] = 10.0
+                resolved["strong_multiplier"] = 1.6
+                resolved["high_bias_risk"] = "北交所涨跌幅 ±30%，高乖离率风险极大！"
+            elif is_kc_cy_stock(code):
+                resolved["base_threshold_floor"] = 8.0
+                resolved["strong_multiplier"] = 1.6
+                resolved["high_bias_risk"] = "科创板/创业板涨跌幅 ±20%，注意追高风险！"
+
         return resolved
     
-    def analyze(self, df: pd.DataFrame, code: str) -> TrendAnalysisResult:
+    def analyze(self, df: pd.DataFrame, code: str, stock_name: str = "") -> TrendAnalysisResult:
         """
         分析股票趋势
         
         Args:
             df: 包含 OHLCV 数据的 DataFrame
             code: 股票代码
+            stock_name: 股票名称（用于判断 ST 等特殊类型）
             
         Returns:
             TrendAnalysisResult 分析结果
         """
         result = TrendAnalysisResult(code=code)
+        result._stock_name = stock_name  # 暂存以便 _generate_signal 使用
         
         if df is None or df.empty or len(df) < 20:
             logger.warning(f"{code} 数据不足，无法进行趋势分析")
@@ -291,7 +311,8 @@ class StockTrendAnalyzer:
         result.ma5 = float(latest['MA5'])
         result.ma10 = float(latest['MA10'])
         result.ma20 = float(latest['MA20'])
-        result.ma60 = float(latest.get('MA60', 0))
+        _ma60_raw = latest.get('MA60', 0)
+        result.ma60 = 0.0 if (pd.isna(_ma60_raw)) else float(_ma60_raw)
 
         # 1. 趋势判断
         self._analyze_trend(df, result)
@@ -325,7 +346,10 @@ class StockTrendAnalyzer:
         if len(df) >= 60:
             df['MA60'] = df['close'].rolling(window=60).mean()
         else:
-            df['MA60'] = df['MA20']  # 数据不足时使用 MA20 替代
+            # 数据不足时 MA60 设为 NaN，避免误报为 MA20
+            # analyze() converts NaN → 0.0 when reading result.ma60
+            df['MA60'] = float('nan')
+            logger.debug("数据不足 60 条（当前 %d 条），MA60 设为 NaN", len(df))
         return df
 
     def _calculate_macd(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -358,11 +382,15 @@ class StockTrendAnalyzer:
 
     def _calculate_rsi(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        计算 RSI 指标
+        计算 RSI 指标（Wilder's smoothing）
+
+        使用 Wilder 平滑移动平均（EWM alpha=1/n），与主流行情软件
+        （TradingView、Wind、通达信）一致。
 
         公式：
         - RS = 平均上涨幅度 / 平均下跌幅度
         - RSI = 100 - (100 / (1 + RS))
+        - 当 avg_loss == 0 时，RSI = 100（纯上涨周期）
         """
         df = df.copy()
 
@@ -374,15 +402,17 @@ class StockTrendAnalyzer:
             gain = delta.where(delta > 0, 0)
             loss = -delta.where(delta < 0, 0)
 
-            # 计算平均涨跌幅
-            avg_gain = gain.rolling(window=period).mean()
-            avg_loss = loss.rolling(window=period).mean()
+            # 使用 Wilder's smoothing（EWM with alpha=1/period）
+            avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+            avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
 
-            # 计算 RS 和 RSI
-            rs = avg_gain / avg_loss
+            # 计算 RS 和 RSI，显式处理 avg_loss == 0（纯上涨）的情况
+            rs = avg_gain / avg_loss.replace(0, float('nan'))
             rsi = 100 - (100 / (1 + rs))
+            # avg_loss == 0 → RS = inf → RSI = 100
+            rsi = rsi.where(avg_loss != 0, 100.0)
 
-            # 填充 NaN 值
+            # 填充 NaN 值（数据不足时的起始段）
             rsi = rsi.fillna(50)  # 默认中性值
 
             # 添加到 DataFrame
@@ -471,7 +501,12 @@ class StockTrendAnalyzer:
             return
         
         latest = df.iloc[-1]
-        vol_5d_avg = df['volume'].iloc[-6:-1].mean()
+        # 前5个交易日的均量（不包含今日），需至少6行数据
+        if len(df) >= 6:
+            vol_5d_avg = df['volume'].iloc[-6:-1].mean()
+        else:
+            # 数据不足6行时，用除今日外的所有历史均量
+            vol_5d_avg = df['volume'].iloc[:-1].mean()
         
         if vol_5d_avg > 0:
             result.volume_ratio_5d = float(latest['volume']) / vol_5d_avg
@@ -671,16 +706,18 @@ class StockTrendAnalyzer:
 
         # === 乖离率评分（20分，强势趋势补偿）===
         bias = result.bias_ma5
-        if bias != bias or bias is None:  # NaN or None defense
+        if bias is None or (isinstance(bias, float) and math.isnan(bias)):
             bias = 0.0
-        market_profile = self._resolve_market_profile(result.code)
+        market_profile = self._resolve_market_profile(result.code, getattr(result, '_stock_name', ''))
         base_threshold = max(
             float(get_config().bias_threshold),
             float(market_profile["base_threshold_floor"]),
         )
 
         # Strong trend compensation: relax threshold for STRONG_BULL with high strength
-        trend_strength = result.trend_strength if result.trend_strength == result.trend_strength else 0.0
+        trend_strength = result.trend_strength
+        if trend_strength is None or (isinstance(trend_strength, float) and math.isnan(trend_strength)):
+            trend_strength = 0.0
         if result.trend_status == TrendStatus.STRONG_BULL and (trend_strength or 0) >= 70:
             effective_threshold = base_threshold * float(market_profile["strong_multiplier"])
             is_strong_trend = True

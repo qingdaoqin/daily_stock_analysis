@@ -26,6 +26,7 @@ AkshareFetcher - 主数据源 (Priority 1)
 import logging
 import os
 import random
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -82,6 +83,7 @@ _realtime_cache: Dict[str, Any] = {
     'timestamp': 0,
     'ttl': 1200  # 20分钟缓存有效期
 }
+_realtime_cache_lock = threading.Lock()
 
 # ETF 实时行情缓存
 _etf_realtime_cache: Dict[str, Any] = {
@@ -89,6 +91,14 @@ _etf_realtime_cache: Dict[str, Any] = {
     'timestamp': 0,
     'ttl': 1200  # 20分钟缓存有效期
 }
+_etf_realtime_cache_lock = threading.Lock()
+
+# Lock for one-time requests.Session monkey-patch (UA injection).
+# Note: the patch modifies requests.Session.__init__ globally (process-wide),
+# so all Session instances — including those created by other libraries —
+# will inherit the rotated User-Agent.  The prefix "dsa" stands for
+# "daily_stock_analysis" to namespace the injected attributes.
+_ua_patch_lock = threading.Lock()
 
 
 def _is_etf_code(stock_code: str) -> bool:
@@ -286,14 +296,25 @@ class AkshareFetcher(BaseFetcher):
         """
         设置随机 User-Agent
         
-        通过修改 requests Session 的 headers 实现
-        这是关键的反爬策略之一
+        通过 monkey-patch requests.Session 的默认 headers 实现反爬策略。
+        akshare 内部为每次请求创建新 Session，因此需要在类级别设置默认 headers。
         """
         try:
-            import akshare as ak
-            # akshare 内部使用 requests，我们通过环境变量或直接设置来影响
-            # 实际上 akshare 可能不直接暴露 session，这里通过 fake_useragent 作为补充
             random_ua = random.choice(USER_AGENTS)
+            # Patch requests.Session.__init__ once so that every new Session
+            # created by akshare/efinance automatically inherits the UA.
+            with _ua_patch_lock:
+                if not hasattr(requests.Session, '_original_init_dsa'):
+                    requests.Session._original_init_dsa = requests.Session.__init__
+
+                    def _patched_init(self_session, *args, **kwargs):
+                        requests.Session._original_init_dsa(self_session, *args, **kwargs)
+                        ua = getattr(requests.Session, '_dsa_user_agent', None)
+                        if ua:
+                            self_session.headers['User-Agent'] = ua
+
+                    requests.Session.__init__ = _patched_init
+                requests.Session._dsa_user_agent = random_ua
             logger.debug(f"设置 User-Agent: {random_ua[:50]}...")
         except Exception as e:
             logger.debug(f"设置 User-Agent 失败: {e}")
@@ -835,15 +856,21 @@ class AkshareFetcher(BaseFetcher):
         source_key = "akshare_em"
         
         try:
-            # 检查缓存
+            # 检查缓存（线程安全：仅在锁内读/写缓存字典，网络请求在锁外）
             current_time = time.time()
-            if (_realtime_cache['data'] is not None and 
-                current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
-                df = _realtime_cache['data']
-                cache_age = int(current_time - _realtime_cache['timestamp'])
-                logger.debug(f"[缓存命中] A股实时行情(东财) - 缓存年龄 {cache_age}s/{_realtime_cache['ttl']}s")
-            else:
-                # 触发全量刷新
+            need_refresh = False
+            with _realtime_cache_lock:
+                if (_realtime_cache['data'] is not None and 
+                    current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
+                    df = _realtime_cache['data']
+                    cache_age = int(current_time - _realtime_cache['timestamp'])
+                    logger.debug(f"[缓存命中] A股实时行情(东财) - 缓存年龄 {cache_age}s/{_realtime_cache['ttl']}s")
+                else:
+                    need_refresh = True
+                    df = None
+
+            if need_refresh:
+                # 网络 I/O 在锁外执行，避免阻塞其他线程
                 logger.info(f"[缓存未命中] 触发全量刷新 A股实时行情(东财)")
                 last_error: Optional[Exception] = None
                 df = None
@@ -873,8 +900,9 @@ class AkshareFetcher(BaseFetcher):
                     logger.error(f"[API错误] ak.stock_zh_a_spot_em 最终失败: {last_error}")
                     circuit_breaker.record_failure(source_key, str(last_error))
                     df = pd.DataFrame()
-                _realtime_cache['data'] = df
-                _realtime_cache['timestamp'] = current_time
+                with _realtime_cache_lock:
+                    _realtime_cache['data'] = df
+                    _realtime_cache['timestamp'] = current_time
                 logger.info(f"[缓存更新] A股实时行情(东财) 缓存已刷新，TTL={_realtime_cache['ttl']}s")
 
             if df is None or df.empty:
@@ -1243,13 +1271,19 @@ class AkshareFetcher(BaseFetcher):
         source_key = "akshare_etf"
         
         try:
-            # 检查缓存
+            # 检查缓存（线程安全：仅在锁内读/写缓存字典，网络请求在锁外）
             current_time = time.time()
-            if (_etf_realtime_cache['data'] is not None and 
-                current_time - _etf_realtime_cache['timestamp'] < _etf_realtime_cache['ttl']):
-                df = _etf_realtime_cache['data']
-                logger.debug(f"[缓存命中] 使用缓存的ETF实时行情数据")
-            else:
+            need_refresh = False
+            with _etf_realtime_cache_lock:
+                if (_etf_realtime_cache['data'] is not None and 
+                    current_time - _etf_realtime_cache['timestamp'] < _etf_realtime_cache['ttl']):
+                    df = _etf_realtime_cache['data']
+                    logger.debug(f"[缓存命中] 使用缓存的ETF实时行情数据")
+                else:
+                    need_refresh = True
+                    df = None
+
+            if need_refresh:
                 last_error: Optional[Exception] = None
                 df = None
                 for attempt in range(1, 3):
@@ -1277,8 +1311,9 @@ class AkshareFetcher(BaseFetcher):
                     logger.error(f"[API错误] ak.fund_etf_spot_em 最终失败: {last_error}")
                     circuit_breaker.record_failure(source_key, str(last_error))
                     df = pd.DataFrame()
-                _etf_realtime_cache['data'] = df
-                _etf_realtime_cache['timestamp'] = current_time
+                with _etf_realtime_cache_lock:
+                    _etf_realtime_cache['data'] = df
+                    _etf_realtime_cache['timestamp'] = current_time
 
             if df is None or df.empty:
                 logger.warning(f"[实时行情] ETF实时行情数据为空，跳过 {stock_code}")

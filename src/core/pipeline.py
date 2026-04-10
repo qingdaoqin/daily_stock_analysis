@@ -237,9 +237,9 @@ class StockAnalysisPipeline:
                 logger.info(f"{stock_name}({code}) 今日数据已存在，跳过获取（断点续传）")
                 return True, None
 
-            # 从数据源获取数据
+            # 从数据源获取数据（拉取足够天数以支持 MA60 + 历史分析窗口）
             logger.info(f"{stock_name}({code}) 开始从数据源获取数据...")
-            df, source_name = self.fetcher_manager.get_daily_data(code, days=30)
+            df, source_name = self.fetcher_manager.get_daily_data(code, days=120)
 
             if df is None or df.empty:
                 return False, "获取数据为空"
@@ -459,9 +459,10 @@ class StockAnalysisPipeline:
                     intel_results=intel_results,
                 )
 
-            # Step 5: 获取分析上下文（技术面数据）
+            # Step 5: 获取分析上下文（技术面数据 + 历史K线）
             analysis_date = get_market_today(get_market_for_stock(code))
-            context = self.db.get_analysis_context(code, target_date=analysis_date)
+            history_days = getattr(self.config, 'analysis_history_days', 60)
+            context = self.db.get_analysis_context(code, target_date=analysis_date, history_days=history_days)
 
             if context is None:
                 logger.warning(f"{stock_name}({code}) 无法获取历史行情数据，将仅基于新闻和实时行情分析")

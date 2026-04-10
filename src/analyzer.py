@@ -1732,7 +1732,20 @@ class GeminiAnalyzer:
 - 成交量较昨日变化：{volume_change}倍
 - 价格较昨日变化：{context.get('price_change_ratio', 'N/A')}%
 """
-        
+
+        # 添加历史K线数据（用于中期趋势判断：触底反弹 vs 高位回调）
+        history = context.get('history')
+        if history and len(history) > 0:
+            prompt += f"""
+### 近{len(history)}日历史K线（用于判断中期趋势、触底反弹或高位回调）
+| 日期 | 开盘 | 最高 | 最低 | 收盘 | 涨跌幅 |
+|------|------|------|------|------|--------|
+"""
+            for bar in history:
+                pct = bar.get('pct_chg')
+                pct_str = f"{pct:+.2f}%" if pct is not None else "N/A"
+                prompt += f"| {bar.get('date', '')} | {bar.get('open', 'N/A')} | {bar.get('high', 'N/A')} | {bar.get('low', 'N/A')} | {bar.get('close', 'N/A')} | {pct_str} |\n"
+
         # 添加新闻搜索结果（重点区域）
         prompt += """
 ---

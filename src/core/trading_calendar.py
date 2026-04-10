@@ -178,7 +178,7 @@ def compute_effective_region(
     Compute effective market review region given config and open markets.
 
     Args:
-        config_region: From MARKET_REVIEW_REGION ('cn' | 'hk' | 'us' | 'both' | 'all')
+        config_region: From MARKET_REVIEW_REGION ('cn' | 'hk' | 'us' | 'both' | 'all' | 'auto')
         open_markets: Markets open today
 
     Returns:
@@ -186,6 +186,9 @@ def compute_effective_region(
         '': all relevant markets closed, skip market review
         'cn' | 'hk' | 'us' | 'both' | 'all': effective subset for today
     """
+    # 'auto' behaves like 'all' — review whichever markets are open today
+    if config_region == "auto":
+        config_region = "all"
     if config_region not in ("cn", "hk", "us", "both", "all"):
         config_region = "cn"
     if config_region == "cn":

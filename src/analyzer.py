@@ -1658,8 +1658,11 @@ class GeminiAnalyzer:
         # 添加实时行情数据（量比、换手率等）
         if 'realtime' in context:
             rt = context['realtime']
+            session_label = context.get('session_label', '')
             prompt += f"""
 ### 实时行情增强数据
+> **数据时效**：{session_label}
+
 | 指标 | 数值 | 解读 |
 |------|------|------|
 | 当前价格 | {rt.get('price', 'N/A')} {currency} | |

@@ -39,7 +39,7 @@ from src.search_service import SearchService
 from src.services.analysis_calibration_service import AnalysisCalibrationService
 from src.enums import ReportType
 from src.stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
-from src.core.trading_calendar import get_market_for_stock, get_market_today, is_market_open
+from src.core.trading_calendar import get_market_for_stock, get_market_today, is_market_open, get_market_session, get_session_label
 from bot.models import BotMessage
 
 
@@ -293,7 +293,9 @@ class StockAnalysisPipeline:
                     # 兼容不同数据源的字段（有些数据源可能没有 volume_ratio）
                     volume_ratio = getattr(realtime_quote, 'volume_ratio', None)
                     turnover_rate = getattr(realtime_quote, 'turnover_rate', None)
-                    logger.info(f"{stock_name}({code}) 实时行情: 价格={realtime_quote.price}, "
+                    session = get_market_session(get_market_for_stock(code))
+                    session_tag = {"pre_market": "[盘前]", "trading": "[盘中]", "post_market": "[盘后]", "closed": "[休市]"}.get(session, "")
+                    logger.info(f"{stock_name}({code}) 实时行情{session_tag}: 价格={realtime_quote.price}, "
                               f"量比={volume_ratio}, 换手率={turnover_rate}% "
                               f"(来源: {realtime_quote.source.value if hasattr(realtime_quote, 'source') else 'unknown'})")
                 else:
@@ -705,6 +707,9 @@ class StockAnalysisPipeline:
             else fallback_market_context
         )
         enhanced["market"] = enhanced["market_context"].get("market", market_tag)
+
+        # Improvement 3+4: inject market session label so LLM knows data timeliness
+        enhanced["session_label"] = get_session_label(market_tag)
 
         # P0: append unified fundamental block; keep as additional context only
         enhanced["fundamental_context"] = (
@@ -1305,12 +1310,24 @@ class StockAnalysisPipeline:
         logger.info(f"股票列表: {', '.join(stock_codes)}")
         logger.info(f"并发数: {self.max_workers}, 模式: {'仅获取数据' if dry_run else '完整分析'}")
         
-        # === 批量预取实时行情（优化：避免每只股票都触发全量拉取）===
+        # === 批量预取实时行情（优化：按市场分组，避免跨市场缓存污染）===
         # 只有股票数量 >= 5 时才进行预取，少量股票直接逐个查询更高效
         if len(stock_codes) >= 5:
-            prefetch_count = self.fetcher_manager.prefetch_realtime_quotes(stock_codes)
-            if prefetch_count > 0:
-                logger.info(f"已启用批量预取架构：一次拉取全市场数据，{len(stock_codes)} 只股票共享缓存")
+            # Group by market so that A-share prefetch only triggers CN sources
+            from collections import defaultdict
+            market_groups: dict = defaultdict(list)
+            for sc in stock_codes:
+                mkt = get_market_for_stock(sc) or "cn"
+                market_groups[mkt].append(sc)
+            total_prefetch = 0
+            for mkt, codes_in_market in market_groups.items():
+                if len(codes_in_market) >= 2:
+                    count = self.fetcher_manager.prefetch_realtime_quotes(codes_in_market)
+                    total_prefetch += count
+                    if count > 0:
+                        logger.info(f"[{mkt}] 批量预取 {len(codes_in_market)} 只股票行情 → 缓存 {count} 条")
+            if total_prefetch > 0:
+                logger.info(f"已启用按市场分组预取架构：{len(stock_codes)} 只股票，{len(market_groups)} 个市场")
 
         # Issue #455: 预取股票名称，避免并发分析时显示「股票xxxxx」
         # dry_run 仅做数据拉取，不需要名称预取，避免额外网络开销

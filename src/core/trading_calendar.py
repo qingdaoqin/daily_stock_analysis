@@ -171,6 +171,74 @@ def get_market_today(market: Optional[str]) -> date:
         return date.today()
 
 
+# Market trading-hour windows (local time, half-open: [start, end))
+# Used for session labelling; not for gating logic (is_market_open handles that).
+_MARKET_HOURS = {
+    "cn": {"pre_start": 9, "open_start": 9.5, "close_end": 15, "post_end": 15.5},
+    "hk": {"pre_start": 9, "open_start": 9.5, "close_end": 16, "post_end": 16.5},
+    "us": {"pre_start": 4, "open_start": 9.5, "close_end": 16, "post_end": 20},
+}
+
+
+def get_market_session(market: Optional[str]) -> str:
+    """
+    Return a label describing the current trading session for the given market.
+
+    Returns one of:
+        'pre_market'  – before regular trading hours but within pre-market window
+        'trading'     – regular trading hours (market open)
+        'post_market' – after close but within extended hours
+        'closed'      – outside all windows or non-trading day
+
+    Fail-open: returns 'unknown' if market is unrecognised or timezone fails.
+    """
+    if not market or market not in MARKET_TIMEZONE:
+        return "unknown"
+
+    hours = _MARKET_HOURS.get(market)
+    if not hours:
+        return "unknown"
+
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(MARKET_TIMEZONE[market])
+        now = datetime.now(tz)
+        today = now.date()
+
+        # Non-trading day → closed regardless of clock
+        if not is_market_open(market, today):
+            return "closed"
+
+        fractional_hour = now.hour + now.minute / 60.0
+        if fractional_hour < hours["pre_start"]:
+            return "closed"
+        if fractional_hour < hours["open_start"]:
+            return "pre_market"
+        if fractional_hour < hours["close_end"]:
+            return "trading"
+        if fractional_hour < hours["post_end"]:
+            return "post_market"
+        return "closed"
+    except Exception as e:
+        logger.warning("get_market_session fail-open for %s: %s", market, e)
+        return "unknown"
+
+
+_SESSION_LABEL = {
+    "pre_market": "⏳ 盘前数据（尚未开盘，以下为前一交易日收盘价或盘前价）",
+    "trading": "📈 盘中实时数据",
+    "post_market": "🔒 盘后数据（已收盘）",
+    "closed": "🔒 休市数据（非交易日或交易时段外）",
+    "unknown": "ℹ️ 数据时效未知",
+}
+
+
+def get_session_label(market: Optional[str]) -> str:
+    """Return a human-readable Chinese label for the current market session."""
+    session = get_market_session(market)
+    return _SESSION_LABEL.get(session, _SESSION_LABEL["unknown"])
+
+
 def compute_effective_region(
     config_region: str, open_markets: Set[str]
 ) -> Optional[str]:

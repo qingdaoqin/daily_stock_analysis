@@ -2527,7 +2527,7 @@ class SearchService:
         if market == "us":
             if is_index_etf:
                 search_dimensions = [
-                    {'name': 'latest_news', 'query': f"{stock_name} {stock_code} latest news events", 'desc': '最新消息'},
+                    {'name': 'latest_news', 'query': f"{stock_name} {stock_code} latest news events past 24 hours", 'desc': '最新消息'},
                     {
                         'name': 'event_calendar',
                         'query': (
@@ -2553,7 +2553,7 @@ class SearchService:
                 ]
             else:
                 search_dimensions = [
-                    {'name': 'latest_news', 'query': f"{stock_name} {stock_code} latest news events", 'desc': '最新消息'},
+                    {'name': 'latest_news', 'query': f"{stock_name} {stock_code} latest news events past 24 hours", 'desc': '最新消息'},
                     {
                         'name': 'official_filings',
                         'query': (
@@ -2606,7 +2606,7 @@ class SearchService:
                     })
         elif market == "hk":
             search_dimensions = [
-                {'name': 'latest_news', 'query': f"{stock_name} {stock_code} 最新 消息 公告", 'desc': '最新消息'},
+                {'name': 'latest_news', 'query': f"{stock_name} {stock_code} 最新 消息 公告 24小时内", 'desc': '最新消息'},
                 {
                     'name': 'official_announcements',
                     'query': (
@@ -2638,7 +2638,7 @@ class SearchService:
             ]
         else:
             search_dimensions = [
-                {'name': 'latest_news', 'query': f"{stock_name} {stock_code} 最新 新闻 重大 事件", 'desc': '最新消息'},
+                {'name': 'latest_news', 'query': f"{stock_name} {stock_code} 最新 新闻 重大 事件 24小时内", 'desc': '最新消息'},
                 {
                     'name': 'official_announcements',
                     'query': (

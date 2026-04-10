@@ -43,6 +43,15 @@ class ConfigIssue:
 _MANAGED_LITELLM_KEY_PROVIDERS = {"gemini", "vertex_ai", "anthropic", "openai", "deepseek"}
 SUPPORTED_LLM_CHANNEL_PROTOCOLS = ("openai", "anthropic", "gemini", "vertex_ai", "deepseek", "ollama")
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off"}
+AGENT_MAX_STEPS_DEFAULT = 10
+NEWS_STRATEGY_WINDOWS: Dict[str, int] = {
+    "ultra_short": 1,
+    "short": 3,
+    "medium": 7,
+    "long": 30,
+}
+
+logger = logging.getLogger(__name__)
 
 
 def parse_env_bool(value: Optional[str], default: bool = False) -> bool:
@@ -53,6 +62,93 @@ def parse_env_bool(value: Optional[str], default: bool = False) -> bool:
     if not normalized:
         return default
     return normalized not in _FALSEY_ENV_VALUES
+
+
+def parse_env_int(
+    value: Optional[str],
+    default: int,
+    *,
+    field_name: str,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
+    """Parse an integer env value with warning + fallback semantics."""
+    raw_value = value
+    if raw_value is None or not str(raw_value).strip():
+        parsed = int(default)
+    else:
+        try:
+            parsed = int(str(raw_value).strip())
+        except (TypeError, ValueError):
+            logger.warning(
+                "%s=%r is not a valid integer; falling back to %s",
+                field_name, raw_value, default,
+            )
+            parsed = int(default)
+
+    if minimum is not None and parsed < minimum:
+        logger.warning(
+            "%s=%r is below minimum %s; clamping to %s",
+            field_name, parsed, minimum, minimum,
+        )
+        parsed = minimum
+    if maximum is not None and parsed > maximum:
+        logger.warning(
+            "%s=%r is above maximum %s; clamping to %s",
+            field_name, parsed, maximum, maximum,
+        )
+        parsed = maximum
+    return parsed
+
+
+def parse_env_float(
+    value: Optional[str],
+    default: float,
+    *,
+    field_name: str,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> float:
+    """Parse a float env value with warning + fallback semantics."""
+    raw_value = value
+    if raw_value is None or not str(raw_value).strip():
+        parsed = float(default)
+    else:
+        try:
+            parsed = float(str(raw_value).strip())
+        except (TypeError, ValueError):
+            logger.warning(
+                "%s=%r is not a valid number; falling back to %s",
+                field_name, raw_value, default,
+            )
+            parsed = float(default)
+
+    if minimum is not None and parsed < minimum:
+        logger.warning(
+            "%s=%r is below minimum %s; clamping to %s",
+            field_name, parsed, minimum, minimum,
+        )
+        parsed = minimum
+    if maximum is not None and parsed > maximum:
+        logger.warning(
+            "%s=%r is above maximum %s; clamping to %s",
+            field_name, parsed, maximum, maximum,
+        )
+        parsed = maximum
+    return parsed
+
+
+def normalize_news_strategy_profile(value: Optional[str]) -> str:
+    """Normalize news strategy profile to known values."""
+    candidate = (value or "short").strip().lower()
+    return candidate if candidate in NEWS_STRATEGY_WINDOWS else "short"
+
+
+def resolve_news_window_days(news_max_age_days: int, news_strategy_profile: Optional[str]) -> int:
+    """Resolve effective news window days from profile and global max-age."""
+    profile = normalize_news_strategy_profile(news_strategy_profile)
+    profile_days = NEWS_STRATEGY_WINDOWS.get(profile, NEWS_STRATEGY_WINDOWS["short"])
+    return max(1, min(max(1, int(news_max_age_days)), profile_days))
 
 
 def canonicalize_llm_channel_protocol(value: Optional[str]) -> str:
@@ -232,6 +328,60 @@ def _uses_direct_env_provider(model: str) -> bool:
     return bool(provider) and provider not in _MANAGED_LITELLM_KEY_PROVIDERS
 
 
+def normalize_agent_litellm_model(
+    model: str,
+    configured_models: Optional[set] = None,
+) -> str:
+    """Normalize AGENT_LITELLM_MODEL while preserving configured router aliases."""
+    normalized_model = (model or "").strip()
+    if not normalized_model:
+        return ""
+    if "/" not in normalized_model:
+        if configured_models and normalized_model in configured_models:
+            return normalized_model
+        return f"openai/{normalized_model}"
+    return normalized_model
+
+
+def get_effective_agent_primary_model(config: "Config") -> str:
+    """Return the effective Agent primary model with fallback inheritance."""
+    configured_router_models = set(
+        get_configured_llm_models(getattr(config, "llm_model_list", []) or [])
+    )
+    configured_agent_model = normalize_agent_litellm_model(
+        getattr(config, "agent_litellm_model", ""),
+        configured_models=configured_router_models,
+    )
+    if configured_agent_model:
+        return configured_agent_model
+    return (getattr(config, "litellm_model", "") or "").strip()
+
+
+def get_effective_agent_models_to_try(config: "Config") -> List[str]:
+    """Return Agent model try-order: primary + global fallbacks (deduped)."""
+    configured_router_models = set(
+        get_configured_llm_models(getattr(config, "llm_model_list", []) or [])
+    )
+    raw_models = [get_effective_agent_primary_model(config)] + (
+        getattr(config, "litellm_fallback_models", []) or []
+    )
+    seen: set = set()
+    ordered_models: List[str] = []
+    for model in raw_models:
+        normalized_model = (model or "").strip()
+        if not normalized_model:
+            continue
+        dedupe_key = normalize_agent_litellm_model(
+            normalized_model,
+            configured_models=configured_router_models,
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        ordered_models.append(normalized_model)
+    return ordered_models
+
+
 def setup_env(override: bool = False):
     """
     Initialize environment variables from .env file.
@@ -340,13 +490,15 @@ class Config:
 
     # === 新闻与分析筛选配置 ===
     news_max_age_days: int = 3   # 新闻最大时效（天）
+    news_strategy_profile: str = "short"  # News window strategy: ultra_short/short/medium/long
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
     analysis_history_days: int = 60  # LLM 分析时发送的历史 K 线天数（默认 60 交易日）
 
     # === Agent 模式配置 ===
     agent_mode: bool = False
     _agent_mode_explicit: bool = False  # True when AGENT_MODE was explicitly set in env
-    agent_max_steps: int = 10
+    agent_litellm_model: str = ""  # Dedicated Agent LLM model; inherits from litellm_model when empty
+    agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT
     agent_skills: List[str] = field(default_factory=list)
     agent_strategy_dir: Optional[str] = None
     agent_nl_routing: bool = False  # Enable natural language routing in bot dispatcher
@@ -904,14 +1056,14 @@ class Config:
             gemini_api_key=os.getenv('GEMINI_API_KEY'),
             gemini_model=os.getenv('GEMINI_MODEL', 'gemini-3-flash-preview'),
             gemini_model_fallback=os.getenv('GEMINI_MODEL_FALLBACK', 'gemini-2.5-flash'),
-            gemini_temperature=float(os.getenv('GEMINI_TEMPERATURE', '0.7')),
-            gemini_request_delay=float(os.getenv('GEMINI_REQUEST_DELAY', '2.0')),
-            gemini_max_retries=int(os.getenv('GEMINI_MAX_RETRIES', '5')),
-            gemini_retry_delay=float(os.getenv('GEMINI_RETRY_DELAY', '5.0')),
+            gemini_temperature=parse_env_float(os.getenv('GEMINI_TEMPERATURE'), 0.7, field_name='GEMINI_TEMPERATURE'),
+            gemini_request_delay=parse_env_float(os.getenv('GEMINI_REQUEST_DELAY'), 2.0, field_name='GEMINI_REQUEST_DELAY', minimum=0.0),
+            gemini_max_retries=parse_env_int(os.getenv('GEMINI_MAX_RETRIES'), 5, field_name='GEMINI_MAX_RETRIES', minimum=0),
+            gemini_retry_delay=parse_env_float(os.getenv('GEMINI_RETRY_DELAY'), 5.0, field_name='GEMINI_RETRY_DELAY', minimum=0.0),
             anthropic_api_key=os.getenv('ANTHROPIC_API_KEY'),
             anthropic_model=os.getenv('ANTHROPIC_MODEL', 'claude-3-5-sonnet-20241022'),
-            anthropic_temperature=float(os.getenv('ANTHROPIC_TEMPERATURE', '0.7')),
-            anthropic_max_tokens=int(os.getenv('ANTHROPIC_MAX_TOKENS', '8192')),
+            anthropic_temperature=parse_env_float(os.getenv('ANTHROPIC_TEMPERATURE'), 0.7, field_name='ANTHROPIC_TEMPERATURE'),
+            anthropic_max_tokens=parse_env_int(os.getenv('ANTHROPIC_MAX_TOKENS'), 8192, field_name='ANTHROPIC_MAX_TOKENS', minimum=1),
             # AIHubmix is the preferred OpenAI-compatible provider (one key, all models, no VPN required).
             # Within the OpenAI-compatible layer: AIHUBMIX_KEY takes priority over OPENAI_API_KEY.
             # Overall provider fallback order: Gemini > Anthropic > OpenAI-compatible (incl. AIHubmix).
@@ -924,7 +1076,7 @@ class Config:
             ),  # noqa: E501
             openai_model=os.getenv('OPENAI_MODEL', 'gpt-4o-mini'),
             openai_vision_model=os.getenv('OPENAI_VISION_MODEL') or None,
-            openai_temperature=float(os.getenv('OPENAI_TEMPERATURE', '0.7')),
+            openai_temperature=parse_env_float(os.getenv('OPENAI_TEMPERATURE'), 0.7, field_name='OPENAI_TEMPERATURE'),
             # Vision model: VISION_MODEL > OPENAI_VISION_MODEL (alias) > default
             vision_model=(
                 os.getenv('VISION_MODEL')
@@ -940,26 +1092,33 @@ class Config:
             xai_api_keys=xai_api_keys,
             xai_search_model=os.getenv('XAI_SEARCH_MODEL', 'grok-4-1-fast-reasoning'),
             searxng_base_urls=searxng_base_urls,
-            news_max_age_days=max(1, int(os.getenv('NEWS_MAX_AGE_DAYS', '3'))),
-            bias_threshold=max(1.0, float(os.getenv('BIAS_THRESHOLD', '5.0'))),
-            analysis_history_days=max(5, int(os.getenv('ANALYSIS_HISTORY_DAYS', '60'))),
+            news_max_age_days=parse_env_int(os.getenv('NEWS_MAX_AGE_DAYS'), 3, field_name='NEWS_MAX_AGE_DAYS', minimum=1),
+            news_strategy_profile=normalize_news_strategy_profile(os.getenv('NEWS_STRATEGY_PROFILE', 'short')),
+            bias_threshold=parse_env_float(os.getenv('BIAS_THRESHOLD'), 5.0, field_name='BIAS_THRESHOLD', minimum=1.0),
+            analysis_history_days=parse_env_int(os.getenv('ANALYSIS_HISTORY_DAYS'), 60, field_name='ANALYSIS_HISTORY_DAYS', minimum=5),
             agent_mode=os.getenv('AGENT_MODE', 'false').lower() == 'true',
             _agent_mode_explicit=os.getenv('AGENT_MODE') is not None,
-            agent_max_steps=int(os.getenv('AGENT_MAX_STEPS', '10')),
+            agent_litellm_model=(os.getenv('AGENT_LITELLM_MODEL') or "").strip(),
+            agent_max_steps=parse_env_int(
+                os.getenv('AGENT_MAX_STEPS'),
+                AGENT_MAX_STEPS_DEFAULT,
+                field_name='AGENT_MAX_STEPS',
+                minimum=1,
+            ),
             agent_skills=[s.strip() for s in os.getenv('AGENT_SKILLS', '').split(',') if s.strip()],
             agent_strategy_dir=os.getenv('AGENT_STRATEGY_DIR'),
             agent_nl_routing=os.getenv('AGENT_NL_ROUTING', 'false').lower() == 'true',
             agent_arch=os.getenv('AGENT_ARCH', 'single').lower(),
             agent_orchestrator_mode=os.getenv('AGENT_ORCHESTRATOR_MODE', 'standard').lower(),
-            agent_orchestrator_timeout_s=max(0, int(os.getenv('AGENT_ORCHESTRATOR_TIMEOUT_S', '600'))),
+            agent_orchestrator_timeout_s=parse_env_int(os.getenv('AGENT_ORCHESTRATOR_TIMEOUT_S'), 600, field_name='AGENT_ORCHESTRATOR_TIMEOUT_S', minimum=0),
             agent_risk_override=os.getenv('AGENT_RISK_OVERRIDE', 'true').lower() == 'true',
-            agent_deep_research_budget=int(os.getenv('AGENT_DEEP_RESEARCH_BUDGET', '30000')),
-            agent_deep_research_timeout=max(30, int(os.getenv('AGENT_DEEP_RESEARCH_TIMEOUT', '180'))),
+            agent_deep_research_budget=parse_env_int(os.getenv('AGENT_DEEP_RESEARCH_BUDGET'), 30000, field_name='AGENT_DEEP_RESEARCH_BUDGET', minimum=1000),
+            agent_deep_research_timeout=parse_env_int(os.getenv('AGENT_DEEP_RESEARCH_TIMEOUT'), 180, field_name='AGENT_DEEP_RESEARCH_TIMEOUT', minimum=30),
             agent_memory_enabled=os.getenv('AGENT_MEMORY_ENABLED', 'false').lower() == 'true',
             agent_strategy_autoweight=os.getenv('AGENT_STRATEGY_AUTOWEIGHT', 'true').lower() == 'true',
             agent_strategy_routing=os.getenv('AGENT_STRATEGY_ROUTING', 'auto').lower(),
             agent_event_monitor_enabled=os.getenv('AGENT_EVENT_MONITOR_ENABLED', 'false').lower() == 'true',
-            agent_event_monitor_interval_minutes=max(1, int(os.getenv('AGENT_EVENT_MONITOR_INTERVAL_MINUTES', '5'))),
+            agent_event_monitor_interval_minutes=parse_env_int(os.getenv('AGENT_EVENT_MONITOR_INTERVAL_MINUTES'), 5, field_name='AGENT_EVENT_MONITOR_INTERVAL_MINUTES', minimum=1),
             agent_event_alert_rules_json=os.getenv('AGENT_EVENT_ALERT_RULES_JSON', ''),
             wechat_webhook_url=os.getenv('WECHAT_WEBHOOK_URL'),
             feishu_webhook_url=os.getenv('FEISHU_WEBHOOK_URL'),
@@ -993,14 +1152,14 @@ class Config:
             report_templates_dir=os.getenv('REPORT_TEMPLATES_DIR', 'templates'),
             report_renderer_enabled=os.getenv('REPORT_RENDERER_ENABLED', 'false').lower() == 'true',
             report_integrity_enabled=os.getenv('REPORT_INTEGRITY_ENABLED', 'true').lower() == 'true',
-            report_integrity_retry=int(os.getenv('REPORT_INTEGRITY_RETRY', '1')),
-            report_history_compare_n=int(os.getenv('REPORT_HISTORY_COMPARE_N', '0')),
-            analysis_delay=float(os.getenv('ANALYSIS_DELAY', '0')),
+            report_integrity_retry=parse_env_int(os.getenv('REPORT_INTEGRITY_RETRY'), 1, field_name='REPORT_INTEGRITY_RETRY', minimum=0),
+            report_history_compare_n=parse_env_int(os.getenv('REPORT_HISTORY_COMPARE_N'), 0, field_name='REPORT_HISTORY_COMPARE_N', minimum=0),
+            analysis_delay=parse_env_float(os.getenv('ANALYSIS_DELAY'), 0, field_name='ANALYSIS_DELAY', minimum=0.0),
             merge_email_notification=os.getenv('MERGE_EMAIL_NOTIFICATION', 'false').lower() == 'true',
-            feishu_max_bytes=int(os.getenv('FEISHU_MAX_BYTES', '20000')),
+            feishu_max_bytes=parse_env_int(os.getenv('FEISHU_MAX_BYTES'), 20000, field_name='FEISHU_MAX_BYTES', minimum=1000),
             wechat_max_bytes=wechat_max_bytes,
             wechat_msg_type=wechat_msg_type_lower,
-            discord_max_words=int(os.getenv('DISCORD_MAX_WORDS', '2000')),
+            discord_max_words=parse_env_int(os.getenv('DISCORD_MAX_WORDS'), 2000, field_name='DISCORD_MAX_WORDS', minimum=100),
             markdown_to_image_channels=[
                 c.strip().lower()
                 for c in os.getenv('MARKDOWN_TO_IMAGE_CHANNELS', '').split(',')
@@ -1011,9 +1170,9 @@ class Config:
             prefetch_realtime_quotes=os.getenv('PREFETCH_REALTIME_QUOTES', 'true').lower() == 'true',
             database_path=os.getenv('DATABASE_PATH', './data/stock_analysis.db'),
             sqlite_wal_enabled=parse_env_bool(os.getenv('SQLITE_WAL_ENABLED'), True),
-            sqlite_busy_timeout_ms=max(0, int(os.getenv('SQLITE_BUSY_TIMEOUT_MS', '5000'))),
-            sqlite_write_retry_max=max(0, int(os.getenv('SQLITE_WRITE_RETRY_MAX', '3'))),
-            sqlite_write_retry_base_delay=max(0.0, float(os.getenv('SQLITE_WRITE_RETRY_BASE_DELAY', '0.2'))),
+            sqlite_busy_timeout_ms=parse_env_int(os.getenv('SQLITE_BUSY_TIMEOUT_MS'), 5000, field_name='SQLITE_BUSY_TIMEOUT_MS', minimum=0),
+            sqlite_write_retry_max=parse_env_int(os.getenv('SQLITE_WRITE_RETRY_MAX'), 3, field_name='SQLITE_WRITE_RETRY_MAX', minimum=0),
+            sqlite_write_retry_base_delay=parse_env_float(os.getenv('SQLITE_WRITE_RETRY_BASE_DELAY'), 0.2, field_name='SQLITE_WRITE_RETRY_BASE_DELAY', minimum=0.0),
             save_context_snapshot=os.getenv('SAVE_CONTEXT_SNAPSHOT', 'true').lower() == 'true',
             longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,
             longbridge_app_secret=os.getenv('LONGBRIDGE_APP_SECRET') or None,

@@ -388,7 +388,10 @@ def _compute_trading_day_filter(
     filtered_codes = []
     for code in stock_codes:
         mkt = get_market_for_stock(code)
-        if mkt in open_markets or mkt is None:
+        if mkt is None:
+            logger.warning("无法识别股票代码，已跳过: %s", code)
+            continue
+        if mkt in open_markets:
             filtered_codes.append(code)
 
     if config.market_review_enabled and not getattr(args, 'no_market_review', False):
@@ -400,6 +403,28 @@ def _compute_trading_day_filter(
 
     should_skip_all = (not filtered_codes) and (effective_region or '') == ''
     return (filtered_codes, effective_region, should_skip_all)
+
+
+def _iter_effective_config_warnings(config: Config, stock_codes: Optional[List[str]]) -> List[str]:
+    """Filter config warnings that are superseded by explicit CLI inputs."""
+    warnings = list(config.validate())
+    if stock_codes:
+        warnings = [warning for warning in warnings if warning != "未配置自选股列表 (STOCK_LIST)"]
+    return warnings
+
+
+def _filter_recognized_stock_codes(stock_codes: List[str]) -> List[str]:
+    """Always drop syntactically unrecognized stock codes before entering the pipeline."""
+    from src.core.trading_calendar import get_market_for_stock
+
+    filtered_codes = []
+    for code in stock_codes:
+        market = get_market_for_stock(code)
+        if market is None:
+            logger.warning("无法识别股票代码，已跳过: %s", code)
+            continue
+        filtered_codes.append(code)
+    return filtered_codes
 
 
 def run_full_analysis(
@@ -424,6 +449,13 @@ def run_full_analysis(
 
         # Issue #373: Trading day filter (per-stock, per-market)
         effective_codes = stock_codes if stock_codes is not None else config.stock_list
+        if not effective_codes:
+            logger.error("未配置自选股列表，请在 .env 文件中设置 STOCK_LIST")
+            return
+        effective_codes = _filter_recognized_stock_codes(effective_codes)
+        if not effective_codes:
+            logger.error("未识别到有效股票代码，请检查 STOCK_LIST 或命令行 --stocks 参数")
+            return
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
             config, args, effective_codes
         )
@@ -743,16 +775,16 @@ def main() -> int:
     logger.info(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
 
-    # 验证配置
-    warnings = config.validate()
-    for warning in warnings:
-        logger.warning(warning)
-
     # 解析股票列表（统一为大写 Issue #355）
     stock_codes = None
     if args.stocks:
         stock_codes = [canonical_stock_code(c) for c in args.stocks.split(',') if (c or "").strip()]
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
+
+    # 验证配置
+    warnings = _iter_effective_config_warnings(config, stock_codes)
+    for warning in warnings:
+        logger.warning(warning)
 
     # === 处理 --webui / --webui-only 参数，映射到 --serve / --serve-only ===
     if args.webui:

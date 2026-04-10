@@ -538,11 +538,17 @@ _CHIP_KEYS: tuple = ("profit_ratio", "avg_cost", "concentration", "chip_health")
 
 
 def _is_value_placeholder(v: Any) -> bool:
-    """True if value is empty or placeholder (N/A, 数据缺失, etc.)."""
+    """True if value is empty or placeholder (N/A, 数据缺失, etc.).
+
+    Note: numeric 0 is NOT treated as placeholder — 0 can be a valid value
+    (e.g. bias_ma5 = 0.0%, MACD bar = 0).
+    For chip_structure fields, use ``_is_chip_value_placeholder()`` which
+    additionally treats numeric 0 as placeholder.
+    """
     if v is None:
         return True
-    if isinstance(v, (int, float)) and v == 0:
-        return True
+    if isinstance(v, (int, float)):
+        return False
     s = str(v).strip().lower()
     return s in ("", "n/a", "na", "数据缺失", "未知", "data unavailable", "unknown", "tbd")
 

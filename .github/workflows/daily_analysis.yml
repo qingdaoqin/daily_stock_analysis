@@ -1,14 +1,22 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 对齐美股开盘前半小时
-  # GitHub Actions schedule 可能延迟，因此在目标窗口内增加多次尝试：
+  # 定时触发 - 多市场窗口调度
+  # GitHub Actions schedule 可能延迟，因此在目标窗口内增加多次尝试。
+  #
+  # A股窗口：开盘前半小时（北京时间 08:30）
+  # - 00:30/00:40/00:50 UTC ≈ 北京时间 08:30/08:40/08:50
+  # - 运行时检查上海时间 08:30-08:59
+  #
+  # 美股窗口：开盘前半小时（纽约时间 09:00-09:29）
   # - EDT(夏令时, UTC-4): 13:00/13:10/13:20 UTC ≈ 北京时间 21:00/21:10/21:20
   # - EST(冬令时, UTC-5): 14:00/14:10/14:20 UTC ≈ 北京时间 22:00/22:10/22:20
-  # 运行时再根据纽约当前夏/冬令时 + 纽约本地时间判断是否放行。
-  # 只允许纽约时间 09:00-09:29，严格限制在开盘前半小时。
-  # 同一纽约交易日只允许成功进入主链一次，避免重复分析。
+  #
+  # 每个市场每天只运行一次（重复运行守卫按 market+date 去重）。
   schedule:
+    # A股窗口
+    - cron: '30,40,50 0 * * 1-5'
+    # 美股窗口（夏令时 + 冬令时）
     - cron: '0,10,20 13 * * 1-5'
     - cron: '0,10,20 14 * * 1-5'
   
@@ -45,7 +53,7 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v5
 
-      - name: 检查美股开盘前窗口
+      - name: 检查市场开盘前窗口
         if: github.event_name == 'schedule'
         id: market_window
         run: |
@@ -55,6 +63,13 @@ jobs:
           NY_OFFSET="$(TZ='America/New_York' date '+%z')"
           NY_DATE="$(TZ='America/New_York' date '+%F')"
           NY_TIME="${NY_HOUR}:${NY_MINUTE}"
+
+          SH_DOW="$(TZ='Asia/Shanghai' date '+%u')"
+          SH_HOUR="$(TZ='Asia/Shanghai' date '+%H')"
+          SH_MINUTE="$(TZ='Asia/Shanghai' date '+%M')"
+          SH_DATE="$(TZ='Asia/Shanghai' date '+%F')"
+          SH_TIME="${SH_HOUR}:${SH_MINUTE}"
+
           SCHEDULE_EXPR="${{ github.event.schedule }}"
           echo "ny_dow=$NY_DOW" >> "$GITHUB_OUTPUT"
           echo "ny_hour=$NY_HOUR" >> "$GITHUB_OUTPUT"
@@ -62,51 +77,94 @@ jobs:
           echo "ny_offset=$NY_OFFSET" >> "$GITHUB_OUTPUT"
           echo "ny_date=$NY_DATE" >> "$GITHUB_OUTPUT"
           echo "ny_time=$NY_TIME" >> "$GITHUB_OUTPUT"
-          echo "🕘 当前纽约时间: $NY_DATE $NY_TIME (offset=$NY_OFFSET, weekday=$NY_DOW)"
-          echo "🗓️ 当前触发 cron: $SCHEDULE_EXPR"
+          echo "sh_date=$SH_DATE" >> "$GITHUB_OUTPUT"
+          echo "🕘 纽约时间: $NY_DATE $NY_TIME (offset=$NY_OFFSET, weekday=$NY_DOW)"
+          echo "🕘 上海时间: $SH_DATE $SH_TIME (weekday=$SH_DOW)"
+          echo "🗓️ 触发 cron: $SCHEDULE_EXPR"
 
           SHOULD_RUN=false
           REASON="不在有效执行窗口"
+          TARGET_MARKET=""
 
-          if [ "$NY_DOW" -ge 1 ] && [ "$NY_DOW" -le 5 ]; then
-            # 严格限制在纽约 09:00-09:29（开盘前半小时）。
-            WITHIN_WINDOW=false
-            if [ "$NY_HOUR" = "09" ] && [ "$NY_MINUTE" -lt 30 ]; then
-              WITHIN_WINDOW=true
-            fi
-
-            if [ "$NY_OFFSET" = "-0400" ] && [[ "$SCHEDULE_EXPR" == *"13"* ]] && [ "$WITHIN_WINDOW" = "true" ]; then
-              SHOULD_RUN=true
-              REASON="EDT 时间窗口命中（13:00/13:10/13:20 UTC / 北京时间约 21:00-21:20）"
-            elif [ "$NY_OFFSET" = "-0500" ] && [[ "$SCHEDULE_EXPR" == *"14"* ]] && [ "$WITHIN_WINDOW" = "true" ]; then
-              SHOULD_RUN=true
-              REASON="EST 时间窗口命中（14:00/14:10/14:20 UTC / 北京时间约 22:00-22:20）"
-            elif [ "$WITHIN_WINDOW" != "true" ]; then
-              REASON="当前纽约时间已超出 09:00-09:29 开盘前窗口"
+          # --- A股窗口检测：上海时间 08:30-08:59，工作日 ---
+          if [[ "$SCHEDULE_EXPR" == *"0 *"* ]] || [[ "$SCHEDULE_EXPR" == *" 0 "* ]]; then
+            # 这是 A 股 cron 槽位（UTC hour 0）
+            if [ "$SH_DOW" -ge 1 ] && [ "$SH_DOW" -le 5 ]; then
+              if [ "$SH_HOUR" = "08" ] && [ "$SH_MINUTE" -ge 30 ]; then
+                SHOULD_RUN=true
+                TARGET_MARKET="cn"
+                REASON="A股窗口命中（上海 ${SH_TIME}，在 08:30-08:59 内）"
+              else
+                REASON="上海时间 ${SH_TIME} 不在 08:30-08:59 窗口内"
+              fi
             else
-              REASON="当前触发槽位与纽约夏/冬令时不匹配"
+              REASON="上海时间当前不是工作日（weekday=$SH_DOW）"
             fi
-          else
-            REASON="当前不是纽约工作日"
           fi
 
+          # --- 美股窗口检测：纽约 09:00-09:29，工作日 ---
+          if [ "$SHOULD_RUN" = "false" ]; then
+            if [ "$NY_DOW" -ge 1 ] && [ "$NY_DOW" -le 5 ]; then
+              WITHIN_WINDOW=false
+              if [ "$NY_HOUR" = "09" ] && [ "$NY_MINUTE" -lt 30 ]; then
+                WITHIN_WINDOW=true
+              fi
+
+              if [ "$NY_OFFSET" = "-0400" ] && [[ "$SCHEDULE_EXPR" == *"13"* ]] && [ "$WITHIN_WINDOW" = "true" ]; then
+                SHOULD_RUN=true
+                TARGET_MARKET="us"
+                REASON="美股 EDT 窗口命中（13:xx UTC / 纽约 ${NY_TIME}）"
+              elif [ "$NY_OFFSET" = "-0500" ] && [[ "$SCHEDULE_EXPR" == *"14"* ]] && [ "$WITHIN_WINDOW" = "true" ]; then
+                SHOULD_RUN=true
+                TARGET_MARKET="us"
+                REASON="美股 EST 窗口命中（14:xx UTC / 纽约 ${NY_TIME}）"
+              elif [ "$WITHIN_WINDOW" != "true" ]; then
+                REASON="纽约时间 ${NY_TIME} 不在 09:00-09:29 窗口内"
+              else
+                REASON="触发槽位与纽约夏/冬令时不匹配"
+              fi
+            else
+              REASON="纽约当前不是工作日（weekday=$NY_DOW）"
+            fi
+          fi
+
+          echo "target_market=$TARGET_MARKET" >> "$GITHUB_OUTPUT"
           if [ "$SHOULD_RUN" = "true" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
-            echo "✅ $REASON，继续执行"
+            echo "✅ $REASON，目标市场=$TARGET_MARKET，继续执行"
           else
             echo "should_run=false" >> "$GITHUB_OUTPUT"
             echo "⏭️ $REASON，后续步骤跳过"
           fi
 
-      - name: 检查同日重复运行
+      - name: 检查同日同市场重复运行
         if: github.event_name == 'schedule' && steps.market_window.outputs.should_run == 'true'
         id: duplicate_guard
         uses: actions/github-script@v8
         with:
           script: |
-            const nyDate = "${{ steps.market_window.outputs.ny_date }}";
+            // 按目标市场选择去重日期：A股用上海日期，美股用纽约日期
+            const targetMarket = "${{ steps.market_window.outputs.target_market }}";
+            const dedupeDate = targetMarket === "cn"
+              ? "${{ steps.market_window.outputs.sh_date }}"
+              : "${{ steps.market_window.outputs.ny_date }}";
+            const dedupeTimezone = targetMarket === "cn" ? "Asia/Shanghai" : "America/New_York";
             const currentRunId = Number(process.env.GITHUB_RUN_ID);
             const currentRunNumber = Number(process.env.GITHUB_RUN_NUMBER);
+
+            // 判断一个 cron 表达式属于哪个市场窗口
+            function cronToMarket(cron) {
+              if (!cron) return "";
+              // A 股 cron 包含 "0 *"（UTC hour 0 的 30,40,50 分）
+              if (/\b0\s+\*/.test(cron) || /\s0\s/.test(cron)) {
+                // 精确检查：分钟含 30/40/50 且小时为 0
+                const parts = cron.trim().split(/\s+/);
+                if (parts.length >= 2 && parts[1] === "0") return "cn";
+              }
+              // 美股 cron 包含小时 13 或 14
+              if (/\b1[34]\b/.test(cron)) return "us";
+              return "";
+            }
 
             const { owner, repo } = context.repo;
             const response = await github.rest.actions.listWorkflowRuns({
@@ -119,33 +177,35 @@ jobs:
             });
 
             const runs = response.data.workflow_runs.filter((run) => {
-              if (run.id === currentRunId) {
-                return false;
-              }
-              if (run.run_number >= currentRunNumber) {
-                return false;
-              }
+              if (run.id === currentRunId) return false;
+              if (run.run_number >= currentRunNumber) return false;
+
+              // 按去重时区获取运行日期
               const createdAt = new Date(run.created_at);
-              const nyCreatedAt = new Intl.DateTimeFormat('en-CA', {
-                timeZone: 'America/New_York',
-                year: 'numeric',
-                month: '2-digit',
-                day: '2-digit',
+              const runDate = new Intl.DateTimeFormat('en-CA', {
+                timeZone: dedupeTimezone,
+                year: 'numeric', month: '2-digit', day: '2-digit',
               }).format(createdAt);
-              if (nyCreatedAt !== nyDate) {
-                return false;
-              }
-              if (run.status === 'queued' || run.status === 'in_progress') {
-                return true;
-              }
+              if (runDate !== dedupeDate) return false;
+
+              // 按市场过滤：同市场窗口的运行才算重复
+              const runCron = (run.path || "").match(/cron:\s*'([^']+)'/)?.[1] || "";
+              // GitHub API 不直接暴露触发 cron，改用时间段推断
+              const runHourUTC = createdAt.getUTCHours();
+              let runMarket = "";
+              if (runHourUTC === 0 || runHourUTC === 1) runMarket = "cn";
+              else if (runHourUTC >= 13 && runHourUTC <= 14) runMarket = "us";
+              if (runMarket !== targetMarket) return false;
+
+              if (run.status === 'queued' || run.status === 'in_progress') return true;
               return run.conclusion === 'success';
             });
 
             if (runs.length > 0) {
-              core.info(`已有更早的同日定时运行，跳过当前尝试: ${runs[0].html_url}`);
+              core.info(`已有同日(${dedupeDate})同市场(${targetMarket})的定时运行，跳过: ${runs[0].html_url}`);
               core.setOutput('should_continue', 'false');
             } else {
-              core.info('当前是今日首个有效定时尝试，继续执行');
+              core.info(`当前是 ${targetMarket} 市场 ${dedupeDate} 首个有效尝试，继续执行`);
               core.setOutput('should_continue', 'true');
             }
 
@@ -277,7 +337,7 @@ jobs:
           # 自选股配置
           # ==========================================
           STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST || '' }}
-          MARKET_REVIEW_REGION: ${{ vars.MARKET_REVIEW_REGION || secrets.MARKET_REVIEW_REGION || 'us' }}
+          MARKET_REVIEW_REGION: ${{ vars.MARKET_REVIEW_REGION || secrets.MARKET_REVIEW_REGION || 'auto' }}
           
           # ==========================================
           # 运行配置 ⬅️ 新增！

@@ -1640,7 +1640,7 @@ class GeminiAnalyzer:
 | 最高价 | {today.get('high', 'N/A')} {currency} |
 | 最低价 | {today.get('low', 'N/A')} {currency} |
 | 涨跌幅 | {today.get('pct_chg', 'N/A')}% |
-| 成交量 | {self._format_volume(today.get('volume'))} |
+| 成交量 | {self._format_volume(today.get('volume'), market)} |
 | 成交额 | {self._format_amount(today.get('amount'), currency)} |
 
 ### 均线系统（关键判断指标）
@@ -1796,10 +1796,18 @@ class GeminiAnalyzer:
         
         return prompt
     
-    def _format_volume(self, volume: Optional[float]) -> str:
-        """格式化成交量显示"""
+    def _format_volume(self, volume: Optional[float], market: str = "cn") -> str:
+        """格式化成交量显示（市场感知）"""
         if volume is None:
             return 'N/A'
+        if market == "us":
+            if volume >= 1e6:
+                return f"{volume / 1e6:.2f}M shares"
+            elif volume >= 1e3:
+                return f"{volume / 1e3:.2f}K shares"
+            else:
+                return f"{volume:.0f} shares"
+        # cn / hk 使用中文单位
         if volume >= 1e8:
             return f"{volume / 1e8:.2f} 亿股"
         elif volume >= 1e4:
@@ -1895,7 +1903,8 @@ class GeminiAnalyzer:
 3. 量能是否配合（缩量回调/放量突破）？
 4. 筹码结构是否健康？
 5. 消息面有无重大利空？（减持、处罚、业绩变脸、政策利空等）
-6. 是否存在涨停/交易约束/T+1 等执行层限制，导致“理论买点”在实盘中未必可成交？"""
+6. 是否存在涨停/交易约束/T+1 等执行层限制，导致“理论买点”在实盘中未必可成交？
+7. 是否为特殊交易规则股票？ST股涨跌停 ±5%，科创板/创业板 ±20%，北交所 ±30%——乖离率阈值需相应调整。"""
 
     def _build_market_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """构建当日行情快照（展示用）"""
@@ -1921,6 +1930,7 @@ class GeminiAnalyzer:
             except (TypeError, ValueError):
                 change_amount = None
 
+        market = self._resolve_market_context(context).get("market", "cn")
         snapshot = {
             "date": context.get('date', '未知'),
             "close": self._format_price(close),
@@ -1931,7 +1941,7 @@ class GeminiAnalyzer:
             "pct_chg": self._format_percent(today.get('pct_chg')),
             "change_amount": self._format_price(change_amount),
             "amplitude": self._format_percent(amplitude),
-            "volume": self._format_volume(today.get('volume')),
+            "volume": self._format_volume(today.get('volume'), market),
             "amount": self._format_amount(today.get('amount')),
         }
 

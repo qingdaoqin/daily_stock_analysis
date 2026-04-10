@@ -27,6 +27,7 @@ import numpy as np
 
 from src.config import get_config
 from src.core.trading_calendar import get_market_for_stock
+from data_provider.base import is_st_stock, is_kc_cy_stock, is_bse_code
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +206,7 @@ class StockTrendAnalyzer:
         pass
 
     @staticmethod
-    def _resolve_market_profile(code: str) -> Dict[str, Any]:
+    def _resolve_market_profile(code: str, stock_name: str = "") -> Dict[str, Any]:
         market = get_market_for_stock(code) or "cn"
         profile = {
             "cn": {
@@ -224,8 +225,8 @@ class StockTrendAnalyzer:
                 "support_ma10_reason": "MA10支撑有效",
             },
             "hk": {
-                "base_threshold_floor": 6.0,
-                "strong_multiplier": 1.45,
+                "base_threshold_floor": 10.0,
+                "strong_multiplier": 1.5,
                 "near_ma_reason": "可结合公告/回踩确认再介入",
                 "slightly_high_reason": "可少量跟踪，但更适合等公告或回踩确认",
                 "high_bias_risk": "不宜重仓追价，等待回踩或公告确认",
@@ -239,7 +240,7 @@ class StockTrendAnalyzer:
                 "support_ma10_reason": "关键支撑位附近企稳，可作为回测确认",
             },
             "us": {
-                "base_threshold_floor": 7.0,
+                "base_threshold_floor": 15.0,
                 "strong_multiplier": 1.6,
                 "near_ma_reason": "回踩后可考虑分批跟踪",
                 "slightly_high_reason": "趋势延续可轻仓跟踪，避免一次性追价",
@@ -256,20 +257,39 @@ class StockTrendAnalyzer:
         }
         resolved = dict(profile.get(market, profile["cn"]))
         resolved["market"] = market
+
+        # A-share sub-type adjustments: ST(±5%), 科创板/创业板(±20%), 北交所(±30%)
+        if market == "cn":
+            normalized_code = (code or "").strip().split(".")[0]
+            if is_st_stock(stock_name):
+                resolved["base_threshold_floor"] = 3.0
+                resolved["strong_multiplier"] = 1.3
+                resolved["high_bias_risk"] = "ST 股涨跌停仅 ±5%，严禁追高！"
+            elif is_bse_code(normalized_code):
+                resolved["base_threshold_floor"] = 10.0
+                resolved["strong_multiplier"] = 1.6
+                resolved["high_bias_risk"] = "北交所涨跌幅 ±30%，高乖离率风险极大！"
+            elif is_kc_cy_stock(normalized_code):
+                resolved["base_threshold_floor"] = 8.0
+                resolved["strong_multiplier"] = 1.6
+                resolved["high_bias_risk"] = "科创板/创业板涨跌幅 ±20%，注意追高风险！"
+
         return resolved
     
-    def analyze(self, df: pd.DataFrame, code: str) -> TrendAnalysisResult:
+    def analyze(self, df: pd.DataFrame, code: str, stock_name: str = "") -> TrendAnalysisResult:
         """
         分析股票趋势
         
         Args:
             df: 包含 OHLCV 数据的 DataFrame
             code: 股票代码
+            stock_name: 股票名称（用于判断 ST 等特殊类型）
             
         Returns:
             TrendAnalysisResult 分析结果
         """
         result = TrendAnalysisResult(code=code)
+        result._stock_name = stock_name  # 暂存以便 _generate_signal 使用
         
         if df is None or df.empty or len(df) < 20:
             logger.warning(f"{code} 数据不足，无法进行趋势分析")
@@ -687,7 +707,7 @@ class StockTrendAnalyzer:
         bias = result.bias_ma5
         if bias is None or (isinstance(bias, float) and math.isnan(bias)):
             bias = 0.0
-        market_profile = self._resolve_market_profile(result.code)
+        market_profile = self._resolve_market_profile(result.code, getattr(result, '_stock_name', ''))
         base_threshold = max(
             float(get_config().bias_threshold),
             float(market_profile["base_threshold_floor"]),

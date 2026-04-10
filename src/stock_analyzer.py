@@ -311,7 +311,8 @@ class StockTrendAnalyzer:
         result.ma5 = float(latest['MA5'])
         result.ma10 = float(latest['MA10'])
         result.ma20 = float(latest['MA20'])
-        result.ma60 = float(latest.get('MA60', 0))
+        _ma60_raw = latest.get('MA60', 0)
+        result.ma60 = 0.0 if (pd.isna(_ma60_raw)) else float(_ma60_raw)
 
         # 1. 趋势判断
         self._analyze_trend(df, result)
@@ -346,9 +347,7 @@ class StockTrendAnalyzer:
             df['MA60'] = df['close'].rolling(window=60).mean()
         else:
             # 数据不足时 MA60 设为 NaN，避免误报为 MA20
-            # Downstream consumers: analyze() reads MA60 via latest.get('MA60', 0);
-            # _analyze_trend() uses MA60 for trend classification; _generate_signal() accesses
-            # result.ma60 with NaN guards (math.isnan checks).
+            # analyze() converts NaN → 0.0 when reading result.ma60
             df['MA60'] = float('nan')
             logger.debug("数据不足 60 条（当前 %d 条），MA60 设为 NaN", len(df))
         return df

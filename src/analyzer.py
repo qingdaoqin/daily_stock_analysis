@@ -1933,6 +1933,7 @@ class GeminiAnalyzer:
                 change_amount = None
 
         market = self._resolve_market_context(context).get("market", "cn")
+        currency = {"cn": "元", "hk": "港元", "us": "美元"}.get(market, "元")
         snapshot = {
             "date": context.get('date', '未知'),
             "close": self._format_price(close),
@@ -1944,7 +1945,7 @@ class GeminiAnalyzer:
             "change_amount": self._format_price(change_amount),
             "amplitude": self._format_percent(amplitude),
             "volume": self._format_volume(today.get('volume'), market),
-            "amount": self._format_amount(today.get('amount')),
+            "amount": self._format_amount(today.get('amount'), currency),
         }
 
         if realtime:

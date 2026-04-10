@@ -219,8 +219,10 @@ class TushareFetcher(BaseFetcher):
         2. 如果是，重置计数器
         3. 如果当前分钟调用次数超过限制，强制休眠
         
-        线程安全：使用 Lock 保护计数器操作
+        线程安全：使用 Lock 保护计数器操作。
+        sleep 在锁外执行，避免阻塞其他线程。
         """
+        sleep_time = 0.0
         with self._rate_limit_lock:
             current_time = time.time()
             
@@ -244,13 +246,16 @@ class TushareFetcher(BaseFetcher):
                     f"Tushare 达到速率限制 ({self._call_count}/{self.rate_limit_per_minute} 次/分钟)，"
                     f"等待 {sleep_time:.1f} 秒..."
                 )
-                
-                time.sleep(sleep_time)
-                
+
+        # Sleep outside the lock to avoid blocking other threads
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+            with self._rate_limit_lock:
                 # 重置计数器
                 self._minute_start = time.time()
                 self._call_count = 0
-            
+
+        with self._rate_limit_lock:
             # 增加调用计数
             self._call_count += 1
             logger.debug(f"Tushare 当前分钟调用次数: {self._call_count}/{self.rate_limit_per_minute}")

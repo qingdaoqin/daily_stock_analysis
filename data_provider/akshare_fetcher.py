@@ -856,8 +856,9 @@ class AkshareFetcher(BaseFetcher):
         source_key = "akshare_em"
         
         try:
-            # 检查缓存（线程安全）
+            # 检查缓存（线程安全：仅在锁内读/写缓存字典，网络请求在锁外）
             current_time = time.time()
+            need_refresh = False
             with _realtime_cache_lock:
                 if (_realtime_cache['data'] is not None and 
                     current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
@@ -865,39 +866,44 @@ class AkshareFetcher(BaseFetcher):
                     cache_age = int(current_time - _realtime_cache['timestamp'])
                     logger.debug(f"[缓存命中] A股实时行情(东财) - 缓存年龄 {cache_age}s/{_realtime_cache['ttl']}s")
                 else:
-                    # 触发全量刷新
-                    logger.info(f"[缓存未命中] 触发全量刷新 A股实时行情(东财)")
-                    last_error: Optional[Exception] = None
+                    need_refresh = True
                     df = None
-                    for attempt in range(1, 3):
-                        try:
-                            # 防封禁策略
-                            self._set_random_user_agent()
-                            self._enforce_rate_limit()
 
-                            logger.info(f"[API调用] ak.stock_zh_a_spot_em() 获取A股实时行情... (attempt {attempt}/2)")
-                            import time as _time
-                            api_start = _time.time()
+            if need_refresh:
+                # 网络 I/O 在锁外执行，避免阻塞其他线程
+                logger.info(f"[缓存未命中] 触发全量刷新 A股实时行情(东财)")
+                last_error: Optional[Exception] = None
+                df = None
+                for attempt in range(1, 3):
+                    try:
+                        # 防封禁策略
+                        self._set_random_user_agent()
+                        self._enforce_rate_limit()
 
-                            df = ak.stock_zh_a_spot_em()
+                        logger.info(f"[API调用] ak.stock_zh_a_spot_em() 获取A股实时行情... (attempt {attempt}/2)")
+                        import time as _time
+                        api_start = _time.time()
 
-                            api_elapsed = _time.time() - api_start
-                            logger.info(f"[API返回] ak.stock_zh_a_spot_em 成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
-                            circuit_breaker.record_success(source_key)
-                            break
-                        except Exception as e:
-                            last_error = e
-                            logger.warning(f"[API错误] ak.stock_zh_a_spot_em 获取失败 (attempt {attempt}/2): {e}")
-                            time.sleep(min(2 ** attempt, 5))
+                        df = ak.stock_zh_a_spot_em()
 
-                    # 更新缓存：成功缓存数据；失败也缓存空数据，避免同一轮任务对同一接口反复请求
-                    if df is None:
-                        logger.error(f"[API错误] ak.stock_zh_a_spot_em 最终失败: {last_error}")
-                        circuit_breaker.record_failure(source_key, str(last_error))
-                        df = pd.DataFrame()
+                        api_elapsed = _time.time() - api_start
+                        logger.info(f"[API返回] ak.stock_zh_a_spot_em 成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
+                        circuit_breaker.record_success(source_key)
+                        break
+                    except Exception as e:
+                        last_error = e
+                        logger.warning(f"[API错误] ak.stock_zh_a_spot_em 获取失败 (attempt {attempt}/2): {e}")
+                        time.sleep(min(2 ** attempt, 5))
+
+                # 更新缓存：成功缓存数据；失败也缓存空数据，避免同一轮任务对同一接口反复请求
+                if df is None:
+                    logger.error(f"[API错误] ak.stock_zh_a_spot_em 最终失败: {last_error}")
+                    circuit_breaker.record_failure(source_key, str(last_error))
+                    df = pd.DataFrame()
+                with _realtime_cache_lock:
                     _realtime_cache['data'] = df
                     _realtime_cache['timestamp'] = current_time
-                    logger.info(f"[缓存更新] A股实时行情(东财) 缓存已刷新，TTL={_realtime_cache['ttl']}s")
+                logger.info(f"[缓存更新] A股实时行情(东财) 缓存已刷新，TTL={_realtime_cache['ttl']}s")
 
             if df is None or df.empty:
                 logger.warning(f"[实时行情] A股实时行情数据为空，跳过 {stock_code}")
@@ -1265,41 +1271,47 @@ class AkshareFetcher(BaseFetcher):
         source_key = "akshare_etf"
         
         try:
-            # 检查缓存（线程安全）
+            # 检查缓存（线程安全：仅在锁内读/写缓存字典，网络请求在锁外）
             current_time = time.time()
+            need_refresh = False
             with _etf_realtime_cache_lock:
                 if (_etf_realtime_cache['data'] is not None and 
                     current_time - _etf_realtime_cache['timestamp'] < _etf_realtime_cache['ttl']):
                     df = _etf_realtime_cache['data']
                     logger.debug(f"[缓存命中] 使用缓存的ETF实时行情数据")
                 else:
-                    last_error: Optional[Exception] = None
+                    need_refresh = True
                     df = None
-                    for attempt in range(1, 3):
-                        try:
-                            # 防封禁策略
-                            self._set_random_user_agent()
-                            self._enforce_rate_limit()
 
-                            logger.info(f"[API调用] ak.fund_etf_spot_em() 获取ETF实时行情... (attempt {attempt}/2)")
-                            import time as _time
-                            api_start = _time.time()
+            if need_refresh:
+                last_error: Optional[Exception] = None
+                df = None
+                for attempt in range(1, 3):
+                    try:
+                        # 防封禁策略
+                        self._set_random_user_agent()
+                        self._enforce_rate_limit()
 
-                            df = ak.fund_etf_spot_em()
+                        logger.info(f"[API调用] ak.fund_etf_spot_em() 获取ETF实时行情... (attempt {attempt}/2)")
+                        import time as _time
+                        api_start = _time.time()
 
-                            api_elapsed = _time.time() - api_start
-                            logger.info(f"[API返回] ak.fund_etf_spot_em 成功: 返回 {len(df)} 只ETF, 耗时 {api_elapsed:.2f}s")
-                            circuit_breaker.record_success(source_key)
-                            break
-                        except Exception as e:
-                            last_error = e
-                            logger.warning(f"[API错误] ak.fund_etf_spot_em 获取失败 (attempt {attempt}/2): {e}")
-                            time.sleep(min(2 ** attempt, 5))
+                        df = ak.fund_etf_spot_em()
 
-                    if df is None:
-                        logger.error(f"[API错误] ak.fund_etf_spot_em 最终失败: {last_error}")
-                        circuit_breaker.record_failure(source_key, str(last_error))
-                        df = pd.DataFrame()
+                        api_elapsed = _time.time() - api_start
+                        logger.info(f"[API返回] ak.fund_etf_spot_em 成功: 返回 {len(df)} 只ETF, 耗时 {api_elapsed:.2f}s")
+                        circuit_breaker.record_success(source_key)
+                        break
+                    except Exception as e:
+                        last_error = e
+                        logger.warning(f"[API错误] ak.fund_etf_spot_em 获取失败 (attempt {attempt}/2): {e}")
+                        time.sleep(min(2 ** attempt, 5))
+
+                if df is None:
+                    logger.error(f"[API错误] ak.fund_etf_spot_em 最终失败: {last_error}")
+                    circuit_breaker.record_failure(source_key, str(last_error))
+                    df = pd.DataFrame()
+                with _etf_realtime_cache_lock:
                     _etf_realtime_cache['data'] = df
                     _etf_realtime_cache['timestamp'] = current_time
 

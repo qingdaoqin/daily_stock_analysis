@@ -12,17 +12,24 @@ A股自选股智能分析系统 - 搜索服务模块
 """
 
 import logging
+import random
 import re
 import threading
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from io import StringIO
 from typing import List, Dict, Any, Optional, Tuple
 from itertools import cycle
 import requests
-from newspaper import Article, Config
+import pandas as pd
+try:
+    from newspaper import Article, Config
+except Exception:  # pragma: no cover - optional dependency
+    Article = None
+    Config = None
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -31,12 +38,14 @@ from tenacity import (
     before_sleep_log,
 )
 
+from data_provider.fundamental_adapter import UsSecFundamentalAdapter
 from data_provider.us_index_mapping import is_us_index_code
 from src.config import (
     NEWS_STRATEGY_WINDOWS,
     normalize_news_strategy_profile,
     resolve_news_window_days,
 )
+from src.core.trading_calendar import get_market_for_stock
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +87,9 @@ def fetch_url_content(url: str, timeout: int = 5) -> str:
     """
     获取 URL 网页正文内容 (使用 newspaper3k)
     """
+    if Article is None or Config is None:
+        logger.debug("newspaper3k not installed; skip fetching URL content")
+        return ""
     try:
         # 配置 newspaper3k
         config = Config()
@@ -128,6 +140,7 @@ class SearchResponse:
     success: bool = True
     error_message: Optional[str] = None
     search_time: float = 0.0  # 搜索耗时（秒）
+    metadata: Dict[str, Any] = field(default_factory=dict)
     
     def to_context(self, max_results: int = 5) -> str:
         """将搜索结果转换为可用于 AI 分析的上下文"""
@@ -1604,6 +1617,288 @@ class SearXNGSearchProvider(BaseSearchProvider):
         )
 
 
+class XAIXSearchProvider(BaseSearchProvider):
+    """xAI X Search provider for social-signal enrichment on US stocks."""
+
+    API_ENDPOINT = "https://api.x.ai/v1/responses"
+
+    def __init__(self, api_keys: List[str], model: str = "grok-4-1-fast-reasoning"):
+        super().__init__(api_keys, "xAI X Search")
+        self._model = (model or "grok-4-1-fast-reasoning").strip()
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        lookback_days = max(1, min(int(days or 7), 30))
+        end_date = datetime.now(UTC).date()
+        start_date = end_date - timedelta(days=lookback_days - 1)
+
+        payload = {
+            "model": self._model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": self._build_prompt(query, max_results=max_results, days=lookback_days),
+                }
+            ],
+            "tools": [
+                {
+                    "type": "x_search",
+                    "from_date": start_date.isoformat(),
+                    "to_date": end_date.isoformat(),
+                }
+            ],
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            response = _post_with_retry(self.API_ENDPOINT, headers=headers, json=payload, timeout=20)
+        except requests.exceptions.Timeout:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="xAI X Search 请求超时",
+            )
+        except requests.exceptions.RequestException as e:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"xAI X Search 网络请求失败: {e}",
+            )
+
+        if response.status_code != 200:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=self._parse_http_error(response),
+            )
+
+        try:
+            data = response.json()
+        except ValueError as e:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"xAI X Search 响应JSON解析失败: {e}",
+            )
+
+        results, summary_text = self._extract_results(data, max_results=max_results)
+        if not results:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="xAI X Search 未返回可解析的社交信号",
+                metadata={"summary": summary_text},
+            )
+
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider=self.name,
+            success=True,
+            metadata={
+                "summary": summary_text,
+                "model": self._model,
+                "citations": data.get("citations", []),
+            },
+        )
+
+    @staticmethod
+    def _build_prompt(query: str, *, max_results: int, days: int) -> str:
+        return (
+            f"Search X for the last {days} days about {query}. "
+            f"Return up to {max_results} high-signal items as a numbered list. "
+            "Each item must be one single line in this format: "
+            "Short title — concise summary. "
+            "Focus on earnings, guidance, official company posts, executive comments, "
+            "product issues, lawsuits, short reports, analyst or market-moving posts. "
+            "Avoid generic hype, jokes, memes, and duplicated points."
+        )
+
+    @staticmethod
+    def _parse_http_error(response) -> str:
+        try:
+            if response.headers.get("content-type", "").startswith("application/json"):
+                error_data = response.json()
+                if isinstance(error_data, dict):
+                    error = error_data.get("error")
+                    if isinstance(error, dict):
+                        message = error.get("message") or error.get("code")
+                        if message:
+                            return f"HTTP {response.status_code}: {message}"
+                    message = error_data.get("message")
+                    if message:
+                        return f"HTTP {response.status_code}: {message}"
+                return f"HTTP {response.status_code}: {error_data}"
+            return f"HTTP {response.status_code}: {response.text[:200]}"
+        except Exception:
+            return f"HTTP {response.status_code}: {response.text[:200]}"
+
+    def _extract_results(self, data: Dict[str, Any], *, max_results: int) -> Tuple[List[SearchResult], str]:
+        citations = data.get("citations", [])
+        output = data.get("output", [])
+        seen_urls = set()
+        results: List[SearchResult] = []
+        collected_text: List[str] = []
+
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for content in item.get("content", []):
+                if not isinstance(content, dict) or content.get("type") != "output_text":
+                    continue
+                text = str(content.get("text") or "").strip()
+                if text:
+                    collected_text.append(text)
+                annotations = content.get("annotations") or []
+                if text and annotations:
+                    block_results = self._extract_results_from_output_block(
+                        text,
+                        annotations,
+                        seen_urls=seen_urls,
+                    )
+                    results.extend(block_results)
+                    if len(results) >= max_results:
+                        return results[:max_results], "\n".join(collected_text).strip()
+
+        summary_text = "\n".join(collected_text).strip()
+        if len(results) < max_results and citations:
+            results.extend(
+                self._fallback_results_from_citations(
+                    citations,
+                    summary_text,
+                    max_results=max_results,
+                    seen_urls=seen_urls,
+                )
+            )
+
+        return results[:max_results], summary_text
+
+    def _extract_results_from_output_block(
+        self,
+        text: str,
+        annotations: List[Dict[str, Any]],
+        *,
+        seen_urls: set,
+    ) -> List[SearchResult]:
+        results: List[SearchResult] = []
+        sorted_annotations = sorted(
+            [ann for ann in annotations if isinstance(ann, dict) and ann.get("url")],
+            key=lambda ann: int(ann.get("start_index", 0)),
+        )
+
+        for ann in sorted_annotations:
+            url = str(ann.get("url") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            line = self._extract_line(text, int(ann.get("start_index", 0)), int(ann.get("end_index", 0)))
+            clean_line = self._strip_inline_citations(line)
+            title, snippet = self._split_title_and_snippet(clean_line, url)
+            seen_urls.add(url)
+            results.append(
+                SearchResult(
+                    title=title,
+                    snippet=snippet,
+                    url=url,
+                    source=self._extract_domain(url),
+                )
+            )
+
+        return results
+
+    def _fallback_results_from_citations(
+        self,
+        citations: List[Any],
+        summary_text: str,
+        *,
+        max_results: int,
+        seen_urls: set,
+    ) -> List[SearchResult]:
+        results: List[SearchResult] = []
+        clean_lines = [
+            self._strip_inline_citations(line).strip()
+            for line in summary_text.splitlines()
+            if self._strip_inline_citations(line).strip()
+        ]
+        candidate_lines = [
+            re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+            for line in clean_lines
+            if line.strip()
+        ]
+
+        for idx, raw_url in enumerate(citations):
+            url = str(raw_url or "").strip()
+            if not url or url in seen_urls:
+                continue
+            line = candidate_lines[min(idx, len(candidate_lines) - 1)] if candidate_lines else "X 社交信号摘要"
+            title, snippet = self._split_title_and_snippet(line, url)
+            seen_urls.add(url)
+            results.append(
+                SearchResult(
+                    title=title,
+                    snippet=snippet,
+                    url=url,
+                    source=self._extract_domain(url),
+                )
+            )
+            if len(results) >= max_results:
+                break
+
+        return results
+
+    @staticmethod
+    def _extract_line(text: str, start_index: int, end_index: int) -> str:
+        line_start = text.rfind("\n", 0, max(start_index, 0))
+        if line_start < 0:
+            line_start = 0
+        else:
+            line_start += 1
+        line_end = text.find("\n", max(end_index, 0))
+        if line_end < 0:
+            line_end = len(text)
+        return text[line_start:line_end].strip()
+
+    @staticmethod
+    def _strip_inline_citations(text: str) -> str:
+        return re.sub(r"\[\[\d+\]\]\([^)]+\)", "", text or "").strip()
+
+    def _split_title_and_snippet(self, line: str, url: str) -> Tuple[str, str]:
+        normalized = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line or "").strip(" \t-–—:")
+        for separator in (" — ", " – ", " - ", ": "):
+            if separator in normalized:
+                left, right = normalized.split(separator, 1)
+                title = (left or "").strip()[:120]
+                snippet = (right or "").strip()[:500]
+                if title and snippet:
+                    return title, snippet
+
+        fallback_title = normalized[:120] if normalized else self._extract_domain(url)
+        fallback_snippet = normalized[:500] if normalized else "X 社交信号摘要"
+        return fallback_title, fallback_snippet
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(url)
+            domain = parsed.netloc.replace("www.", "")
+            return domain or "x.com"
+        except Exception:
+            return "x.com"
+
+
 class SearchService:
     """
     搜索服务
@@ -1644,6 +1939,8 @@ class SearchService:
         brave_keys: Optional[List[str]] = None,
         serpapi_keys: Optional[List[str]] = None,
         minimax_keys: Optional[List[str]] = None,
+        xai_keys: Optional[List[str]] = None,
+        xai_search_model: str = "grok-4-1-fast-reasoning",
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = True,
         news_max_age_days: int = 3,
@@ -1658,12 +1955,15 @@ class SearchService:
             brave_keys: Brave Search API Key 列表
             serpapi_keys: SerpAPI Key 列表
             minimax_keys: MiniMax API Key 列表
+            xai_keys: xAI API Key 列表（用于 X 社交信号）
+            xai_search_model: xAI X Search 使用的模型
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
         self._providers: List[BaseSearchProvider] = []
+        self._x_signal_provider: Optional[XAIXSearchProvider] = None
         self.news_max_age_days = max(1, news_max_age_days)
         raw_profile = (news_strategy_profile or "short").strip().lower()
         self.news_strategy_profile = normalize_news_strategy_profile(news_strategy_profile)
@@ -1707,10 +2007,15 @@ class SearchService:
             self._providers.append(MiniMaxSearchProvider(minimax_keys))
             logger.info(f"已配置 MiniMax 搜索，共 {len(minimax_keys)} 个 API Key")
 
-        # 6. SearXNG（自建实例优先；未配置时可自动发现公共实例）
+        # 6. SearXNG（自建实例优先；未配置其他引擎时可自动发现公共实例兜底）
+        use_public = bool(
+            searxng_public_instances_enabled
+            and not searxng_base_urls
+            and not self._providers
+        )
         searxng_provider = SearXNGSearchProvider(
             searxng_base_urls,
-            use_public_instances=bool(searxng_public_instances_enabled and not searxng_base_urls),
+            use_public_instances=use_public,
         )
         if searxng_provider.is_available:
             self._providers.append(searxng_provider)
@@ -1722,10 +2027,15 @@ class SearchService:
         if not self._providers:
             logger.warning("未配置任何搜索能力，新闻搜索功能将不可用")
 
+        if xai_keys:
+            self._x_signal_provider = XAIXSearchProvider(xai_keys, model=xai_search_model)
+            logger.info(f"已配置 xAI X Search，共 {len(xai_keys)} 个 API Key")
+
         # In-memory search result cache: {cache_key: (timestamp, SearchResponse)}
         self._cache: Dict[str, Tuple[float, 'SearchResponse']] = {}
         # Default cache TTL in seconds (10 minutes)
         self._cache_ttl: int = 600
+        self._us_sec_adapter = UsSecFundamentalAdapter()
         logger.info(
             "新闻时效策略已启用: profile=%s, profile_days=%s, NEWS_MAX_AGE_DAYS=%s, effective_window=%s",
             self.news_strategy_profile,
@@ -1749,6 +2059,12 @@ class SearchService:
         if code.isdigit() and len(code) == 5:
             return True
         return False
+
+    @staticmethod
+    def _market_tag(stock_code: str) -> str:
+        """返回市场标签: cn/us/hk。"""
+        market = get_market_for_stock(stock_code)
+        return market or "cn"
 
     # A-share ETF code prefixes (Shanghai 51/52/56/58, Shenzhen 15/16/18)
     _A_ETF_PREFIXES = ('51', '52', '56', '58', '15', '16', '18')
@@ -1774,6 +2090,576 @@ class SearchService:
             name_upper = (stock_name or '').upper()
             return any(kw in name_upper for kw in SearchService._ETF_NAME_KEYWORDS)
         return False
+
+    _US_CHINA_EXPOSURE_KEYWORDS = {
+        "revenue": (
+            "greater china",
+            "china revenue",
+            "china sales",
+            "china demand",
+            "mainland china",
+            "prc",
+            "中国市场",
+            "中国收入",
+            "大中华",
+        ),
+        "supply_chain": (
+            "supply chain",
+            "supplier",
+            "manufactur",
+            "assembly",
+            "factory",
+            "made in china",
+            "中国供应链",
+            "中国制造",
+            "组装",
+        ),
+        "policy": (
+            "tariff",
+            "export control",
+            "sanction",
+            "geopolitical",
+            "rare earth",
+            "china policy",
+            "中美",
+            "关税",
+            "出口管制",
+            "稀土",
+            "中国政策",
+        ),
+    }
+    _US_CHINA_SIGNAL_LABELS = {
+        "revenue": "中国收入/需求",
+        "supply_chain": "中国供应链/制造",
+        "policy": "中国政策/关税/出口管制",
+    }
+
+    @staticmethod
+    def _market_label(market: str) -> str:
+        return {
+            "cn": "A股",
+            "hk": "港股",
+            "us": "美股",
+        }.get(market, market or "未知市场")
+
+    def _summarize_us_china_exposure(
+        self,
+        stock_name: str,
+        intel_results: Optional[Dict[str, SearchResponse]],
+        is_index_etf: bool,
+    ) -> Dict[str, Any]:
+        """Heuristically assess whether China policy should materially affect a US stock."""
+        if is_index_etf:
+            return {
+                "level": "holdings_based",
+                "level_label": "看持仓结构",
+                "policy_weight": "holdings_based",
+                "policy_weight_label": "按持仓结构决定",
+                "signals": [],
+                "reasoning": (
+                    f"{stock_name} 属于指数/ETF，需先看成分股和行业权重；只有当重仓行业或核心持仓对中国"
+                    "收入、供应链或政策高度敏感时，才提高中国政策权重。"
+                ),
+            }
+
+        results = intel_results or {}
+        direct_response = results.get("china_exposure")
+        direct_summary = (
+            direct_response.metadata.get("china_exposure", {})
+            if isinstance(direct_response, SearchResponse)
+            else {}
+        )
+        if isinstance(direct_summary, dict) and direct_summary:
+            level = str(direct_summary.get("level") or "unknown")
+            level_label = {
+                "high": "高",
+                "medium": "中",
+                "low": "低",
+                "unknown": "未知",
+            }.get(level, "未知")
+            policy_weight = {
+                "high": "high",
+                "medium": "medium",
+                "low": "low",
+            }.get(level, "guarded")
+            policy_weight_label = {
+                "high": "高权重",
+                "medium": "中等权重",
+                "low": "低权重",
+                "guarded": "谨慎使用",
+            }[policy_weight if policy_weight in {"high", "medium", "low"} else "guarded"]
+            signals = list(direct_summary.get("signals", []))
+            if signals:
+                reasoning = (
+                    f"基于 SEC {direct_summary.get('filing_form') or 'filing'} 原文检索到 "
+                    f"{'、'.join(signals)} 证据，中国政策影响权重判定为{level_label}。"
+                )
+            else:
+                reasoning = (
+                    f"已检查 SEC {direct_summary.get('filing_form') or 'filing'} 原文，未检索到明确的中国收入、"
+                    "供应链或政策传导证据；默认不应把中国政策当成核心驱动。"
+                )
+            return {
+                "level": level,
+                "level_label": level_label,
+                "policy_weight": policy_weight,
+                "policy_weight_label": policy_weight_label,
+                "signals": signals,
+                "evidence": list(direct_summary.get("evidence", []))[:4],
+                "reasoning": reasoning,
+                "filing_url": direct_summary.get("filing_url", ""),
+            }
+
+        matched_groups = set()
+        evidence: List[str] = []
+
+        for dim_name in ("china_exposure", "official_filings", "risk_check", "industry", "latest_news"):
+            response = results.get(dim_name)
+            if not response or not response.success:
+                continue
+            for item in response.results[:3]:
+                text = f"{item.title} {item.snippet}".lower()
+                local_hits = []
+                for group, keywords in self._US_CHINA_EXPOSURE_KEYWORDS.items():
+                    if any(keyword in text for keyword in keywords):
+                        matched_groups.add(group)
+                        local_hits.append(group)
+                if local_hits:
+                    signals = "、".join(self._US_CHINA_SIGNAL_LABELS[group] for group in sorted(set(local_hits)))
+                    evidence.append(f"{item.source}:{signals}")
+
+        signal_labels = [self._US_CHINA_SIGNAL_LABELS[group] for group in sorted(matched_groups)]
+        signals_text = "、".join(signal_labels)
+
+        if "revenue" in matched_groups and ("supply_chain" in matched_groups or "policy" in matched_groups):
+            level = "high"
+            level_label = "高"
+            policy_weight = "high"
+            policy_weight_label = "高权重"
+            reasoning = (
+                f"检索结果同时出现 {signals_text} 证据，说明该美股与中国业务/供应链/政策传导关系较强，"
+                "分析时应把中国政策视作高权重外部变量之一，但仍需与 SEC 披露和财报指引交叉验证。"
+            )
+        elif len(matched_groups) >= 2:
+            level = "medium"
+            level_label = "中"
+            policy_weight = "medium"
+            policy_weight_label = "中等权重"
+            reasoning = (
+                f"检索结果出现 {signals_text} 线索，说明该美股对中国存在一定经营或政策暴露，"
+                "中国政策可作为中等权重因子，不应脱离财报与估值单独下结论。"
+            )
+        elif len(matched_groups) == 1:
+            level = "low"
+            level_label = "低"
+            policy_weight = "low"
+            policy_weight_label = "低权重"
+            reasoning = (
+                f"当前只看到 {signals_text} 的零散线索，中国政策只应作为低权重辅助因子，"
+                "除非后续公告或财报进一步确认，否则不要让其主导结论。"
+            )
+        else:
+            level = "unknown"
+            level_label = "未知"
+            policy_weight = "guarded"
+            policy_weight_label = "谨慎使用"
+            reasoning = (
+                "当前检索结果没有足够证据证明该美股对中国收入、供应链或政策高度敏感，"
+                "默认不应把中国政策当成核心驱动，只能作为待验证背景变量。"
+            )
+
+        return {
+            "level": level,
+            "level_label": level_label,
+            "policy_weight": policy_weight,
+            "policy_weight_label": policy_weight_label,
+            "signals": signal_labels,
+            "evidence": evidence[:4],
+            "reasoning": reasoning,
+        }
+
+    def build_market_intel_summary(
+        self,
+        stock_code: str,
+        stock_name: str,
+        intel_results: Optional[Dict[str, SearchResponse]] = None,
+    ) -> Dict[str, Any]:
+        """Return market-specific guidance so downstream prompts can apply the right logic."""
+        market = self._market_tag(stock_code)
+        is_index_etf = self.is_index_or_etf(stock_code, stock_name)
+        summary: Dict[str, Any] = {
+            "market": market,
+            "market_label": self._market_label(market),
+            "is_index_etf": is_index_etf,
+        }
+
+        if market == "us":
+            summary.update({
+                "official_source_priority": "SEC 直连披露、财报电话会、公司指引、美国市场定位数据",
+                "analysis_focus": (
+                    "先看 SEC/财报/指引/诉讼与估值，再决定政策变量权重；不要默认把中国政策当成主线。"
+                ),
+                "policy_scope": (
+                    "中国政策只有在存在明确的中国收入、供应链、制造、关税或出口管制暴露时，"
+                    "才应上调为重要因子。"
+                ),
+                "china_exposure": self._summarize_us_china_exposure(stock_name, intel_results, is_index_etf),
+            })
+            return summary
+
+        if market == "hk":
+            summary.update({
+                "official_source_priority": "HKEX 官方事件页/公告、业绩公告、配股/回购/分红安排、港股卖方报告",
+                "analysis_focus": "先看 HKEX 披露和盈利/融资安排，再看行业景气、南向资金与内地业务暴露。",
+                "policy_scope": (
+                    "内地政策通常是港股的重要二级因子；若公司主营、客户或资产明显依赖内地，"
+                    "可进一步上调权重，否则不要单靠内地政策归因。"
+                ),
+            })
+            return summary
+
+        summary.update({
+            "official_source_priority": "巨潮直连公告、沪深交易所公告、业绩预告、监管函、资金流与板块数据",
+            "analysis_focus": "政策、监管、业绩预告与资金流本身就是 A 股核心变量，应直接纳入主判断。",
+            "policy_scope": "中国政策与产业监管属于核心主因，不需要额外做 China exposure 闸门判断。",
+        })
+        return summary
+
+    @staticmethod
+    def _build_failed_response(
+        query: str,
+        provider: str,
+        error_message: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SearchResponse:
+        return SearchResponse(
+            query=query,
+            results=[],
+            provider=provider,
+            success=False,
+            error_message=error_message,
+            metadata=metadata or {},
+        )
+
+    @staticmethod
+    def _strip_markup(text: str) -> str:
+        clean = re.sub(r"(?s)<[^>]+>", " ", text or "")
+        return re.sub(r"\s+", " ", clean).strip()
+
+    @staticmethod
+    def _format_timestamp_ms(timestamp_ms: Any) -> Optional[str]:
+        try:
+            return datetime.fromtimestamp(float(timestamp_ms) / 1000.0).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+
+    @staticmethod
+    def _hk_row_matches_code(row_text: str, target_code: str) -> bool:
+        target_digits = re.sub(r"\D", "", target_code or "")
+        if not target_digits:
+            return False
+        try:
+            normalized_target = str(int(target_digits))
+        except ValueError:
+            normalized_target = target_digits.lstrip("0") or "0"
+
+        candidates = set()
+        for token in re.findall(r"\b\d{1,5}\b", row_text or ""):
+            try:
+                candidates.add(str(int(token)))
+            except ValueError:
+                continue
+        return normalized_target in candidates
+
+    def can_run_comprehensive_intel(self, stock_code: str = "") -> bool:
+        """Whether comprehensive intel can run via direct official feeds or search engines."""
+        market = self._market_tag(stock_code) if stock_code else "cn"
+        if market in {"cn", "hk", "us"}:
+            return True
+        return self.is_available
+
+    def _run_provider_search(
+        self,
+        query: str,
+        provider_index: int,
+        *,
+        max_results: int = 3,
+    ) -> Tuple[SearchResponse, int]:
+        available_providers = [p for p in self._providers if p.is_available]
+        if not available_providers:
+            return self._build_failed_response(query, "None", "未配置搜索引擎 API Key"), provider_index
+
+        provider = available_providers[provider_index % len(available_providers)]
+        provider_index += 1
+        logger.info(f"[情报搜索] 使用 {provider.name}: {query}")
+        response = provider.search(query, max_results=max_results, days=self.news_max_age_days)
+        return response, provider_index
+
+    def _recent_day_range(self, lookback_days: int = 180) -> Tuple[str, str]:
+        end = datetime.now()
+        start = end - timedelta(days=max(lookback_days, self.news_max_age_days))
+        return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+    def _direct_cninfo_announcements(
+        self,
+        stock_code: str,
+        stock_name: str,
+        *,
+        query: str,
+        limit: int = 4,
+    ) -> SearchResponse:
+        normalized_code = re.sub(r"\D", "", stock_code or "")
+        searchkey = stock_name or normalized_code
+        if not searchkey:
+            return self._build_failed_response(query, "CNINFO", "missing stock identifier")
+
+        start_date, end_date = self._recent_day_range(lookback_days=180)
+        payload = {
+            "pageNum": 1,
+            "pageSize": max(10, limit * 3),
+            "tabName": "fulltext",
+            "plate": "",
+            "searchkey": searchkey,
+            "secid": "",
+            "stock": "",
+            "category": "",
+            "trade": "",
+            "seDate": f"{start_date}~{end_date}",
+            "sortName": "",
+            "sortType": "",
+            "isHLtitle": "true",
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        try:
+            response = requests.post(
+                "https://www.cninfo.com.cn/new/hisAnnouncement/query",
+                data=payload,
+                headers=headers,
+                timeout=8,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            return self._build_failed_response(query, "CNINFO", f"cninfo:{type(exc).__name__}")
+
+        announcements = data.get("announcements") or []
+        if normalized_code:
+            matched = [item for item in announcements if str(item.get("secCode") or "").zfill(6) == normalized_code.zfill(6)]
+            if matched:
+                announcements = matched
+
+        results: List[SearchResult] = []
+        for item in announcements[:limit]:
+            title = self._strip_markup(item.get("announcementTitle") or item.get("shortTitle") or "")
+            sec_name = self._strip_markup(item.get("secName") or item.get("tileSecName") or stock_name)
+            file_path = str(item.get("adjunctUrl") or "").lstrip("/")
+            url = f"https://static.cninfo.com.cn/{file_path}" if file_path else "https://www.cninfo.com.cn/"
+            snippet = f"{sec_name} 公告，类型={item.get('announcementType') or '未分类'}。"
+            results.append(
+                SearchResult(
+                    title=title or f"{sec_name} 公告",
+                    snippet=snippet,
+                    url=url,
+                    source="cninfo.com.cn",
+                    published_date=self._format_timestamp_ms(item.get("announcementTime")),
+                )
+            )
+
+        if not results:
+            return self._build_failed_response(query, "CNINFO", "未找到匹配公告")
+
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider="CNINFO",
+            success=True,
+            metadata={"official_source": "cninfo"},
+        )
+
+    def _build_event_response_from_results(
+        self,
+        query: str,
+        provider: str,
+        source_results: List[SearchResult],
+        keywords: Tuple[str, ...],
+        *,
+        fallback_message: str,
+    ) -> SearchResponse:
+        lower_keywords = tuple(keyword.lower() for keyword in keywords)
+        matched = [
+            item for item in source_results
+            if any(keyword in f"{item.title} {item.snippet}".lower() for keyword in lower_keywords)
+        ]
+        if not matched:
+            return self._build_failed_response(query, provider, fallback_message)
+        return SearchResponse(
+            query=query,
+            results=matched[:4],
+            provider=provider,
+            success=True,
+            metadata={"official_source": provider.lower()},
+        )
+
+    def _direct_hk_event_calendar(
+        self,
+        stock_code: str,
+        stock_name: str,
+        *,
+        query: str,
+        limit: int = 4,
+    ) -> SearchResponse:
+        code_digits = re.sub(r"\D", "", stock_code or "").zfill(5)
+        if not code_digits:
+            return self._build_failed_response(query, "HKEX", "missing hk stock code")
+
+        endpoints = [
+            (
+                "https://www3.hkexnews.hk/reports/bmn/ebmn.htm",
+                ("board meeting", "results", "profit warning", "annual", "interim"),
+                "board meeting notification",
+            ),
+            (
+                "https://www3.hkexnews.hk/reports/doe/eent.htm",
+                ("dividend", "entitlement", "ex-date", "book close"),
+                "dividend / entitlement schedule",
+            ),
+        ]
+        collected: List[SearchResult] = []
+        for url, keywords, label in endpoints:
+            try:
+                tables = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+                tables.raise_for_status()
+                dfs = pd.read_html(StringIO(tables.text))
+            except Exception as exc:
+                logger.debug(f"[HKEX] 官方事件页面读取失败 {url}: {exc}")
+                continue
+            if len(dfs) < 2:
+                continue
+            df = dfs[1].copy()
+            df.columns = [str(col).strip() for col in df.columns]
+            joined = df.apply(lambda row: " ".join(str(v) for v in row.tolist()), axis=1)
+            matched = df[joined.map(lambda value: self._hk_row_matches_code(value, code_digits))]
+            for _, row in matched.head(limit).iterrows():
+                values = [str(v).strip() for v in row.tolist() if str(v).strip() and str(v).strip() != "nan"]
+                if not values:
+                    continue
+                title = f"{stock_name or stock_code} {label}"
+                snippet = " | ".join(values[:5])
+                collected.append(
+                    SearchResult(
+                        title=title,
+                        snippet=snippet,
+                        url=url,
+                        source="hkex.com.hk",
+                    )
+                )
+
+        if not collected:
+            return self._build_failed_response(query, "HKEX", "未找到港股官方事件日历")
+
+        return SearchResponse(
+            query=query,
+            results=collected[:limit],
+            provider="HKEX",
+            success=True,
+            metadata={"official_source": "hkex_event_pages"},
+        )
+
+    def _direct_sec_filings(
+        self,
+        stock_code: str,
+        stock_name: str,
+        *,
+        query: str,
+        limit: int = 4,
+    ) -> SearchResponse:
+        filings = self._us_sec_adapter.get_recent_filings(
+            stock_code,
+            forms=["10-K", "10-K/A", "10-Q", "10-Q/A", "8-K", "20-F", "20-F/A", "6-K", "4", "13D", "13D/A", "13G", "13G/A"],
+            limit=limit,
+        )
+        if filings.get("status") != "ok":
+            error = ";".join(filings.get("errors", [])) or "未找到 SEC 披露"
+            return self._build_failed_response(query, "SEC", error)
+
+        results = [
+            SearchResult(
+                title=f"{stock_name or stock_code} {item.get('form')} filed",
+                snippet=f"SEC filing form {item.get('form')} on {item.get('filed')}.",
+                url=item.get("url") or "https://www.sec.gov/",
+                source="sec.gov",
+                published_date=item.get("filed"),
+            )
+            for item in filings.get("items", [])[:limit]
+        ]
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider="SEC",
+            success=True,
+            metadata={"official_source": "sec", "filings": filings.get("items", [])[:limit]},
+        )
+
+    def _direct_us_china_exposure(
+        self,
+        stock_code: str,
+        stock_name: str,
+        *,
+        query: str,
+    ) -> SearchResponse:
+        summary = self._us_sec_adapter.get_china_exposure_summary(stock_code)
+        if summary.get("status") not in {"partial", "ok"}:
+            error = ";".join(summary.get("errors", [])) or "no sec exposure evidence"
+            return self._build_failed_response(query, "SEC", error, metadata={"china_exposure": summary})
+
+        signals = summary.get("signals", [])
+        title = (
+            f"{stock_name or stock_code} China exposure ({summary.get('level', 'unknown')})"
+        )
+        snippet_parts = []
+        if signals:
+            snippet_parts.append("、".join(signals))
+        if summary.get("evidence"):
+            snippet_parts.append(summary["evidence"][0])
+        snippet = " | ".join(part for part in snippet_parts if part) or "SEC filing text did not show strong China exposure signals."
+        results = [
+            SearchResult(
+                title=title,
+                snippet=snippet,
+                url=summary.get("filing_url") or "https://www.sec.gov/",
+                source="sec.gov",
+                published_date=summary.get("filing_date"),
+            )
+        ]
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider="SEC",
+            success=True,
+            metadata={"china_exposure": summary},
+        )
+
+    def _direct_x_social_signal(
+        self,
+        stock_code: str,
+        stock_name: str,
+        *,
+        query: str,
+        limit: int = 4,
+    ) -> SearchResponse:
+        if not self._x_signal_provider or not self._x_signal_provider.is_available:
+            return self._build_failed_response(query, "xAI X Search", "未配置 XAI_API_KEY")
+
+        return self._x_signal_provider.search(
+            query=query or f"{stock_name} {stock_code} X social signal",
+            max_results=limit,
+            days=self.news_max_age_days,
+        )
 
     @property
     def is_available(self) -> bool:
@@ -2230,12 +3116,18 @@ class SearchService:
             success=False,
             error_message="事件搜索失败"
         )
+
+    def search_x_signals(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+        """Search X social signals via xAI X Search provider."""
+        if not self._x_signal_provider or not self._x_signal_provider.is_available:
+            return self._build_failed_response(query, "xAI X Search", "未配置 XAI_API_KEY")
+        return self._x_signal_provider.search(query, max_results=max_results, days=days)
     
     def search_comprehensive_intel(
         self,
         stock_code: str,
         stock_name: str,
-        max_searches: int = 3
+        max_searches: int = 9
     ) -> Dict[str, SearchResponse]:
         """
         多维度情报搜索（同时使用多个引擎、多个维度）
@@ -2253,12 +3145,101 @@ class SearchService:
         Returns:
             {维度名称: SearchResponse} 字典
         """
-        results = {}
+        results: Dict[str, SearchResponse] = {}
         search_count = 0
 
+        market = self._market_tag(stock_code)
         is_foreign = self._is_foreign_stock(stock_code)
         is_index_etf = self.is_index_or_etf(stock_code, stock_name)
 
+        # --- Phase 1: direct-only intelligence dimensions (market-specific) ---
+        direct_dimensions: List[Dict[str, Any]] = []
+        if market == "us" and not is_index_etf:
+            direct_dimensions = [
+                {
+                    'name': 'official_filings',
+                    'query': (
+                        f"site:sec.gov {stock_name} {stock_code} "
+                        f"(10-Q OR 10-K OR 8-K OR \"Form 4\" OR \"13D\" OR \"13G\")"
+                    ),
+                    'desc': '官方披露',
+                    'direct_kind': 'sec_filings',
+                },
+                {
+                    'name': 'china_exposure',
+                    'query': (
+                        f"{stock_name} {stock_code} "
+                        f"(\"Greater China\" OR China revenue OR China sales OR China supply chain "
+                        f"OR tariff OR export control OR PRC)"
+                    ),
+                    'desc': '中国暴露',
+                    'direct_kind': 'sec_china_exposure',
+                },
+            ]
+            if self._x_signal_provider and self._x_signal_provider.is_available:
+                direct_dimensions.append({
+                    'name': 'x_signal',
+                    'query': (
+                        f"{stock_name} {stock_code} earnings guidance product launch lawsuit "
+                        f"short report analyst downgrade CEO comments"
+                    ),
+                    'desc': 'X社交信号',
+                    'direct_kind': 'x_social_signal',
+                    'engine_fallback': False,
+                })
+        elif market == "hk":
+            direct_dimensions = [
+                {
+                    'name': 'official_announcements',
+                    'query': (
+                        f"(site:hkexnews.hk OR site:hkex.com.hk) "
+                        f"{stock_name} {stock_code} announcement results profit warning buyback"
+                    ),
+                    'desc': '官方公告',
+                    'direct_kind': 'hk_events',
+                },
+            ]
+        elif market == "cn":
+            direct_dimensions = [
+                {
+                    'name': 'official_announcements',
+                    'query': (
+                        f"(site:cninfo.com.cn OR site:sse.com.cn OR site:szse.cn) "
+                        f"{stock_name} {stock_code} 公告"
+                    ),
+                    'desc': '官方公告',
+                    'direct_kind': 'cn_official',
+                    'engine_fallback': False,
+                },
+            ]
+
+        provider_index = 0
+        deferred_fallbacks: List[Dict[str, Any]] = []
+        for dim in direct_dimensions:
+            query = dim.get('query', '')
+            response: Optional[SearchResponse] = None
+            direct_kind = dim.get('direct_kind')
+
+            if direct_kind == 'cn_official':
+                response = self._direct_cninfo_announcements(stock_code, stock_name, query=query)
+            elif direct_kind == 'hk_events':
+                response = self._direct_hk_event_calendar(stock_code, stock_name, query=query)
+            elif direct_kind == 'sec_filings':
+                response = self._direct_sec_filings(stock_code, stock_name, query=query)
+            elif direct_kind == 'sec_china_exposure':
+                response = self._direct_us_china_exposure(stock_code, stock_name, query=query)
+            elif direct_kind == 'x_social_signal':
+                response = self._direct_x_social_signal(stock_code, stock_name, query=query)
+
+            if response is not None and response.success:
+                results[dim['name']] = response
+                logger.info(f"[情报搜索] {dim['desc']}: 获取 {len(response.results)} 条结果 (来源: {response.provider})")
+            else:
+                results[dim['name']] = response if response is not None else self._build_failed_response(query, "None", "无可用情报源")
+                if dim.get('engine_fallback', True) and query:
+                    deferred_fallbacks.append(dim)
+
+        # --- Phase 2: search-engine dimensions (with strict_freshness / tavily_topic) ---
         if is_foreign:
             search_dimensions = [
                 {
@@ -2372,9 +3353,6 @@ class SearchService:
             provider_max_results,
         )
         
-        # 轮流使用不同的搜索引擎
-        provider_index = 0
-        
         for dim in search_dimensions:
             if search_count >= max_searches:
                 break
@@ -2402,7 +3380,7 @@ class SearchService:
                     max_results=provider_max_results,
                     days=search_days,
                 )
-            if dim['strict_freshness']:
+            if dim.get('strict_freshness'):
                 filtered_response = self._filter_news_response(
                     response,
                     search_days=search_days,
@@ -2429,6 +3407,17 @@ class SearchService:
             
             # 短暂延迟避免请求过快
             time.sleep(0.5)
+
+        # --- Phase 3: deferred engine fallback for failed direct dimensions ---
+        for dim in deferred_fallbacks:
+            if not self.is_available:
+                break
+            query = dim.get('query', '')
+            logger.info(f"[情报搜索] {dim['desc']}: 搜索引擎回退")
+            response, provider_index = self._run_provider_search(query, provider_index, max_results=3)
+            if response is not None:
+                results[dim['name']] = response
+            time.sleep(0.5)
         
         return results
     
@@ -2446,7 +3435,19 @@ class SearchService:
         lines = [f"【{stock_name} 情报搜索结果】"]
         
         # 维度展示顺序
-        display_order = ['latest_news', 'market_analysis', 'risk_check', 'earnings', 'industry']
+        display_order = [
+            'latest_news',
+            'official_announcements',
+            'official_filings',
+            'china_exposure',
+            'x_signal',
+            'event_calendar',
+            'risk_check',
+            'earnings',
+            'market_analysis',
+            'macro_flows',
+            'industry',
+        ]
         
         for dim_name in display_order:
             if dim_name not in intel_results:
@@ -2457,9 +3458,15 @@ class SearchService:
             # 获取维度描述
             dim_desc = dim_name
             if dim_name == 'latest_news': dim_desc = '📰 最新消息'
+            elif dim_name == 'official_announcements': dim_desc = '📣 官方公告'
+            elif dim_name == 'official_filings': dim_desc = '📄 官方披露'
+            elif dim_name == 'china_exposure': dim_desc = '🇨🇳 中国暴露'
+            elif dim_name == 'x_signal': dim_desc = 'X 社交信号'
+            elif dim_name == 'event_calendar': dim_desc = '🗓️ 事件日历'
             elif dim_name == 'market_analysis': dim_desc = '📈 机构分析'
             elif dim_name == 'risk_check': dim_desc = '⚠️ 风险排查'
             elif dim_name == 'earnings': dim_desc = '📊 业绩预期'
+            elif dim_name == 'macro_flows': dim_desc = '🌐 宏观资金'
             elif dim_name == 'industry': dim_desc = '🏭 行业分析'
             
             lines.append(f"\n{dim_desc} (来源: {resp.provider}):")
@@ -2702,6 +3709,8 @@ def get_search_service() -> SearchService:
             brave_keys=config.brave_api_keys,
             serpapi_keys=config.serpapi_keys,
             minimax_keys=config.minimax_api_keys,
+            xai_keys=config.xai_api_keys,
+            xai_search_model=config.xai_search_model,
             searxng_base_urls=config.searxng_base_urls,
             searxng_public_instances_enabled=config.searxng_public_instances_enabled,
             news_max_age_days=config.news_max_age_days,

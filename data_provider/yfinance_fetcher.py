@@ -160,7 +160,8 @@ class YfinanceFetcher(BaseFetcher):
         # 港股：hk前缀 -> .HK后缀
         if code.startswith('HK'):
             hk_code = code[2:].lstrip('0') or '0'  # 去除前导0，但保留至少一个0
-            hk_code = hk_code.zfill(4)  # 补齐到4位
+            # Yahoo Finance 港股使用4位数字（如 0700.HK），但部分标的需要5位
+            hk_code = hk_code.zfill(4)
             logger.debug(f"转换港股代码: {stock_code} -> {hk_code}.HK")
             return f"{hk_code}.HK"
 

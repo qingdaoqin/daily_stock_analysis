@@ -1067,6 +1067,14 @@ class StockAnalysisPipeline:
             }
             new_df = pd.DataFrame([new_row])
             df = pd.concat([df, new_df], ignore_index=True)
+
+        # Deduplicate by date (keep last) to avoid double-counting if
+        # historical data already includes today's row
+        if 'date' in df.columns:
+            df['_dedup_date'] = pd.to_datetime(df['date']).dt.date
+            df = df.drop_duplicates(subset=['_dedup_date'], keep='last').drop(columns=['_dedup_date'])
+            df = df.reset_index(drop=True)
+
         return df
 
     def _build_context_snapshot(

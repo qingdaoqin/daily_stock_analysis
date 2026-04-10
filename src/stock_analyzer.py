@@ -17,6 +17,7 @@
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Dict, Any, List
 from enum import Enum
@@ -325,7 +326,9 @@ class StockTrendAnalyzer:
         if len(df) >= 60:
             df['MA60'] = df['close'].rolling(window=60).mean()
         else:
-            df['MA60'] = df['MA20']  # 数据不足时使用 MA20 替代
+            # 数据不足时 MA60 设为 NaN，避免误报为 MA20
+            df['MA60'] = float('nan')
+            logger.debug("数据不足 60 条（当前 %d 条），MA60 设为 NaN", len(df))
         return df
 
     def _calculate_macd(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -358,11 +361,15 @@ class StockTrendAnalyzer:
 
     def _calculate_rsi(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        计算 RSI 指标
+        计算 RSI 指标（Wilder's smoothing）
+
+        使用 Wilder 平滑移动平均（EWM alpha=1/n），与主流行情软件
+        （TradingView、Wind、通达信）一致。
 
         公式：
         - RS = 平均上涨幅度 / 平均下跌幅度
         - RSI = 100 - (100 / (1 + RS))
+        - 当 avg_loss == 0 时，RSI = 100（纯上涨周期）
         """
         df = df.copy()
 
@@ -374,15 +381,17 @@ class StockTrendAnalyzer:
             gain = delta.where(delta > 0, 0)
             loss = -delta.where(delta < 0, 0)
 
-            # 计算平均涨跌幅
-            avg_gain = gain.rolling(window=period).mean()
-            avg_loss = loss.rolling(window=period).mean()
+            # 使用 Wilder's smoothing（EWM with alpha=1/period）
+            avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+            avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
 
-            # 计算 RS 和 RSI
-            rs = avg_gain / avg_loss
+            # 计算 RS 和 RSI，显式处理 avg_loss == 0（纯上涨）的情况
+            rs = avg_gain / avg_loss.replace(0, float('nan'))
             rsi = 100 - (100 / (1 + rs))
+            # avg_loss == 0 → RS = inf → RSI = 100
+            rsi = rsi.where(avg_loss != 0, 100.0)
 
-            # 填充 NaN 值
+            # 填充 NaN 值（数据不足时的起始段）
             rsi = rsi.fillna(50)  # 默认中性值
 
             # 添加到 DataFrame
@@ -471,7 +480,12 @@ class StockTrendAnalyzer:
             return
         
         latest = df.iloc[-1]
-        vol_5d_avg = df['volume'].iloc[-6:-1].mean()
+        # 前5个交易日的均量（不包含今日），需至少6行数据
+        if len(df) >= 6:
+            vol_5d_avg = df['volume'].iloc[-6:-1].mean()
+        else:
+            # 数据不足6行时，用除今日外的所有历史均量
+            vol_5d_avg = df['volume'].iloc[:-1].mean()
         
         if vol_5d_avg > 0:
             result.volume_ratio_5d = float(latest['volume']) / vol_5d_avg
@@ -671,7 +685,7 @@ class StockTrendAnalyzer:
 
         # === 乖离率评分（20分，强势趋势补偿）===
         bias = result.bias_ma5
-        if bias != bias or bias is None:  # NaN or None defense
+        if bias is None or (isinstance(bias, float) and math.isnan(bias)):
             bias = 0.0
         market_profile = self._resolve_market_profile(result.code)
         base_threshold = max(
@@ -680,7 +694,9 @@ class StockTrendAnalyzer:
         )
 
         # Strong trend compensation: relax threshold for STRONG_BULL with high strength
-        trend_strength = result.trend_strength if result.trend_strength == result.trend_strength else 0.0
+        trend_strength = result.trend_strength
+        if trend_strength is None or (isinstance(trend_strength, float) and math.isnan(trend_strength)):
+            trend_strength = 0.0
         if result.trend_status == TrendStatus.STRONG_BULL and (trend_strength or 0) >= 70:
             effective_threshold = base_threshold * float(market_profile["strong_multiplier"])
             is_strong_trend = True

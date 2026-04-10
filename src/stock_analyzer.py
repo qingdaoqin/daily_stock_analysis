@@ -346,7 +346,7 @@ class StockTrendAnalyzer:
             df['MA60'] = df['close'].rolling(window=60).mean()
         else:
             # 数据不足时 MA60 设为 NaN，避免误报为 MA20
-            # Downstream consumers: analyze() reads MA60 at line ~314 via latest.get('MA60', 0);
+            # Downstream consumers: analyze() reads MA60 via latest.get('MA60', 0);
             # _analyze_trend() uses MA60 for trend classification; _generate_signal() accesses
             # result.ma60 with NaN guards (math.isnan checks).
             df['MA60'] = float('nan')

@@ -531,6 +531,8 @@ def _is_value_placeholder(v: Any) -> bool:
 
     Note: numeric 0 is NOT treated as placeholder — 0 can be a valid value
     (e.g. bias_ma5 = 0.0%, MACD bar = 0).
+    For chip_structure fields, use ``_is_chip_value_placeholder()`` which
+    additionally treats numeric 0 as placeholder.
     """
     if v is None:
         return True

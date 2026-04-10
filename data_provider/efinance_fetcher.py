@@ -137,7 +137,11 @@ _etf_realtime_cache: Dict[str, Any] = {
 }
 _etf_realtime_cache_lock = threading.Lock()
 
-# Lock for one-time requests.Session monkey-patch (UA injection)
+# Lock for one-time requests.Session monkey-patch (UA injection).
+# Note: the patch modifies requests.Session.__init__ globally (process-wide),
+# so all Session instances — including those created by other libraries —
+# will inherit the rotated User-Agent.  The prefix "dsa" stands for
+# "daily_stock_analysis" to namespace the injected attributes.
 _ua_patch_lock = threading.Lock()
 
 

@@ -152,20 +152,6 @@ jobs:
             const currentRunId = Number(process.env.GITHUB_RUN_ID);
             const currentRunNumber = Number(process.env.GITHUB_RUN_NUMBER);
 
-            // 判断一个 cron 表达式属于哪个市场窗口
-            function cronToMarket(cron) {
-              if (!cron) return "";
-              // A 股 cron 包含 "0 *"（UTC hour 0 的 30,40,50 分）
-              if (/\b0\s+\*/.test(cron) || /\s0\s/.test(cron)) {
-                // 精确检查：分钟含 30/40/50 且小时为 0
-                const parts = cron.trim().split(/\s+/);
-                if (parts.length >= 2 && parts[1] === "0") return "cn";
-              }
-              // 美股 cron 包含小时 13 或 14
-              if (/\b1[34]\b/.test(cron)) return "us";
-              return "";
-            }
-
             const { owner, repo } = context.repo;
             const response = await github.rest.actions.listWorkflowRuns({
               owner,
@@ -188,9 +174,7 @@ jobs:
               }).format(createdAt);
               if (runDate !== dedupeDate) return false;
 
-              // 按市场过滤：同市场窗口的运行才算重复
-              const runCron = (run.path || "").match(/cron:\s*'([^']+)'/)?.[1] || "";
-              // GitHub API 不直接暴露触发 cron，改用时间段推断
+              // 按市场过滤：同市场窗口的运行才算重复（按 UTC 小时推断）
               const runHourUTC = createdAt.getUTCHours();
               let runMarket = "";
               if (runHourUTC === 0 || runHourUTC === 1) runMarket = "cn";

@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -47,6 +48,419 @@ from src.schemas.report_schema import AnalysisReportSchema
 from src.market_context import get_market_role, get_market_guidelines
 
 logger = logging.getLogger(__name__)
+
+_BUY_SIGNAL_HINTS = {
+    "buy", "strong_buy", "long", "bullish",
+    "买入", "加仓", "强烈买入", "看多", "强烈看多",
+}
+_SELL_SIGNAL_HINTS = {
+    "sell", "strong_sell", "short", "bearish",
+    "卖出", "减仓", "强烈卖出", "看空", "强烈看空",
+}
+_HOLD_SIGNAL_HINTS = {
+    "hold", "neutral", "wait", "watch",
+    "持有", "观望", "震荡", "中性",
+}
+_SIGNAL_LEVEL_BY_ADVICE = {
+    "强烈买入": ("强烈买入", "💚", "强买"),
+    "买入": ("买入", "🟢", "买入"),
+    "加仓": ("买入", "🟢", "买入"),
+    "持有": ("持有", "🟡", "持有"),
+    "观望": ("观望", "⚪", "观望"),
+    "减仓": ("减仓", "🟠", "减仓"),
+    "卖出": ("卖出", "🔴", "卖出"),
+    "强烈卖出": ("卖出", "🔴", "卖出"),
+}
+
+
+def _canonical_decision_signal(value: Any) -> str:
+    """Normalize model-facing decision labels into buy/hold/sell."""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip().lower()
+    if not text:
+        return ""
+    if text in _BUY_SIGNAL_HINTS:
+        return "buy"
+    if text in _SELL_SIGNAL_HINTS:
+        return "sell"
+    if text in _HOLD_SIGNAL_HINTS:
+        return "hold"
+    return ""
+
+
+def _signal_from_operation_advice(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    if any(keyword in text for keyword in ("买入", "加仓", "做多")):
+        return "buy"
+    if any(keyword in text for keyword in ("卖出", "减仓", "止盈", "止损")):
+        return "sell"
+    if any(keyword in text for keyword in ("持有", "观望", "等待")):
+        return "hold"
+    return _canonical_decision_signal(text)
+
+
+def _split_operation_advice_tokens(value: Any) -> List[str]:
+    if not isinstance(value, str):
+        return []
+    tokens: List[str] = []
+    normalized = (
+        value.replace("／", "/")
+        .replace("|", "/")
+        .replace("，", "/")
+        .replace(",", "/")
+        .replace("、", "/")
+    )
+    for part in normalized.split("/"):
+        token = part.strip()
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def _signal_from_trend_prediction(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    if "看空" in text or "bearish" in text.lower():
+        return "sell"
+    if "看多" in text or "bullish" in text.lower():
+        return "buy"
+    if any(keyword in text for keyword in ("震荡", "中性", "盘整")):
+        return "hold"
+    return _canonical_decision_signal(text)
+
+
+def _signal_from_sentiment_score(score: int) -> str:
+    if score >= 60:
+        return "buy"
+    if score <= 39:
+        return "sell"
+    return "hold"
+
+
+def _coerce_sentiment_score_value(value: Any, default: int = 50) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_sentiment_score_to_signal(score: int, signal: str) -> int:
+    return _clamp_sentiment_score_to_signal_with_bias(score, signal, "neutral")
+
+
+def _clamp_sentiment_score_to_signal_with_bias(score: int, signal: str, hold_bias: str = "neutral") -> int:
+    hold_bands = {
+        "bullish": (52, 59),
+        "neutral": (46, 54),
+        "bearish": (40, 47),
+    }
+    bands = {
+        # Upper bound extended from 79 → 100 to allow "强烈买入" (score >= 80)
+        "buy": (60, 100),
+        "hold": hold_bands.get(hold_bias, hold_bands["neutral"]),
+        "sell": (0, 39),
+    }
+    low, high = bands.get(signal, (0, 100))
+    return max(low, min(high, score))
+
+
+def _canonical_operation_advice(signal: str) -> str:
+    return _canonical_operation_advice_with_bias(signal, "neutral")
+
+
+def _canonical_operation_advice_with_bias(signal: str, hold_bias: str = "neutral") -> str:
+    if signal == "hold":
+        return "观望" if hold_bias == "bearish" else "持有"
+    mapping = {
+        "buy": "买入",
+        "sell": "减仓/卖出",
+    }
+    return mapping.get(signal, "观望")
+
+
+def _canonical_trend_prediction(signal: str) -> str:
+    return _canonical_trend_prediction_with_bias(signal, "neutral")
+
+
+def _canonical_trend_prediction_with_bias(signal: str, hold_bias: str = "neutral") -> str:
+    if signal == "hold":
+        hold_mapping = {
+            "bullish": "震荡偏多",
+            "neutral": "震荡",
+            "bearish": "震荡偏空",
+        }
+        return hold_mapping.get(hold_bias, "震荡")
+    mapping = {
+        "buy": "看多",
+        "sell": "看空",
+    }
+    return mapping.get(signal, "震荡")
+
+
+def _canonical_signal_type(signal: str) -> str:
+    return _canonical_signal_type_with_bias(signal, "neutral")
+
+
+def _canonical_signal_type_with_bias(signal: str, hold_bias: str = "neutral") -> str:
+    if signal == "hold":
+        hold_mapping = {
+            "bullish": "持有待机",
+            "neutral": "持有观望",
+            "bearish": "谨慎观望",
+        }
+        return hold_mapping.get(hold_bias, "持有观望")
+    mapping = {
+        "buy": "买入信号",
+        "sell": "卖出信号",
+    }
+    return mapping.get(signal, "持有观望")
+
+
+def get_result_signal_level(result: "AnalysisResult") -> Tuple[str, str, str]:
+    """Return stable display tuple from advice/decision_type/score.
+
+    Display layers should trust the machine-stable ``decision_type`` before
+    score fallback, while still preserving explicit advice when it is known.
+    """
+    advice = getattr(result, "operation_advice", "")
+    score = _coerce_sentiment_score_value(getattr(result, "sentiment_score", 50), 50)
+    decision_signal = _canonical_decision_signal(getattr(result, "decision_type", ""))
+    advice_tokens = _split_operation_advice_tokens(advice)
+
+    if advice in _SIGNAL_LEVEL_BY_ADVICE:
+        return _SIGNAL_LEVEL_BY_ADVICE[advice]
+
+    if advice_tokens:
+        recognized_tokens = [token for token in advice_tokens if token in _SIGNAL_LEVEL_BY_ADVICE]
+        if recognized_tokens:
+            if decision_signal == "buy":
+                if "强烈买入" in recognized_tokens:
+                    return _SIGNAL_LEVEL_BY_ADVICE["强烈买入"]
+                return _SIGNAL_LEVEL_BY_ADVICE["买入"]
+            if decision_signal == "sell":
+                if "强烈卖出" in recognized_tokens or "卖出" in recognized_tokens:
+                    return _SIGNAL_LEVEL_BY_ADVICE["卖出"]
+                return _SIGNAL_LEVEL_BY_ADVICE["减仓"]
+            if decision_signal == "hold":
+                if "持有" in recognized_tokens:
+                    return _SIGNAL_LEVEL_BY_ADVICE["持有"]
+                return _SIGNAL_LEVEL_BY_ADVICE["观望"]
+
+            component_signals = set()
+            for token in recognized_tokens:
+                token_signal = _signal_from_operation_advice(token)
+                if token_signal:
+                    component_signals.add(token_signal)
+            if len(component_signals) == 1:
+                single_signal = next(iter(component_signals))
+                if single_signal == "buy":
+                    return _SIGNAL_LEVEL_BY_ADVICE["买入"]
+                if single_signal == "sell":
+                    if "卖出" in recognized_tokens or "强烈卖出" in recognized_tokens:
+                        return _SIGNAL_LEVEL_BY_ADVICE["卖出"]
+                    return _SIGNAL_LEVEL_BY_ADVICE["减仓"]
+                if "持有" in recognized_tokens:
+                    return _SIGNAL_LEVEL_BY_ADVICE["持有"]
+                return _SIGNAL_LEVEL_BY_ADVICE["观望"]
+
+    if decision_signal == "buy":
+        return _SIGNAL_LEVEL_BY_ADVICE["买入"]
+    if decision_signal == "sell":
+        return _SIGNAL_LEVEL_BY_ADVICE["卖出"]
+    if decision_signal == "hold":
+        trend_text = str(getattr(result, "trend_prediction", "") or "")
+        if "偏空" in trend_text:
+            return _SIGNAL_LEVEL_BY_ADVICE["观望"]
+        return _SIGNAL_LEVEL_BY_ADVICE["持有"]
+
+    if score >= 80:
+        return _SIGNAL_LEVEL_BY_ADVICE["强烈买入"]
+    if score >= 65:
+        return _SIGNAL_LEVEL_BY_ADVICE["买入"]
+    if score >= 55:
+        return _SIGNAL_LEVEL_BY_ADVICE["持有"]
+    if score >= 45:
+        return _SIGNAL_LEVEL_BY_ADVICE["观望"]
+    if score >= 35:
+        return _SIGNAL_LEVEL_BY_ADVICE["减仓"]
+    return _SIGNAL_LEVEL_BY_ADVICE["卖出"]
+
+
+def _default_position_advice_for_signal(signal: str) -> Dict[str, str]:
+    return _default_position_advice_for_signal_with_bias(signal, "neutral")
+
+
+def _default_position_advice_for_signal_with_bias(signal: str, hold_bias: str = "neutral") -> Dict[str, str]:
+    if signal == "hold":
+        hold_mapping = {
+            "bullish": {
+                "no_position": "暂不追价，等回踩支撑位或下一次确认后再考虑介入。",
+                "has_position": "可继续持有，回踩关键支撑不破则耐心观察。",
+            },
+            "neutral": {
+                "no_position": "先观察，等待趋势和消息进一步明朗。",
+                "has_position": "控制仓位，等待新的方向选择。",
+            },
+            "bearish": {
+                "no_position": "暂不开新仓，等待风险释放或重新企稳。",
+                "has_position": "以防守为主，跌破关键位优先减仓。",
+            },
+        }
+        return hold_mapping.get(hold_bias, hold_mapping["neutral"])
+    mapping = {
+        "buy": {
+            "no_position": "可等待回踩支撑位后分批试仓，避免一次性追高。",
+            "has_position": "可继续持有，回踩关键位不破再考虑加仓。",
+        },
+        "sell": {
+            "no_position": "暂不参与，等待风险充分释放后再评估。",
+            "has_position": "优先控制回撤，按计划减仓或离场。",
+        },
+    }
+    return mapping.get(signal, _default_position_advice_for_signal_with_bias("hold", hold_bias))
+
+
+def _resolve_consistent_signal(signals: List[str]) -> Tuple[str, bool]:
+    valid_signals = [signal for signal in signals if signal in {"buy", "hold", "sell"}]
+    if not valid_signals:
+        return "hold", False
+
+    counts = Counter(valid_signals)
+    top_count = max(counts.values())
+    winners = [signal for signal, count in counts.items() if count == top_count]
+    if len(winners) == 1:
+        final_signal = winners[0]
+    else:
+        final_signal = "hold"
+
+    has_conflict = len(set(valid_signals)) > 1
+    if "buy" in valid_signals and "sell" in valid_signals:
+        final_signal = "hold"
+        has_conflict = True
+
+    return final_signal, has_conflict
+
+
+def _derive_hold_bias(
+    signals: List[str],
+    *,
+    trend_prediction: str = "",
+) -> str:
+    valid_signals = [signal for signal in signals if signal in {"buy", "hold", "sell"}]
+    buy_count = valid_signals.count("buy")
+    sell_count = valid_signals.count("sell")
+    if buy_count > sell_count:
+        return "bullish"
+    if sell_count > buy_count:
+        return "bearish"
+    trend_text = str(trend_prediction or "").strip()
+    if "偏多" in trend_text:
+        return "bullish"
+    if "偏空" in trend_text:
+        return "bearish"
+    return "neutral"
+
+
+def _resolve_signal_state(
+    *,
+    decision_signal: str,
+    operation_signal: str,
+    trend_signal: str,
+    score_signal: str,
+    raw_trend_prediction: str = "",
+) -> Tuple[str, bool, str]:
+    """Resolve the stable buy/hold/sell state from top-level signal fields.
+
+    Directional actions still need support from trend or score. When the model
+    emits a weak directional action such as ``buy + 50分 + 震荡``, we downgrade
+    to hold instead of mechanically trusting the action field.
+    """
+    action_signal = decision_signal or operation_signal
+    opposite_pairs = {("buy", "sell"), ("sell", "buy")}
+    hard_conflict = False
+
+    if decision_signal and operation_signal and (decision_signal, operation_signal) in opposite_pairs:
+        hard_conflict = True
+    elif action_signal and trend_signal and (action_signal, trend_signal) in opposite_pairs:
+        hard_conflict = True
+    elif action_signal and score_signal and (action_signal, score_signal) in opposite_pairs:
+        hard_conflict = True
+
+    soft_conflict = False
+    if not hard_conflict and action_signal in {"buy", "sell"}:
+        support_signals = [signal for signal in (trend_signal, score_signal) if signal]
+        directional_support = any(signal == action_signal for signal in support_signals)
+        if support_signals and not directional_support:
+            soft_conflict = True
+
+    has_conflict = hard_conflict or soft_conflict
+    if has_conflict and action_signal in {"buy", "sell"}:
+        final_signal = "hold"
+    elif action_signal:
+        final_signal = action_signal
+    else:
+        final_signal, has_conflict = _resolve_consistent_signal([
+            trend_signal,
+            score_signal,
+        ])
+
+    hold_bias = "neutral"
+    if final_signal == "hold":
+        hold_bias = _derive_hold_bias(
+            [
+                decision_signal,
+                operation_signal,
+                trend_signal,
+                score_signal,
+            ],
+            trend_prediction=raw_trend_prediction,
+        )
+
+    return final_signal, has_conflict, hold_bias
+
+
+def _normalize_dashboard_signal_fields(
+    dashboard: Any,
+    signal: str,
+    *,
+    has_conflict: bool,
+    hold_bias: str = "neutral",
+) -> Any:
+    if not isinstance(dashboard, dict):
+        return dashboard
+
+    dashboard["decision_type"] = signal
+    core = dashboard.get("core_conclusion")
+    if not isinstance(core, dict):
+        core = {}
+        dashboard["core_conclusion"] = core
+
+    core["signal_type"] = _canonical_signal_type_with_bias(signal, hold_bias)
+    if has_conflict or not isinstance(core.get("position_advice"), dict):
+        core["position_advice"] = _default_position_advice_for_signal_with_bias(signal, hold_bias)
+    if has_conflict:
+        hold_summary = {
+            "bullish": ("多空有分歧，当前先持有等待更优买点", "本周内"),
+            "neutral": ("信号存在分歧，当前以观望为主", "不急"),
+            "bearish": ("上行动能不足，当前先观望或偏防守", "今日内"),
+        }
+        summary, time_sensitivity = {
+            "buy": ("趋势偏强，但应等待更优买点", "本周内"),
+            "hold": hold_summary.get(hold_bias, hold_summary["neutral"]),
+            "sell": ("风险偏高，优先减仓防守", "立即行动"),
+        }.get(signal, hold_summary["neutral"])
+        core["one_sentence"] = summary
+        core["time_sensitivity"] = time_sensitivity
+
+    return dashboard
 
 
 def check_content_integrity(result: "AnalysisResult") -> Tuple[bool, List[str]]:
@@ -177,6 +591,19 @@ def _build_chip_structure_from_data(chip_data: Any, language: str = "zh") -> Dic
         "concentration": f"{c90:.2%}",
         "chip_health": chip_health,
     }
+
+
+def _is_chip_value_placeholder(v: Any) -> bool:
+    """Like _is_value_placeholder but also treats numeric 0 as placeholder.
+
+    For chip_structure fields the LLM outputs ``0`` when it has no data,
+    so zero should be treated as "needs to be filled from real data source".
+    """
+    if _is_value_placeholder(v):
+        return True
+    if isinstance(v, (int, float)) and v == 0:
+        return True
+    return False
 
 
 def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> None:
@@ -478,6 +905,71 @@ class AnalysisResult:
             "low": "⭐",
         }
         return star_map.get(str(self.confidence_level or "").strip().lower(), "⭐⭐")
+
+
+def normalize_analysis_result_signals(result: AnalysisResult) -> AnalysisResult:
+    """Normalize an existing AnalysisResult into a self-consistent signal state.
+
+    Used by non-JSON downgrade paths and by agent-mode conversion so every
+    runtime path shares the same decision/advice/trend/dashboard contract.
+    """
+    raw_score = _coerce_sentiment_score_value(getattr(result, "sentiment_score", 50), 50)
+    raw_trend_prediction = getattr(result, "trend_prediction", "震荡")
+    raw_operation_advice = getattr(result, "operation_advice", "持有")
+    raw_decision_type = getattr(result, "decision_type", "")
+
+    decision_signal = _canonical_decision_signal(raw_decision_type)
+    operation_signal = _signal_from_operation_advice(raw_operation_advice)
+    trend_signal = _signal_from_trend_prediction(raw_trend_prediction)
+    score_signal = _signal_from_sentiment_score(raw_score)
+
+    action_signal = decision_signal or operation_signal
+    final_signal, has_conflict, hold_bias = _resolve_signal_state(
+        decision_signal=decision_signal,
+        operation_signal=operation_signal,
+        trend_signal=trend_signal,
+        score_signal=score_signal,
+        raw_trend_prediction=raw_trend_prediction,
+    )
+
+    normalized_score = raw_score
+    if raw_score < 0 or raw_score > 100 or has_conflict or score_signal not in ("", final_signal):
+        normalized_score = _clamp_sentiment_score_to_signal_with_bias(
+            max(0, min(100, raw_score)),
+            final_signal,
+            hold_bias,
+        )
+
+    normalized_trend_prediction = raw_trend_prediction
+    canonical_trend = _canonical_trend_prediction_with_bias(final_signal, hold_bias)
+    if (
+        has_conflict
+        or trend_signal not in ("", final_signal)
+        or (final_signal == "hold" and hold_bias != "neutral" and str(raw_trend_prediction).strip() != canonical_trend)
+    ):
+        normalized_trend_prediction = canonical_trend
+
+    normalized_operation_advice = raw_operation_advice
+    canonical_advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
+    if (
+        not action_signal
+        or has_conflict
+        or operation_signal not in ("", final_signal)
+        or (final_signal == "hold" and hold_bias != "neutral" and str(raw_operation_advice).strip() != canonical_advice)
+    ):
+        normalized_operation_advice = canonical_advice
+
+    result.sentiment_score = normalized_score
+    result.trend_prediction = normalized_trend_prediction
+    result.operation_advice = normalized_operation_advice
+    result.decision_type = final_signal
+    result.dashboard = _normalize_dashboard_signal_fields(
+        result.dashboard,
+        final_signal,
+        has_conflict=has_conflict,
+        hold_bias=hold_bias,
+    )
+    return result
 
 
 class GeminiAnalyzer:

@@ -671,14 +671,16 @@ class DatabaseManager:
             "echo": False,
             "pool_pre_ping": True,
         }
-        if str(db_url).startswith("sqlite"):
+        if str(db_url).startswith("sqlite:"):
             engine_kwargs["connect_args"] = {
                 "timeout": max(self._sqlite_busy_timeout_ms / 1000.0, 1.0),
             }
         
         # 创建数据库引擎
         self._engine = create_engine(db_url, **engine_kwargs)
-        if str(db_url).startswith("sqlite"):
+        self._is_sqlite_engine = self._engine.url.get_backend_name() == "sqlite"
+        self._sqlite_file_db = self._is_sqlite_engine and self._is_file_sqlite_database()
+        if self._is_sqlite_engine:
             self._install_sqlite_pragma_handler(self._engine)
         
         # 创建 Session 工厂
@@ -741,24 +743,34 @@ class DatabaseManager:
             try:
                 cursor.execute(f"PRAGMA busy_timeout={int(self._sqlite_busy_timeout_ms)}")
                 cursor.execute("PRAGMA foreign_keys=ON")
-                if self._sqlite_wal_enabled:
+                if self._sqlite_file_db and self._sqlite_wal_enabled:
                     cursor.execute("PRAGMA journal_mode=WAL")
                     cursor.execute("PRAGMA synchronous=NORMAL")
+            except Exception as exc:
+                logger.warning("初始化 SQLite PRAGMA 失败: %s", exc)
             finally:
                 cursor.close()
 
-    def _is_retryable_sqlite_error(self, exc: Exception) -> bool:
-        """Return True when the exception looks like a transient SQLite lock issue."""
-        if getattr(self._engine.dialect, "name", "") != "sqlite":
+    def _is_file_sqlite_database(self) -> bool:
+        """Return True when the engine points to a file-backed SQLite database."""
+        try:
+            url_str = str(self._engine.url)
+            if ":memory:" in url_str:
+                return False
+            # file-based SQLite URLs look like sqlite:///path or sqlite:////abs/path
+            return url_str.startswith("sqlite")
+        except Exception:
             return False
-        message = str(exc).lower()
-        retry_markers = (
+
+    @staticmethod
+    def _is_retryable_sqlite_error(exc: Exception) -> bool:
+        """Return True when the exception looks like a transient SQLite lock issue."""
+        err_text = str(getattr(exc, "orig", exc)).lower()
+        return any(token in err_text for token in (
             "database is locked",
             "database table is locked",
             "database schema is locked",
-            "database is busy",
-        )
-        return any(marker in message for marker in retry_markers)
+        ))
 
     def _run_write_transaction(
         self,
@@ -768,42 +780,52 @@ class DatabaseManager:
         default: T,
         fail_open: bool = False,
     ) -> T:
-        """Run a write transaction with bounded retry for transient SQLite lock errors."""
-        attempts = self._sqlite_write_retry_max if getattr(self._engine.dialect, "name", "") == "sqlite" else 1
+        """Run a write transaction with bounded retry for transient SQLite lock errors.
+
+        When running against SQLite, issues ``BEGIN IMMEDIATE`` before the
+        user callback so that the writer lock is acquired upfront, preventing
+        race conditions between concurrent read-then-write sequences.
+        """
+        attempts = self._sqlite_write_retry_max if self._is_sqlite_engine else 1
         last_error: Optional[Exception] = None
 
         for attempt in range(1, attempts + 1):
-            with self.get_session() as session:
-                try:
-                    result = worker(session)
-                    session.commit()
-                    return result
-                except OperationalError as exc:
-                    session.rollback()
-                    last_error = exc
-                    if attempt < attempts and self._is_retryable_sqlite_error(exc):
-                        delay = self._sqlite_write_retry_base_delay * (2 ** (attempt - 1))
-                        logger.warning(
-                            "%s 遇到 SQLite 锁竞争，第 %s/%s 次重试，等待 %.2fs: %s",
-                            operation_name,
-                            attempt,
-                            attempts,
-                            delay,
-                            exc,
-                        )
-                        time.sleep(delay)
-                        continue
-                    if fail_open:
-                        logger.debug("%s 失败（fail-open）: %s", operation_name, exc)
-                        return default
-                    raise
-                except Exception as exc:
-                    session.rollback()
-                    last_error = exc
-                    if fail_open:
-                        logger.debug("%s 失败（fail-open）: %s", operation_name, exc)
-                        return default
-                    raise
+            session = self.get_session()
+            try:
+                # SQLite: acquire writer lock immediately to serialise writes
+                if self._is_sqlite_engine:
+                    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                result = worker(session)
+                session.commit()
+                return result
+            except OperationalError as exc:
+                session.rollback()
+                last_error = exc
+                if attempt < attempts and self._is_retryable_sqlite_error(exc):
+                    delay = self._sqlite_write_retry_base_delay * (2 ** (attempt - 1))
+                    logger.warning(
+                        "%s 遇到 SQLite 锁竞争，第 %s/%s 次重试，等待 %.2fs: %s",
+                        operation_name,
+                        attempt,
+                        attempts,
+                        delay,
+                        exc,
+                    )
+                    time.sleep(delay)
+                    continue
+                if fail_open:
+                    logger.debug("%s 失败（fail-open）: %s", operation_name, exc)
+                    return default
+                raise
+            except Exception as exc:
+                session.rollback()
+                last_error = exc
+                if fail_open:
+                    logger.debug("%s 失败（fail-open）: %s", operation_name, exc)
+                    return default
+                raise
+            finally:
+                session.close()
 
         if fail_open:
             logger.debug("%s 最终失败（fail-open）: %s", operation_name, last_error)
@@ -1409,29 +1431,26 @@ class DatabaseManager:
             )
 
         def _worker(session: Session) -> int:
-            if getattr(self._engine.dialect, "name", "") == "sqlite":
-                stmt = sqlite_insert(StockDaily).values(payloads)
-                update_fields = {
-                    "open": stmt.excluded.open,
-                    "high": stmt.excluded.high,
-                    "low": stmt.excluded.low,
-                    "close": stmt.excluded.close,
-                    "volume": stmt.excluded.volume,
-                    "amount": stmt.excluded.amount,
-                    "pct_chg": stmt.excluded.pct_chg,
-                    "ma5": stmt.excluded.ma5,
-                    "ma10": stmt.excluded.ma10,
-                    "ma20": stmt.excluded.ma20,
-                    "volume_ratio": stmt.excluded.volume_ratio,
-                    "data_source": stmt.excluded.data_source,
-                    "updated_at": stmt.excluded.updated_at,
-                }
-                session.execute(
-                    stmt.on_conflict_do_update(
-                        index_elements=["code", "date"],
-                        set_=update_fields,
+            # SQLite has a ~999 bind-parameter limit per statement.
+            # 50 records × ~15 columns = 750 params — safely under the limit.
+            _SQLITE_CHUNK = 50
+            _update_columns = (
+                "open", "high", "low", "close", "volume", "amount",
+                "pct_chg", "ma5", "ma10", "ma20", "volume_ratio",
+                "data_source", "updated_at",
+            )
+
+            if self._is_sqlite_engine:
+                for i in range(0, len(payloads), _SQLITE_CHUNK):
+                    chunk = payloads[i : i + _SQLITE_CHUNK]
+                    stmt = sqlite_insert(StockDaily).values(chunk)
+                    update_fields = {col: getattr(stmt.excluded, col) for col in _update_columns}
+                    session.execute(
+                        stmt.on_conflict_do_update(
+                            index_elements=["code", "date"],
+                            set_=update_fields,
+                        )
                     )
-                )
                 return len(payloads)
 
             saved_count = 0
@@ -1445,21 +1464,7 @@ class DatabaseManager:
                     )
                 ).scalar_one_or_none()
                 if existing:
-                    for key in (
-                        "open",
-                        "high",
-                        "low",
-                        "close",
-                        "volume",
-                        "amount",
-                        "pct_chg",
-                        "ma5",
-                        "ma10",
-                        "ma20",
-                        "volume_ratio",
-                        "data_source",
-                        "updated_at",
-                    ):
+                    for key in _update_columns:
                         setattr(existing, key, payload[key])
                 else:
                     session.add(StockDaily(**payload))

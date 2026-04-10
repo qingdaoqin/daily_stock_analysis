@@ -137,6 +137,9 @@ _etf_realtime_cache: Dict[str, Any] = {
 }
 _etf_realtime_cache_lock = threading.Lock()
 
+# Lock for one-time requests.Session monkey-patch (UA injection)
+_ua_patch_lock = threading.Lock()
+
 
 def _is_etf_code(stock_code: str) -> bool:
     """
@@ -303,16 +306,17 @@ class EfinanceFetcher(BaseFetcher):
             random_ua = random.choice(USER_AGENTS)
             # Patch requests.Session.__init__ once so that every new Session
             # created by akshare/efinance automatically inherits the UA.
-            if not hasattr(requests.Session, '_original_init_dsa'):
-                requests.Session._original_init_dsa = requests.Session.__init__
+            with _ua_patch_lock:
+                if not hasattr(requests.Session, '_original_init_dsa'):
+                    requests.Session._original_init_dsa = requests.Session.__init__
 
-                def _patched_init(self_session, *args, **kwargs):
-                    requests.Session._original_init_dsa(self_session, *args, **kwargs)
-                    ua = getattr(requests.Session, '_dsa_user_agent', None)
-                    if ua:
-                        self_session.headers['User-Agent'] = ua
+                    def _patched_init(self_session, *args, **kwargs):
+                        requests.Session._original_init_dsa(self_session, *args, **kwargs)
+                        ua = getattr(requests.Session, '_dsa_user_agent', None)
+                        if ua:
+                            self_session.headers['User-Agent'] = ua
 
-                requests.Session.__init__ = _patched_init
+                    requests.Session.__init__ = _patched_init
             requests.Session._dsa_user_agent = random_ua
             logger.debug(f"设置 User-Agent: {random_ua[:50]}...")
         except Exception as e:

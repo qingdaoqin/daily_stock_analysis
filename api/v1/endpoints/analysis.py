@@ -169,6 +169,7 @@ def _handle_async_analysis_batch(
         stock_name=None,
         report_type=request.report_type,
         force_refresh=request.force_refresh,
+        notify=request.notify,
     )
 
     accepted = [
@@ -247,7 +248,8 @@ def _handle_sync_analysis(
             stock_code=stock_code,
             report_type=request.report_type,
             force_refresh=request.force_refresh,
-            query_id=query_id
+            query_id=query_id,
+            send_notification=request.notify,
         )
 
         if result is None:
@@ -409,8 +411,8 @@ async def task_stream():
                         "timestamp": datetime.now().isoformat()
                     })
         except asyncio.CancelledError:
-            # 客户端断开连接
-            pass
+            logger.debug("SSE client disconnected, cancelling event generator")
+            raise
         finally:
             task_queue.unsubscribe(event_queue)
     

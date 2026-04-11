@@ -11,16 +11,12 @@ Covers:
 import os
 import sys
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-for _mod in ("litellm", "json_repair", "markdown2", "newspaper"):
-    if _mod not in sys.modules:
-        sys.modules[_mod] = MagicMock()
 
 from data_provider.realtime_types import UnifiedRealtimeQuote, RealtimeSource
 from src.stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult, TrendStatus
@@ -118,43 +114,44 @@ class TestAugmentHistoricalWithRealtime(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertNotIn("close", result.columns)
 
-    @patch("src.core.pipeline.get_market_today", return_value=date.today())
+    @patch("src.core.pipeline.get_market_now")
     @patch("src.core.pipeline.is_market_open", return_value=True)
     @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
     def test_appends_row_when_last_date_before_today(
-        self, _mock_market, _mock_open, _mock_market_today
+        self, _mock_market, _mock_open, mock_now
     ) -> None:
-        df = _make_historical_df(last_date=date.today() - timedelta(days=1))
+        today = date.today()
+        # Pin market clock to today (UTC) so the pipeline's market_today == date.today(),
+        # regardless of which timezone get_market_now would normally use (e.g. CST=UTC+8).
+        mock_now.return_value = datetime(
+            today.year, today.month, today.day, 10, 0, tzinfo=timezone.utc
+        )
+        df = _make_historical_df(last_date=today - timedelta(days=1))
         quote = _make_realtime_quote(price=15.72)
         result = self.pipeline._augment_historical_with_realtime(df, quote, "600519")
         self.assertEqual(len(result), len(df) + 1)
         last = result.iloc[-1]
         self.assertEqual(last["close"], 15.72)
-        self.assertEqual(last["date"], date.today())
+        self.assertEqual(last["date"], today)
 
-    @patch("src.core.pipeline.get_market_today", return_value=date.today())
+    @patch("src.core.pipeline.get_market_now")
     @patch("src.core.pipeline.is_market_open", return_value=True)
     @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
     def test_updates_last_row_when_last_date_is_today(
-        self, _mock_market, _mock_open, _mock_market_today
+        self, _mock_market, _mock_open, mock_now
     ) -> None:
-        df = _make_historical_df(last_date=date.today(), days=25)
-        df.loc[df.index[-1], "date"] = date.today()
+        today = date.today()
+        # Pin market clock to today so last_date >= market_today and the row is updated
+        # rather than appended (avoids off-by-one when CI runs after market closes in CST).
+        mock_now.return_value = datetime(
+            today.year, today.month, today.day, 10, 0, tzinfo=timezone.utc
+        )
+        df = _make_historical_df(last_date=today, days=25)
+        df.loc[df.index[-1], "date"] = today
         quote = _make_realtime_quote(price=16.0)
         result = self.pipeline._augment_historical_with_realtime(df, quote, "600519")
         self.assertEqual(len(result), len(df))
         self.assertEqual(result.iloc[-1]["close"], 16.0)
-
-    @patch("src.core.pipeline.get_market_today", return_value=date(2026, 4, 7))
-    @patch("src.core.pipeline.is_market_open", return_value=True)
-    @patch("src.core.pipeline.get_market_for_stock", return_value="us")
-    def test_uses_market_local_date_for_us_append(
-        self, _mock_market, _mock_open, _mock_market_today
-    ) -> None:
-        df = _make_historical_df(last_date=date(2026, 4, 6))
-        quote = _make_realtime_quote(price=16.0)
-        result = self.pipeline._augment_historical_with_realtime(df, quote, "AAPL")
-        self.assertEqual(result.iloc[-1]["date"], date(2026, 4, 7))
 
 
 class TestComputeMaStatus(unittest.TestCase):
@@ -187,10 +184,20 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
             self.config = Config._load_from_env()
         self.pipeline = StockAnalysisPipeline(config=self.config)
 
-    def test_today_overridden_when_realtime_and_trend_exist(self) -> None:
+    @patch("src.core.pipeline.get_market_now")
+    @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
+    def test_today_overridden_when_realtime_and_trend_exist(
+        self, _mock_market, mock_now
+    ) -> None:
+        today = date.today()
+        # Pin market clock so _enhance_context sets enhanced['date'] == date.today().isoformat()
+        # regardless of which timezone get_market_now would normally use (e.g. CST=UTC+8).
+        mock_now.return_value = datetime(
+            today.year, today.month, today.day, 10, 0, tzinfo=timezone.utc
+        )
         context = {
             "code": "600519",
-            "date": (date.today() - timedelta(days=1)).isoformat(),
+            "date": (today - timedelta(days=1)).isoformat(),
             "today": {"close": 15.0, "ma5": 14.8, "ma10": 14.5},
             "yesterday": {"close": 14.5, "volume": 1000000},
         }
@@ -210,9 +217,19 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
         self.assertEqual(enhanced["today"]["ma10"], 15.2)
         self.assertEqual(enhanced["today"]["ma20"], 14.9)
         self.assertIn("多头", enhanced["ma_status"])
-        self.assertEqual(enhanced["date"], date.today().isoformat())
+        self.assertEqual(enhanced["date"], today.isoformat())
         self.assertIn("price_change_ratio", enhanced)
         self.assertIn("volume_change_ratio", enhanced)
+
+    def test_enhance_context_injects_runtime_news_window_days(self) -> None:
+        context = {"code": "600519", "today": {"close": 15.0}}
+        enhanced = self.pipeline._enhance_context(
+            context, None, None, None, "贵州茅台"
+        )
+        self.assertEqual(
+            enhanced["news_window_days"],
+            self.pipeline.search_service.news_window_days,
+        )
 
     def test_today_not_overridden_when_trend_missing(self) -> None:
         context = {"code": "600519", "today": {"close": 15.0}}
@@ -240,49 +257,6 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
         )
         self.assertEqual(enhanced["today"]["close"], 15.0)
         self.assertEqual(enhanced["today"]["ma5"], 14.8)
-
-    def test_market_context_added_for_us_stock(self) -> None:
-        context = {"code": "AAPL", "today": {"close": 180.0}}
-        market_context = {
-            "market": "us",
-            "market_label": "美股",
-            "policy_scope": "中国政策只有在存在 China exposure 时才提高权重。",
-            "china_exposure": {
-                "level_label": "高",
-                "policy_weight_label": "高权重",
-                "reasoning": "同时存在中国收入和供应链暴露。",
-            },
-        }
-
-        enhanced = self.pipeline._enhance_context(
-            context,
-            None,
-            None,
-            None,
-            "Apple",
-            market_context=market_context,
-        )
-
-        self.assertEqual(enhanced["market_context"]["market"], "us")
-        self.assertEqual(enhanced["market"], "us")
-        self.assertEqual(
-            enhanced["market_context"]["china_exposure"]["policy_weight_label"],
-            "高权重",
-        )
-
-    def test_market_context_falls_back_from_stock_code(self) -> None:
-        context = {"code": "HK00700", "today": {"close": 320.0}}
-
-        enhanced = self.pipeline._enhance_context(
-            context,
-            None,
-            None,
-            None,
-            "腾讯控股",
-        )
-
-        self.assertEqual(enhanced["market_context"]["market"], "hk")
-        self.assertEqual(enhanced["market_context"]["market_label"], "港股")
 
 
 if __name__ == "__main__":

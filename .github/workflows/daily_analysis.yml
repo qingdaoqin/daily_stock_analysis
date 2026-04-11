@@ -1,24 +1,9 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 多市场窗口调度
-  # GitHub Actions schedule 可能延迟，因此在目标窗口内增加多次尝试。
-  #
-  # A股窗口：开盘前半小时（北京时间 08:30）
-  # - 00:30/00:40/00:50 UTC ≈ 北京时间 08:30/08:40/08:50
-  # - 运行时检查上海时间 08:30-08:59
-  #
-  # 美股窗口：开盘前半小时（纽约时间 09:00-09:29）
-  # - EDT(夏令时, UTC-4): 13:00/13:10/13:20 UTC ≈ 北京时间 21:00/21:10/21:20
-  # - EST(冬令时, UTC-5): 14:00/14:10/14:20 UTC ≈ 北京时间 22:00/22:10/22:20
-  #
-  # 每个市场每天只运行一次（重复运行守卫按 market+date 去重）。
+  # 定时触发 - 每天北京时间 18:00 (UTC 10:00)
   schedule:
-    # A股窗口
-    - cron: '30,40,50 0 * * 1-5'
-    # 美股窗口（夏令时 + 冬令时）
-    - cron: '0,10,20 13 * * 1-5'
-    - cron: '0,10,20 14 * * 1-5'
+    - cron: '0 10 * * 1-5'     # 周一到周五，UTC 10:00 = 北京时间 18:00
   
   # 手动触发
   workflow_dispatch:
@@ -47,176 +32,31 @@ jobs:
   analyze:
     runs-on: ubuntu-latest
     # 添加超时限制，防止任务卡死
-    timeout-minutes: 60
+    timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '30') }}
     
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v5
-
-      - name: 检查市场开盘前窗口
-        if: github.event_name == 'schedule'
-        id: market_window
-        run: |
-          NY_DOW="$(TZ='America/New_York' date '+%u')"
-          NY_HOUR="$(TZ='America/New_York' date '+%H')"
-          NY_MINUTE="$(TZ='America/New_York' date '+%M')"
-          NY_OFFSET="$(TZ='America/New_York' date '+%z')"
-          NY_DATE="$(TZ='America/New_York' date '+%F')"
-          NY_TIME="${NY_HOUR}:${NY_MINUTE}"
-
-          SH_DOW="$(TZ='Asia/Shanghai' date '+%u')"
-          SH_HOUR="$(TZ='Asia/Shanghai' date '+%H')"
-          SH_MINUTE="$(TZ='Asia/Shanghai' date '+%M')"
-          SH_DATE="$(TZ='Asia/Shanghai' date '+%F')"
-          SH_TIME="${SH_HOUR}:${SH_MINUTE}"
-
-          SCHEDULE_EXPR="${{ github.event.schedule }}"
-          echo "ny_dow=$NY_DOW" >> "$GITHUB_OUTPUT"
-          echo "ny_hour=$NY_HOUR" >> "$GITHUB_OUTPUT"
-          echo "ny_minute=$NY_MINUTE" >> "$GITHUB_OUTPUT"
-          echo "ny_offset=$NY_OFFSET" >> "$GITHUB_OUTPUT"
-          echo "ny_date=$NY_DATE" >> "$GITHUB_OUTPUT"
-          echo "ny_time=$NY_TIME" >> "$GITHUB_OUTPUT"
-          echo "sh_date=$SH_DATE" >> "$GITHUB_OUTPUT"
-          echo "🕘 纽约时间: $NY_DATE $NY_TIME (offset=$NY_OFFSET, weekday=$NY_DOW)"
-          echo "🕘 上海时间: $SH_DATE $SH_TIME (weekday=$SH_DOW)"
-          echo "🗓️ 触发 cron: $SCHEDULE_EXPR"
-
-          SHOULD_RUN=false
-          REASON="不在有效执行窗口"
-          TARGET_MARKET=""
-
-          # --- A股窗口检测：上海时间 08:30-08:59，工作日 ---
-          if [[ "$SCHEDULE_EXPR" == *"0 *"* ]] || [[ "$SCHEDULE_EXPR" == *" 0 "* ]]; then
-            # 这是 A 股 cron 槽位（UTC hour 0）
-            if [ "$SH_DOW" -ge 1 ] && [ "$SH_DOW" -le 5 ]; then
-              if [ "$SH_HOUR" = "08" ] && [ "$SH_MINUTE" -ge 30 ]; then
-                SHOULD_RUN=true
-                TARGET_MARKET="cn"
-                REASON="A股窗口命中（上海 ${SH_TIME}，在 08:30-08:59 内）"
-              else
-                REASON="上海时间 ${SH_TIME} 不在 08:30-08:59 窗口内"
-              fi
-            else
-              REASON="上海时间当前不是工作日（weekday=$SH_DOW）"
-            fi
-          fi
-
-          # --- 美股窗口检测：纽约 09:00-09:29，工作日 ---
-          if [ "$SHOULD_RUN" = "false" ]; then
-            if [ "$NY_DOW" -ge 1 ] && [ "$NY_DOW" -le 5 ]; then
-              WITHIN_WINDOW=false
-              if [ "$NY_HOUR" = "09" ] && [ "$NY_MINUTE" -lt 30 ]; then
-                WITHIN_WINDOW=true
-              fi
-
-              if [ "$NY_OFFSET" = "-0400" ] && [[ "$SCHEDULE_EXPR" == *"13"* ]] && [ "$WITHIN_WINDOW" = "true" ]; then
-                SHOULD_RUN=true
-                TARGET_MARKET="us"
-                REASON="美股 EDT 窗口命中（13:xx UTC / 纽约 ${NY_TIME}）"
-              elif [ "$NY_OFFSET" = "-0500" ] && [[ "$SCHEDULE_EXPR" == *"14"* ]] && [ "$WITHIN_WINDOW" = "true" ]; then
-                SHOULD_RUN=true
-                TARGET_MARKET="us"
-                REASON="美股 EST 窗口命中（14:xx UTC / 纽约 ${NY_TIME}）"
-              elif [ "$WITHIN_WINDOW" != "true" ]; then
-                REASON="纽约时间 ${NY_TIME} 不在 09:00-09:29 窗口内"
-              else
-                REASON="触发槽位与纽约夏/冬令时不匹配"
-              fi
-            else
-              REASON="纽约当前不是工作日（weekday=$NY_DOW）"
-            fi
-          fi
-
-          echo "target_market=$TARGET_MARKET" >> "$GITHUB_OUTPUT"
-          if [ "$SHOULD_RUN" = "true" ]; then
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-            echo "✅ $REASON，目标市场=$TARGET_MARKET，继续执行"
-          else
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "⏭️ $REASON，后续步骤跳过"
-          fi
-
-      - name: 检查同日同市场重复运行
-        if: github.event_name == 'schedule' && steps.market_window.outputs.should_run == 'true'
-        id: duplicate_guard
-        uses: actions/github-script@v8
-        with:
-          script: |
-            // 按目标市场选择去重日期：A股用上海日期，美股用纽约日期
-            const targetMarket = "${{ steps.market_window.outputs.target_market }}";
-            const dedupeDate = targetMarket === "cn"
-              ? "${{ steps.market_window.outputs.sh_date }}"
-              : "${{ steps.market_window.outputs.ny_date }}";
-            const dedupeTimezone = targetMarket === "cn" ? "Asia/Shanghai" : "America/New_York";
-            const currentRunId = Number(process.env.GITHUB_RUN_ID);
-            const currentRunNumber = Number(process.env.GITHUB_RUN_NUMBER);
-
-            const { owner, repo } = context.repo;
-            const response = await github.rest.actions.listWorkflowRuns({
-              owner,
-              repo,
-              workflow_id: 'daily_analysis.yml',
-              branch: 'main',
-              event: 'schedule',
-              per_page: 100,
-            });
-
-            const runs = response.data.workflow_runs.filter((run) => {
-              if (run.id === currentRunId) return false;
-              if (run.run_number >= currentRunNumber) return false;
-
-              // 按去重时区获取运行日期
-              const createdAt = new Date(run.created_at);
-              const runDate = new Intl.DateTimeFormat('en-CA', {
-                timeZone: dedupeTimezone,
-                year: 'numeric', month: '2-digit', day: '2-digit',
-              }).format(createdAt);
-              if (runDate !== dedupeDate) return false;
-
-              // 按市场过滤：同市场窗口的运行才算重复（按 UTC 小时推断）
-              const runHourUTC = createdAt.getUTCHours();
-              let runMarket = "";
-              if (runHourUTC === 0 || runHourUTC === 1) runMarket = "cn";
-              else if (runHourUTC >= 13 && runHourUTC <= 14) runMarket = "us";
-              if (runMarket !== targetMarket) return false;
-
-              if (run.status === 'queued' || run.status === 'in_progress') return true;
-              return run.conclusion === 'success';
-            });
-
-            if (runs.length > 0) {
-              core.info(`已有同日(${dedupeDate})同市场(${targetMarket})的定时运行，跳过: ${runs[0].html_url}`);
-              core.setOutput('should_continue', 'false');
-            } else {
-              core.info(`当前是 ${targetMarket} 市场 ${dedupeDate} 首个有效尝试，继续执行`);
-              core.setOutput('should_continue', 'true');
-            }
-
       - name: 随机延迟（避免固定时间访问）
-        if: github.event_name != 'schedule' || (steps.market_window.outputs.should_run == 'true' && steps.duplicate_guard.outputs.should_continue != 'false')
         run: sleep $((RANDOM % 60))  # 随机延迟0-60秒启动
       
+      - name: 检出代码
+        uses: actions/checkout@v5
+      
       - name: 设置 Python 环境
-        if: github.event_name != 'schedule' || (steps.market_window.outputs.should_run == 'true' && steps.duplicate_guard.outputs.should_continue != 'false')
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
       
       - name: 安装依赖
-        if: github.event_name != 'schedule' || (steps.market_window.outputs.should_run == 'true' && steps.duplicate_guard.outputs.should_continue != 'false')
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
       
       - name: 创建必要目录
-        if: github.event_name != 'schedule' || (steps.market_window.outputs.should_run == 'true' && steps.duplicate_guard.outputs.should_continue != 'false')
         run: |
           mkdir -p data logs reports
       
       - name: 执行股票分析
-        if: github.event_name != 'schedule' || (steps.market_window.outputs.should_run == 'true' && steps.duplicate_guard.outputs.should_continue != 'false')
         env:
           # ==========================================
           # AI 配置
@@ -229,11 +69,9 @@ jobs:
 
           # Gemini AI（主选）
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-2.5-flash' }}
-          GEMINI_MODEL_FALLBACK: ${{ vars.GEMINI_MODEL_FALLBACK || secrets.GEMINI_MODEL_FALLBACK || 'gemini-2.5-flash-lite' }}
-          GEMINI_REQUEST_DELAY: ${{ vars.GEMINI_REQUEST_DELAY || secrets.GEMINI_REQUEST_DELAY || '5.0' }}
-          GEMINI_MAX_RETRIES: ${{ vars.GEMINI_MAX_RETRIES || secrets.GEMINI_MAX_RETRIES || '3' }}
-          GEMINI_RETRY_DELAY: ${{ vars.GEMINI_RETRY_DELAY || secrets.GEMINI_RETRY_DELAY || '10.0' }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-3-flash-preview' }}
+          GEMINI_MODEL_FALLBACK: ${{ vars.GEMINI_MODEL_FALLBACK || secrets.GEMINI_MODEL_FALLBACK || 'gemini-2.5-flash' }}
+          GEMINI_REQUEST_DELAY: '3.0'
           
           # AIHubMix（优先于 OPENAI_API_KEY，自动适配 base_url，推荐国内用户）
           AIHUBMIX_KEY: ${{ secrets.AIHUBMIX_KEY }}
@@ -243,6 +81,9 @@ jobs:
           OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL || secrets.OPENAI_MODEL }}
 
+          # DeepSeek
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          
           # Anthropic / Claude
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || secrets.ANTHROPIC_MODEL || 'claude-3-5-sonnet-20241022' }}
@@ -251,9 +92,6 @@ jobs:
           # 数据源
           # ==========================================
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
-          LONGBRIDGE_APP_KEY: ${{ secrets.LONGBRIDGE_APP_KEY }}
-          LONGBRIDGE_APP_SECRET: ${{ secrets.LONGBRIDGE_APP_SECRET }}
-          LONGBRIDGE_ACCESS_TOKEN: ${{ secrets.LONGBRIDGE_ACCESS_TOKEN }}
           
           # ==========================================
           # 搜索服务
@@ -263,9 +101,8 @@ jobs:
           SERPAPI_API_KEYS: ${{ secrets.SERPAPI_API_KEYS }}
           MINIMAX_API_KEYS: ${{ secrets.MINIMAX_API_KEYS }}
           BRAVE_API_KEYS: ${{ secrets.BRAVE_API_KEYS }}
-          XAI_API_KEYS: ${{ secrets.XAI_API_KEYS || secrets.XAI_API_KEY }}
-          XAI_SEARCH_MODEL: ${{ vars.XAI_SEARCH_MODEL || secrets.XAI_SEARCH_MODEL || 'grok-4-1-fast-reasoning' }}
           SEARXNG_BASE_URLS: ${{ secrets.SEARXNG_BASE_URLS }}
+          SEARXNG_PUBLIC_INSTANCES_ENABLED: ${{ vars.SEARXNG_PUBLIC_INSTANCES_ENABLED || secrets.SEARXNG_PUBLIC_INSTANCES_ENABLED }}
           
           # ==========================================
           # 通知渠道（可同时配置多个，全部推送）
@@ -317,17 +154,22 @@ jobs:
           # 方式十一：Server酱3
           SERVERCHAN3_SENDKEY: ${{ secrets.SERVERCHAN3_SENDKEY }}
 
+          # 方式十二：Slack
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+
           # ==========================================
           # 自选股配置
           # ==========================================
-          STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST || '' }}
-          MARKET_REVIEW_REGION: ${{ vars.MARKET_REVIEW_REGION || secrets.MARKET_REVIEW_REGION || 'auto' }}
+          STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST || '600519' }}
+          MARKET_REVIEW_REGION: ${{ vars.MARKET_REVIEW_REGION || secrets.MARKET_REVIEW_REGION || 'cn' }}
           
           # ==========================================
           # 运行配置 ⬅️ 新增！
           # ==========================================
           REPORT_TYPE: ${{ vars.REPORT_TYPE || secrets.REPORT_TYPE || 'simple' }}
-          SINGLE_STOCK_NOTIFY: ${{ vars.SINGLE_STOCK_NOTIFY || secrets.SINGLE_STOCK_NOTIFY || 'true' }}
+          SINGLE_STOCK_NOTIFY: ${{ vars.SINGLE_STOCK_NOTIFY || secrets.SINGLE_STOCK_NOTIFY || 'false' }}
           MARKET_REVIEW_ENABLED: ${{ vars.MARKET_REVIEW_ENABLED || secrets.MARKET_REVIEW_ENABLED || 'true' }}
           ANALYSIS_DELAY: ${{ vars.ANALYSIS_DELAY || secrets.ANALYSIS_DELAY || '0' }}
           TRADING_DAY_CHECK_ENABLED: ${{ vars.TRADING_DAY_CHECK_ENABLED || secrets.TRADING_DAY_CHECK_ENABLED || 'true' }}
@@ -359,7 +201,7 @@ jobs:
           MODE="${{ github.event.inputs.mode || 'full' }}"
           
           echo "=========================================="
-          echo "🚀 自选股智能分析系统"
+          echo "🚀 A股自选股智能分析系统"
           echo "=========================================="
           echo "⏰ 时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
           echo "🎯 运行模式: $MODE"
@@ -372,10 +214,7 @@ jobs:
           echo "【AI 配置】"
           echo "  LiteLLM: $([ -n "$LITELLM_CONFIG" ] || [ -n "$LITELLM_API_KEY" ] || [ -n "$LITELLM_MODEL" ] && echo '✅ 已配置' || echo '❌ 未配置')"
           echo "  Gemini API Key: $([ -n "$GEMINI_API_KEY" ] && echo '✅ 已配置' || echo '❌ 未配置')"
-          echo "  Gemini 主模型: ${GEMINI_MODEL:-未配置}"
-          echo "  Gemini 备选模型: ${GEMINI_MODEL_FALLBACK:-未配置}"
-          echo "  Gemini 请求间隔: ${GEMINI_REQUEST_DELAY}s"
-          echo "  Gemini 重试次数: ${GEMINI_MAX_RETRIES}, 基础退避: ${GEMINI_RETRY_DELAY}s"
+          echo "  DeepSeek Key:   $([ -n "$DEEPSEEK_API_KEY" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  AIHubMix Key:   $([ -n "$AIHUBMIX_KEY" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  OpenAI API Key: $([ -n "$OPENAI_API_KEY" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  Anthropic Key:  $([ -n "$ANTHROPIC_API_KEY" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
@@ -386,8 +225,18 @@ jobs:
           echo "  SerpAPI Keys: $([ -n "$SERPAPI_API_KEYS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  MiniMax API Keys: $([ -n "$MINIMAX_API_KEYS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  Brave API Keys: $([ -n "$BRAVE_API_KEYS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
-          echo "  xAI X Search: $([ -n "$XAI_API_KEYS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  SearXNG Base URLs: $([ -n "$SEARXNG_BASE_URLS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
+          case "${SEARXNG_PUBLIC_INSTANCES_ENABLED,,}" in
+            0|false|no|off)
+              echo "  SearXNG Public Instances: ❌ 已禁用"
+              ;;
+            "")
+              echo "  SearXNG Public Instances: ✅ 默认开启"
+              ;;
+            *)
+              echo "  SearXNG Public Instances: ✅ 已启用"
+              ;;
+          esac
           echo ""
           echo "【通知渠道】"
           echo "  PushPlus: $([ -n "$PUSHPLUS_TOKEN" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
@@ -396,7 +245,7 @@ jobs:
           echo "  Telegram: $([ -n "$TELEGRAM_BOT_TOKEN" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  Discord: $([ -n "$DISCORD_WEBHOOK_URL" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  AstrBot: $([ -n "$ASTRBOT_URL" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
-          echo "  单股推送: ${SINGLE_STOCK_NOTIFY}"
+          echo "  Slack: $(([ -n "$SLACK_WEBHOOK_URL" ] || ([ -n "$SLACK_BOT_TOKEN" ] && [ -n "$SLACK_CHANNEL_ID" ])) && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "=========================================="
           echo ""
           
@@ -416,44 +265,18 @@ jobs:
             python main.py $FORCE_RUN_ARG
           fi
       
-      - name: 准备上传产物
-        if: always() && (github.event_name != 'schedule' || (steps.market_window.outputs.should_run == 'true' && steps.duplicate_guard.outputs.should_continue != 'false'))
-        run: |
-          mkdir -p reports logs
-
-          if [ -z "$(find reports -maxdepth 1 -type f 2>/dev/null)" ]; then
-            printf '%s\n' \
-              '未生成分析报告文件。' \
-              '这通常表示分析流程提前结束、未进入报告保存阶段，或本次运行仅产生通知未落盘。' \
-              '运行编号: ${{ github.run_number }}' \
-              '工作流: ${{ github.workflow }}' \
-              '提交: ${{ github.sha }}' \
-              > reports/_artifact_notice.txt
-          fi
-
-          if [ -z "$(find logs -maxdepth 1 -type f 2>/dev/null)" ]; then
-            printf '%s\n' \
-              '未找到日志文件。' \
-              '这通常表示程序尚未初始化日志、提前终止，或本次运行没有生成本地日志。' \
-              '运行编号: ${{ github.run_number }}' \
-              '工作流: ${{ github.workflow }}' \
-              '提交: ${{ github.sha }}' \
-              > logs/_artifact_notice.txt
-          fi
-
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
-        if: always() && (github.event_name != 'schedule' || (steps.market_window.outputs.should_run == 'true' && steps.duplicate_guard.outputs.should_continue != 'false'))
+        if: always()
         with:
           name: analysis-reports-${{ github.run_number }}
           path: |
-            reports/**
-            logs/**
-          if-no-files-found: warn
+            reports/
+            logs/
           retention-days: 30
       
       - name: 显示运行结果
-        if: always() && (github.event_name != 'schedule' || (steps.market_window.outputs.should_run == 'true' && steps.duplicate_guard.outputs.should_continue != 'false'))
+        if: always()
         run: |
           echo ""
           echo "=========================================="

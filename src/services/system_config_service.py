@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import re
 import time
@@ -47,6 +48,14 @@ class ConfigConflictError(Exception):
     def __init__(self, current_version: str):
         super().__init__("Configuration version conflict")
         self.current_version = current_version
+
+
+class ConfigImportError(Exception):
+    """Raised when an imported `.env` payload is invalid."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
 
 
 class SystemConfigService:
@@ -113,6 +122,39 @@ class SystemConfigService:
             "issues": issues,
         }
 
+    def export_desktop_env(self) -> Dict[str, Any]:
+        """Return the raw active `.env` content for desktop-only backup."""
+        if self._manager.env_path.exists():
+            content = self._manager.env_path.read_text(encoding="utf-8")
+        else:
+            content = ""
+
+        return {
+            "content": content,
+            "config_version": self._manager.get_config_version(),
+            "updated_at": self._manager.get_updated_at(),
+        }
+
+    def import_desktop_env(
+        self,
+        *,
+        config_version: str,
+        content: str,
+        reload_now: bool = True,
+    ) -> Dict[str, Any]:
+        """Merge imported `.env` assignments into the active config."""
+        current_version = self._manager.get_config_version()
+        if current_version != config_version:
+            raise ConfigConflictError(current_version=current_version)
+
+        updates = self._parse_imported_env_content(content)
+        return self.update(
+            config_version=config_version,
+            items=updates,
+            mask_token="__DSA_IMPORT_LITERAL_MASK__",
+            reload_now=reload_now,
+        )
+
     def test_llm_channel(
         self,
         *,
@@ -158,7 +200,7 @@ class SystemConfigService:
             "model": resolved_model,
             "messages": [{"role": "user", "content": "Reply with OK"}],
             "temperature": 0,
-            "max_tokens": 8,
+            "max_tokens": 256,  # Increased to allow MiniMax-M2.7 thinking process + response
             "timeout": max(5.0, float(timeout_seconds)),
         }
         if selected_api_key:
@@ -168,13 +210,44 @@ class SystemConfigService:
 
         try:
             import litellm
+            from src.agent.llm_adapter import LLMToolAdapter
+
+            # Register custom model pricing for MiniMax models not in LiteLLM's built-in list
+            # This must be done before litellm.completion() to prevent cost calculation errors
+            # Reuses the registration logic from LLMToolAdapter to avoid code duplication
+            LLMToolAdapter._register_custom_model_pricing()
 
             started_at = time.perf_counter()
             response = litellm.completion(**call_kwargs)
             latency_ms = int((time.perf_counter() - started_at) * 1000)
             content = ""
             if response and getattr(response, "choices", None):
-                content = str(response.choices[0].message.content or "").strip()
+                choice = response.choices[0]
+                # MiniMax-M2.7 uses content_blocks format directly on choice (not inside message)
+                # Check both possible locations for content_blocks
+                content_blocks = None
+                if hasattr(choice, "content_blocks"):
+                    content_blocks = choice.content_blocks
+                elif hasattr(choice.message, "content_blocks"):
+                    content_blocks = choice.message.content_blocks
+
+                if content_blocks:
+                    # MiniMax response format: concatenate ALL text blocks
+                    # Handle both type=="text" with .text and .content fields
+                    text_parts = []
+                    for block in content_blocks:
+                        if getattr(block, "type", None) == "text":
+                            text = getattr(block, "text", "") or ""
+                            if text:
+                                text_parts.append(text)
+                        elif hasattr(block, "content") and block.content:
+                            text_parts.append(block.content)
+                    content = "".join(text_parts).strip()
+                else:
+                    # Standard OpenAI format
+                    message = getattr(choice, "message", None)
+                    if message:
+                        content = str(message.content or "").strip()
 
             if not content:
                 return {
@@ -277,6 +350,32 @@ class SystemConfigService:
             sensitive_keys=set(),
             mask_token=mask_token,
         )
+
+    @staticmethod
+    def _parse_imported_env_content(content: str) -> List[Dict[str, str]]:
+        """Parse raw `.env` text into update items using current dotenv semantics."""
+        normalized_content = content.replace("\ufeff", "")
+        if not normalized_content.strip():
+            raise ConfigImportError("未识别到有效 .env 配置")
+
+        from dotenv import dotenv_values
+
+        parsed = dotenv_values(stream=io.StringIO(normalized_content))
+        updates: List[Dict[str, str]] = []
+        for key, value in parsed.items():
+            if key is None:
+                continue
+            updates.append(
+                {
+                    "key": str(key).upper(),
+                    "value": "" if value is None else str(value),
+                }
+            )
+
+        if not updates:
+            raise ConfigImportError("未识别到有效 .env 配置")
+
+        return updates
 
     def _collect_issues(self, items: Sequence[Dict[str, str]], mask_token: str) -> List[Dict[str, Any]]:
         """Collect field-level and cross-field validation issues."""

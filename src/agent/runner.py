@@ -314,12 +314,29 @@ def _repair_common_json_issues(text: str) -> str:
 # Core loop
 # ============================================================
 
+# Minimum wall-clock seconds required to start a new step.
+# If remaining budget is below this threshold the loop exits early instead
+# of starting an LLM call that will almost certainly timeout mid-stream,
+# wasting billing and returning an incomplete response.
+_MIN_STEP_BUDGET_S = 8.0
+
+
+def _remaining_timeout_seconds(
+    start_time: float, max_wall_clock_seconds: Optional[float]
+) -> Optional[float]:
+    """Return seconds left in the wall-clock budget, or *None* if unbounded."""
+    if max_wall_clock_seconds is None or max_wall_clock_seconds <= 0:
+        return None
+    return max(0.0, max_wall_clock_seconds - (time.time() - start_time))
+
+
 def run_agent_loop(
     *,
     messages: List[Dict[str, Any]],
     tool_registry: ToolRegistry,
     llm_adapter: LLMToolAdapter,
     max_steps: int = 10,
+    max_wall_clock_seconds: Optional[float] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     thinking_labels: Optional[Dict[str, str]] = None,
 ) -> RunLoopResult:
@@ -335,6 +352,9 @@ def run_agent_loop(
         tool_registry: Registry of callable tools.
         llm_adapter: LLM backend (handles multi-provider fallback).
         max_steps: Maximum number of LLM round-trips.
+        max_wall_clock_seconds: Optional overall wall-clock timeout.  When the
+            remaining budget drops below ``_MIN_STEP_BUDGET_S`` the loop exits
+            early (step > 0 only — the first step always runs).
         progress_callback: Optional callback receiving progress dicts.
         thinking_labels: Override map of tool_name → friendly label.
 
@@ -353,6 +373,29 @@ def run_agent_loop(
     models_used: List[str] = []
 
     for step in range(max_steps):
+        # --- time budget guard (skip from step 2 onwards) ---
+        if step > 0:
+            remaining = _remaining_timeout_seconds(start_time, max_wall_clock_seconds)
+            if remaining is not None and remaining < _MIN_STEP_BUDGET_S:
+                logger.warning(
+                    "Agent step %d skipped: only %.1fs remaining (min %.1fs)",
+                    step + 1, remaining, _MIN_STEP_BUDGET_S,
+                )
+                return RunLoopResult(
+                    success=False,
+                    content="",
+                    tool_calls_log=tool_calls_log,
+                    total_steps=step,
+                    total_tokens=total_tokens,
+                    provider=provider_used,
+                    models_used=models_used,
+                    error=(
+                        f"Agent step skipped due to insufficient budget: "
+                        f"{remaining:.1f}s remaining, minimum {_MIN_STEP_BUDGET_S:.0f}s required"
+                    ),
+                    messages=messages,
+                )
+
         logger.info("Agent step %d/%d", step + 1, max_steps)
 
         # --- progress: thinking ---

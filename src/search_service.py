@@ -14,10 +14,12 @@ A股自选股智能分析系统 - 搜索服务模块
 import logging
 import random
 import re
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from io import StringIO
 from typing import List, Dict, Any, Optional, Tuple
 from itertools import cycle
@@ -38,6 +40,11 @@ from tenacity import (
 
 from data_provider.fundamental_adapter import UsSecFundamentalAdapter
 from data_provider.us_index_mapping import is_us_index_code
+from src.config import (
+    NEWS_STRATEGY_WINDOWS,
+    normalize_news_strategy_profile,
+    resolve_news_window_days,
+)
 from src.core.trading_calendar import get_market_for_stock
 
 logger = logging.getLogger(__name__)
@@ -275,7 +282,14 @@ class TavilySearchProvider(BaseSearchProvider):
     def __init__(self, api_keys: List[str]):
         super().__init__(api_keys, "Tavily")
     
-    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+        topic: Optional[str] = None,
+    ) -> SearchResponse:
         """执行 Tavily 搜索"""
         try:
             from tavily import TavilyClient
@@ -292,13 +306,19 @@ class TavilySearchProvider(BaseSearchProvider):
             client = TavilyClient(api_key=api_key)
             
             # 执行搜索（优化：使用advanced深度、限制最近几天）
+            search_kwargs: Dict[str, Any] = {
+                "query": query,
+                "search_depth": "advanced",  # advanced 获取更多结果
+                "max_results": max_results,
+                "include_answer": False,
+                "include_raw_content": False,
+                "days": days,  # 搜索最近天数的内容
+            }
+            if topic is not None:
+                search_kwargs["topic"] = topic
+
             response = client.search(
-                query=query,
-                search_depth="advanced",  # advanced 获取更多结果
-                max_results=max_results,
-                include_answer=False,
-                include_raw_content=False,
-                days=days,  # 搜索最近天数的内容
+                **search_kwargs,
             )
             
             # 记录原始响应到日志
@@ -313,7 +333,7 @@ class TavilySearchProvider(BaseSearchProvider):
                     snippet=item.get('content', '')[:500],  # 截取前500字
                     url=item.get('url', ''),
                     source=self._extract_domain(item.get('url', '')),
-                    published_date=item.get('published_date'),
+                    published_date=item.get('published_date') or item.get('publishedDate'),
                 ))
             
             return SearchResponse(
@@ -335,6 +355,53 @@ class TavilySearchProvider(BaseSearchProvider):
                 provider=self.name,
                 success=False,
                 error_message=error_msg
+            )
+
+    def search(
+        self,
+        query: str,
+        max_results: int = 5,
+        days: int = 7,
+        topic: Optional[str] = None,
+    ) -> SearchResponse:
+        """执行 Tavily 搜索，可按调用方选择是否启用新闻 topic。"""
+        if topic is None:
+            return super().search(query, max_results=max_results, days=days)
+
+        api_key = self._get_next_key()
+        if not api_key:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"{self._name} 未配置 API Key"
+            )
+
+        start_time = time.time()
+        try:
+            response = self._do_search(query, api_key, max_results, days=days, topic=topic)
+            response.search_time = time.time() - start_time
+
+            if response.success:
+                self._record_success(api_key)
+                logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
+            else:
+                self._record_error(api_key)
+
+            return response
+
+        except Exception as e:
+            self._record_error(api_key)
+            elapsed = time.time() - start_time
+            logger.error(f"[{self._name}] 搜索 '{query}' 失败: {e}")
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=str(e),
+                search_time=elapsed
             )
     
     @staticmethod
@@ -1156,11 +1223,41 @@ class SearXNGSearchProvider(BaseSearchProvider):
     """
     SearXNG search engine (self-hosted, no quota).
 
-    Uses base_urls as "keys" for load balancing. Requires format: json in settings.yml.
+    Self-hosted instances are used when explicitly configured.
+    Otherwise, the provider can lazily discover public instances from
+    searx.space and rotate across them with per-request failover.
     """
 
-    def __init__(self, base_urls: List[str]):
-        super().__init__(base_urls, "SearXNG")
+    PUBLIC_INSTANCES_URL = "https://searx.space/data/instances.json"
+    PUBLIC_INSTANCES_CACHE_TTL_SECONDS = 3600
+    PUBLIC_INSTANCES_STALE_REFRESH_BACKOFF_SECONDS = 60
+    PUBLIC_INSTANCES_POOL_LIMIT = 20
+    PUBLIC_INSTANCES_MAX_ATTEMPTS = 3
+    PUBLIC_INSTANCES_TIMEOUT_SECONDS = 5
+    SELF_HOSTED_TIMEOUT_SECONDS = 10
+
+    _public_instances_cache: Optional[Tuple[float, List[str]]] = None
+    _public_instances_stale_retry_after: float = 0.0
+    _public_instances_lock = threading.Lock()
+
+    def __init__(self, base_urls: Optional[List[str]] = None, *, use_public_instances: bool = False):
+        normalized_base_urls = [url.rstrip("/") for url in (base_urls or []) if url.strip()]
+        super().__init__(normalized_base_urls, "SearXNG")
+        self._base_urls = normalized_base_urls
+        self._use_public_instances = bool(use_public_instances and not self._base_urls)
+        self._cursor = 0
+        self._cursor_lock = threading.Lock()
+
+    @property
+    def is_available(self) -> bool:
+        return bool(self._base_urls) or self._use_public_instances
+
+    @classmethod
+    def reset_public_instance_cache(cls) -> None:
+        """Reset the shared searx.space cache (used by tests)."""
+        with cls._public_instances_lock:
+            cls._public_instances_cache = None
+            cls._public_instances_stale_retry_after = 0.0
 
     @staticmethod
     def _parse_http_error(response) -> str:
@@ -1183,22 +1280,148 @@ class SearXNGSearchProvider(BaseSearchProvider):
             body = raw_text if isinstance(raw_text, str) else ""
             return f"HTTP {response.status_code}: {body[:200]}"
 
+    @staticmethod
+    def _time_range(days: int) -> str:
+        if days <= 1:
+            return "day"
+        if days <= 7:
+            return "week"
+        if days <= 30:
+            return "month"
+        return "year"
+
+    @classmethod
+    def _search_latency_seconds(cls, instance_data: Dict[str, Any]) -> float:
+        timing = (instance_data.get("timing") or {}).get("search") or {}
+        all_timing = timing.get("all")
+        if isinstance(all_timing, dict):
+            for key in ("mean", "median"):
+                value = all_timing.get(key)
+                if isinstance(value, (int, float)):
+                    return float(value)
+        return float("inf")
+
+    @classmethod
+    def _extract_public_instances(cls, payload: Any) -> List[str]:
+        if not isinstance(payload, dict):
+            return []
+
+        instances = payload.get("instances")
+        if not isinstance(instances, dict):
+            return []
+
+        ranked: List[Tuple[float, float, str]] = []
+        for raw_url, item in instances.items():
+            if not isinstance(raw_url, str) or not isinstance(item, dict):
+                continue
+            if item.get("network_type") != "normal":
+                continue
+            http_status = (item.get("http") or {}).get("status_code")
+            if http_status != 200:
+                continue
+            timing = (item.get("timing") or {}).get("search") or {}
+            uptime = timing.get("success_percentage")
+            if not isinstance(uptime, (int, float)) or float(uptime) <= 0:
+                continue
+
+            ranked.append(
+                (
+                    float(uptime),
+                    cls._search_latency_seconds(item),
+                    raw_url.rstrip("/"),
+                )
+            )
+
+        ranked.sort(key=lambda row: (-row[0], row[1], row[2]))
+        return [url for _, _, url in ranked[: cls.PUBLIC_INSTANCES_POOL_LIMIT]]
+
+    @classmethod
+    def _get_public_instances(cls) -> List[str]:
+        now = time.time()
+        with cls._public_instances_lock:
+            stale_urls: List[str] = []
+            if cls._public_instances_cache is None and cls._public_instances_stale_retry_after > now:
+                logger.debug(
+                    "[SearXNG] 公共实例冷启动刷新退避中，剩余 %.0fs",
+                    cls._public_instances_stale_retry_after - now,
+                )
+                return []
+            if cls._public_instances_cache is not None:
+                cached_at, cached_urls = cls._public_instances_cache
+                if now - cached_at < cls.PUBLIC_INSTANCES_CACHE_TTL_SECONDS:
+                    return list(cached_urls)
+                stale_urls = list(cached_urls)
+                if cls._public_instances_stale_retry_after > now:
+                    logger.debug(
+                        "[SearXNG] 公共实例刷新退避中，继续使用过期缓存，剩余 %.0fs",
+                        cls._public_instances_stale_retry_after - now,
+                    )
+                    return stale_urls
+
+            try:
+                response = requests.get(
+                    cls.PUBLIC_INSTANCES_URL,
+                    timeout=cls.PUBLIC_INSTANCES_TIMEOUT_SECONDS,
+                )
+                if response.status_code != 200:
+                    logger.warning(
+                        "[SearXNG] 拉取公共实例列表失败: HTTP %s",
+                        response.status_code,
+                    )
+                else:
+                    urls = cls._extract_public_instances(response.json())
+                    if urls:
+                        cls._public_instances_cache = (now, list(urls))
+                        cls._public_instances_stale_retry_after = 0.0
+                        logger.info("[SearXNG] 已刷新公共实例池，共 %s 个候选实例", len(urls))
+                        return list(urls)
+                    logger.warning("[SearXNG] searx.space 未返回可用公共实例，保留已有缓存")
+            except Exception as exc:
+                logger.warning("[SearXNG] 拉取公共实例列表失败: %s", exc)
+
+            if stale_urls:
+                cls._public_instances_stale_retry_after = (
+                    now + cls.PUBLIC_INSTANCES_STALE_REFRESH_BACKOFF_SECONDS
+                )
+                logger.warning(
+                    "[SearXNG] 公共实例刷新失败，继续使用过期缓存，共 %s 个候选实例；"
+                    "%.0fs 内不再刷新",
+                    len(stale_urls),
+                    cls.PUBLIC_INSTANCES_STALE_REFRESH_BACKOFF_SECONDS,
+                )
+                return stale_urls
+            cls._public_instances_stale_retry_after = (
+                now + cls.PUBLIC_INSTANCES_STALE_REFRESH_BACKOFF_SECONDS
+            )
+            logger.warning(
+                "[SearXNG] 公共实例冷启动刷新失败，%.0fs 内不再刷新",
+                cls.PUBLIC_INSTANCES_STALE_REFRESH_BACKOFF_SECONDS,
+            )
+            return []
+
+    def _rotate_candidates(self, pool: List[str], *, max_attempts: int) -> List[str]:
+        if not pool or max_attempts <= 0:
+            return []
+        with self._cursor_lock:
+            start = self._cursor % len(pool)
+            self._cursor = (self._cursor + 1) % len(pool)
+        ordered = pool[start:] + pool[:start]
+        return ordered[:max_attempts]
+
     def _do_search(  # type: ignore[override]
-        self, query: str, base_url: str, max_results: int, days: int = 7
+        self,
+        query: str,
+        base_url: str,
+        max_results: int,
+        days: int = 7,
+        *,
+        timeout: int,
+        retry_enabled: bool,
     ) -> SearchResponse:
-        """Execute SearXNG search."""
+        """Execute one SearXNG search against a specific instance."""
         try:
             base = base_url.rstrip("/")
             search_url = base if base.endswith("/search") else base + "/search"
-
-            if days <= 1:
-                time_range = "day"
-            elif days <= 7:
-                time_range = "week"
-            elif days <= 30:
-                time_range = "month"
-            else:
-                time_range = "year"
 
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1207,11 +1430,12 @@ class SearXNGSearchProvider(BaseSearchProvider):
             params = {
                 "q": query,
                 "format": "json",
-                "time_range": time_range,
+                "time_range": self._time_range(days),
                 "pageno": 1,
             }
 
-            response = _get_with_retry(search_url, headers=headers, params=params, timeout=10)
+            request_get = _get_with_retry if retry_enabled else requests.get
+            response = request_get(search_url, headers=headers, params=params, timeout=timeout)
 
             if response.status_code != 200:
                 error_msg = self._parse_http_error(response)
@@ -1320,6 +1544,77 @@ class SearXNGSearchProvider(BaseSearchProvider):
             return domain or "未知来源"
         except Exception:
             return "未知来源"
+
+    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+        """Execute SearXNG search with instance rotation and per-request failover."""
+        start_time = time.time()
+        if self._base_urls:
+            candidates = self._rotate_candidates(
+                self._base_urls,
+                max_attempts=len(self._base_urls),
+            )
+            retry_enabled = True
+            timeout = self.SELF_HOSTED_TIMEOUT_SECONDS
+            empty_error = "SearXNG 未配置可用实例"
+        elif self._use_public_instances:
+            public_instances = self._get_public_instances()
+            candidates = self._rotate_candidates(
+                public_instances,
+                max_attempts=min(len(public_instances), self.PUBLIC_INSTANCES_MAX_ATTEMPTS),
+            )
+            retry_enabled = False
+            timeout = self.PUBLIC_INSTANCES_TIMEOUT_SECONDS
+            empty_error = "未获取到可用的公共 SearXNG 实例"
+        else:
+            candidates = []
+            retry_enabled = False
+            timeout = self.PUBLIC_INSTANCES_TIMEOUT_SECONDS
+            empty_error = "SearXNG 未配置可用实例"
+
+        if not candidates:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=empty_error,
+                search_time=time.time() - start_time,
+            )
+
+        errors: List[str] = []
+        for base_url in candidates:
+            response = self._do_search(
+                query,
+                base_url,
+                max_results,
+                days=days,
+                timeout=timeout,
+                retry_enabled=retry_enabled,
+            )
+            response.search_time = time.time() - start_time
+            if response.success:
+                logger.info(
+                    "[%s] 搜索 '%s' 成功，实例=%s，返回 %s 条结果，耗时 %.2fs",
+                    self.name,
+                    query,
+                    base_url,
+                    len(response.results),
+                    response.search_time,
+                )
+                return response
+
+            errors.append(f"{base_url}: {response.error_message or '未知错误'}")
+            logger.warning("[%s] 实例 %s 搜索失败: %s", self.name, base_url, response.error_message)
+
+        elapsed = time.time() - start_time
+        return SearchResponse(
+            query=query,
+            results=[],
+            provider=self.name,
+            success=False,
+            error_message="；".join(errors[:3]) if errors else empty_error,
+            search_time=elapsed,
+        )
 
 
 class XAIXSearchProvider(BaseSearchProvider):
@@ -1633,6 +1928,9 @@ class SearchService:
         "{name} technical analysis",
         "{name} {code} performance volume",
     ]
+    NEWS_OVERSAMPLE_FACTOR = 2
+    NEWS_OVERSAMPLE_MAX = 10
+    FUTURE_TOLERANCE_DAYS = 1
     
     def __init__(
         self,
@@ -1644,7 +1942,9 @@ class SearchService:
         xai_keys: Optional[List[str]] = None,
         xai_search_model: str = "grok-4-1-fast-reasoning",
         searxng_base_urls: Optional[List[str]] = None,
+        searxng_public_instances_enabled: bool = True,
         news_max_age_days: int = 3,
+        news_strategy_profile: str = "short",
     ):
         """
         初始化搜索服务
@@ -1658,11 +1958,28 @@ class SearchService:
             xai_keys: xAI API Key 列表（用于 X 社交信号）
             xai_search_model: xAI X Search 使用的模型
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
+            searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
             news_max_age_days: 新闻最大时效（天）
+            news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
         self._providers: List[BaseSearchProvider] = []
         self._x_signal_provider: Optional[XAIXSearchProvider] = None
         self.news_max_age_days = max(1, news_max_age_days)
+        raw_profile = (news_strategy_profile or "short").strip().lower()
+        self.news_strategy_profile = normalize_news_strategy_profile(news_strategy_profile)
+        if raw_profile != self.news_strategy_profile:
+            logger.warning(
+                "NEWS_STRATEGY_PROFILE '%s' 无效，已回退为 'short'",
+                news_strategy_profile,
+            )
+        self.news_window_days = resolve_news_window_days(
+            news_max_age_days=self.news_max_age_days,
+            news_strategy_profile=self.news_strategy_profile,
+        )
+        self.news_profile_days = NEWS_STRATEGY_WINDOWS.get(
+            self.news_strategy_profile,
+            NEWS_STRATEGY_WINDOWS["short"],
+        )
 
         # 初始化搜索引擎（按优先级排序）
         # 1. Bocha 优先（中文搜索优化，AI摘要）
@@ -1690,28 +2007,58 @@ class SearchService:
             self._providers.append(MiniMaxSearchProvider(minimax_keys))
             logger.info(f"已配置 MiniMax 搜索，共 {len(minimax_keys)} 个 API Key")
 
-        # 6. SearXNG（自建实例，无配额兜底，最后兜底）
-        if searxng_base_urls:
-            self._providers.append(SearXNGSearchProvider(searxng_base_urls))
-            logger.info(f"已配置 SearXNG 搜索，共 {len(searxng_base_urls)} 个实例")
+        # 6. SearXNG（自建实例优先；未配置其他引擎时可自动发现公共实例兜底）
+        use_public = bool(
+            searxng_public_instances_enabled
+            and not searxng_base_urls
+            and not self._providers
+        )
+        searxng_provider = SearXNGSearchProvider(
+            searxng_base_urls,
+            use_public_instances=use_public,
+        )
+        if searxng_provider.is_available:
+            self._providers.append(searxng_provider)
+            if searxng_base_urls:
+                logger.info("已配置 SearXNG 搜索，共 %s 个自建实例", len(searxng_base_urls))
+            else:
+                logger.info("已启用 SearXNG 公共实例自动发现模式")
+
+        if not self._providers:
+            logger.warning("未配置任何搜索能力，新闻搜索功能将不可用")
 
         if xai_keys:
             self._x_signal_provider = XAIXSearchProvider(xai_keys, model=xai_search_model)
             logger.info(f"已配置 xAI X Search，共 {len(xai_keys)} 个 API Key")
-        
-        if not self._providers:
-            logger.warning("未配置任何搜索引擎 API Key，新闻搜索功能将不可用")
 
         # In-memory search result cache: {cache_key: (timestamp, SearchResponse)}
         self._cache: Dict[str, Tuple[float, 'SearchResponse']] = {}
         # Default cache TTL in seconds (10 minutes)
         self._cache_ttl: int = 600
         self._us_sec_adapter = UsSecFundamentalAdapter()
+        logger.info(
+            "新闻时效策略已启用: profile=%s, profile_days=%s, NEWS_MAX_AGE_DAYS=%s, effective_window=%s",
+            self.news_strategy_profile,
+            self.news_profile_days,
+            self.news_max_age_days,
+            self.news_window_days,
+        )
     
     @staticmethod
     def _is_foreign_stock(stock_code: str) -> bool:
         """判断是否为港股或美股"""
-        return SearchService._market_tag(stock_code) in {"hk", "us"}
+        import re
+        code = stock_code.strip()
+        # 美股：1-5个大写字母，可能包含点（如 BRK.B）
+        if re.match(r'^[A-Za-z]{1,5}(\.[A-Za-z])?$', code):
+            return True
+        # 港股：带 hk 前缀或 5位纯数字
+        lower = code.lower()
+        if lower.startswith('hk'):
+            return True
+        if code.isdigit() and len(code) == 5:
+            return True
+        return False
 
     @staticmethod
     def _market_tag(stock_code: str) -> str:
@@ -1722,6 +2069,28 @@ class SearchService:
     # A-share ETF code prefixes (Shanghai 51/52/56/58, Shenzhen 15/16/18)
     _A_ETF_PREFIXES = ('51', '52', '56', '58', '15', '16', '18')
     _ETF_NAME_KEYWORDS = ('ETF', 'FUND', 'TRUST', 'INDEX', 'TRACKER', 'UNIT')  # US/HK ETF name hints
+
+    @staticmethod
+    def is_index_or_etf(stock_code: str, stock_name: str) -> bool:
+        """
+        Judge if symbol is index-tracking ETF or market index.
+        For such symbols, analysis focuses on index movement only, not issuer company risks.
+        """
+        code = (stock_code or '').strip().split('.')[0]
+        if not code:
+            return False
+        # A-share ETF
+        if code.isdigit() and len(code) == 6 and code.startswith(SearchService._A_ETF_PREFIXES):
+            return True
+        # US index (SPX, DJI, IXIC etc.)
+        if is_us_index_code(code):
+            return True
+        # US/HK ETF: foreign symbol + name contains fund-like keywords
+        if SearchService._is_foreign_stock(code):
+            name_upper = (stock_name or '').upper()
+            return any(kw in name_upper for kw in SearchService._ETF_NAME_KEYWORDS)
+        return False
+
     _US_CHINA_EXPOSURE_KEYWORDS = {
         "revenue": (
             "greater china",
@@ -1764,27 +2133,6 @@ class SearchService:
         "supply_chain": "中国供应链/制造",
         "policy": "中国政策/关税/出口管制",
     }
-
-    @staticmethod
-    def is_index_or_etf(stock_code: str, stock_name: str) -> bool:
-        """
-        Judge if symbol is index-tracking ETF or market index.
-        For such symbols, analysis focuses on index movement only, not issuer company risks.
-        """
-        code = (stock_code or '').strip().split('.')[0]
-        if not code:
-            return False
-        # A-share ETF
-        if code.isdigit() and len(code) == 6 and code.startswith(SearchService._A_ETF_PREFIXES):
-            return True
-        # US index (SPX, DJI, IXIC etc.)
-        if is_us_index_code(code):
-            return True
-        # US/HK ETF: foreign symbol + name contains fund-like keywords
-        if SearchService._is_foreign_stock(code):
-            name_upper = (stock_name or '').upper()
-            return any(kw in name_upper for kw in SearchService._ETF_NAME_KEYWORDS)
-        return False
 
     @staticmethod
     def _market_label(market: str) -> str:
@@ -2351,6 +2699,262 @@ class SearchService:
                 for k in oldest:
                     del self._cache[k]
         self._cache[key] = (time.time(), response)
+
+    def _effective_news_window_days(self) -> int:
+        """Resolve effective news window from strategy profile and global max-age."""
+        return resolve_news_window_days(
+            news_max_age_days=self.news_max_age_days,
+            news_strategy_profile=self.news_strategy_profile,
+        )
+
+    @classmethod
+    def _provider_request_size(cls, max_results: int) -> int:
+        """Apply light overfetch before time filtering to avoid sparse outputs."""
+        target = max(1, int(max_results))
+        return max(target, min(target * cls.NEWS_OVERSAMPLE_FACTOR, cls.NEWS_OVERSAMPLE_MAX))
+
+    @staticmethod
+    def _parse_relative_news_date(text: str, now: datetime) -> Optional[date]:
+        """Parse common Chinese/English relative-time strings."""
+        raw = (text or "").strip()
+        if not raw:
+            return None
+
+        lower = raw.lower()
+        if raw in {"今天", "今日", "刚刚"} or lower in {"today", "just now", "now"}:
+            return now.date()
+        if raw == "昨天" or lower == "yesterday":
+            return (now - timedelta(days=1)).date()
+        if raw == "前天":
+            return (now - timedelta(days=2)).date()
+
+        zh = re.match(r"^\s*(\d+)\s*(分钟|小时|天|周|个月|月|年)\s*前\s*$", raw)
+        if zh:
+            amount = int(zh.group(1))
+            unit = zh.group(2)
+            if unit == "分钟":
+                return (now - timedelta(minutes=amount)).date()
+            if unit == "小时":
+                return (now - timedelta(hours=amount)).date()
+            if unit == "天":
+                return (now - timedelta(days=amount)).date()
+            if unit == "周":
+                return (now - timedelta(weeks=amount)).date()
+            if unit in {"个月", "月"}:
+                return (now - timedelta(days=amount * 30)).date()
+            if unit == "年":
+                return (now - timedelta(days=amount * 365)).date()
+
+        en = re.match(
+            r"^\s*(\d+)\s*(minute|minutes|min|mins|hour|hours|day|days|week|weeks|month|months|year|years)\s*ago\s*$",
+            lower,
+        )
+        if en:
+            amount = int(en.group(1))
+            unit = en.group(2)
+            if unit in {"minute", "minutes", "min", "mins"}:
+                return (now - timedelta(minutes=amount)).date()
+            if unit in {"hour", "hours"}:
+                return (now - timedelta(hours=amount)).date()
+            if unit in {"day", "days"}:
+                return (now - timedelta(days=amount)).date()
+            if unit in {"week", "weeks"}:
+                return (now - timedelta(weeks=amount)).date()
+            if unit in {"month", "months"}:
+                return (now - timedelta(days=amount * 30)).date()
+            if unit in {"year", "years"}:
+                return (now - timedelta(days=amount * 365)).date()
+
+        return None
+
+    @classmethod
+    def _normalize_news_publish_date(cls, value: Any) -> Optional[date]:
+        """Normalize provider date value into a date object."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is not None:
+                local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+                return value.astimezone(local_tz).date()
+            return value.date()
+        if isinstance(value, date):
+            return value
+
+        text = str(value).strip()
+        if not text:
+            return None
+        now = datetime.now()
+        local_tz = now.astimezone().tzinfo or timezone.utc
+
+        relative_date = cls._parse_relative_news_date(text, now)
+        if relative_date:
+            return relative_date
+
+        # Unix timestamp fallback
+        if text.isdigit() and len(text) in (10, 13):
+            try:
+                ts = int(text[:10]) if len(text) == 13 else int(text)
+                # Provider timestamps are typically UTC epoch seconds.
+                # Normalize to local date to keep window checks aligned with local "today".
+                return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(local_tz).date()
+            except (OSError, OverflowError, ValueError):
+                pass
+
+        iso_candidate = text.replace("Z", "+00:00")
+        try:
+            parsed_iso = datetime.fromisoformat(iso_candidate)
+            if parsed_iso.tzinfo is not None:
+                return parsed_iso.astimezone(local_tz).date()
+            return parsed_iso.date()
+        except ValueError:
+            pass
+
+        normalized = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", text, flags=re.IGNORECASE)
+
+        try:
+            parsed_rfc = parsedate_to_datetime(normalized)
+            if parsed_rfc:
+                if parsed_rfc.tzinfo is not None:
+                    return parsed_rfc.astimezone(local_tz).date()
+                return parsed_rfc.date()
+        except (TypeError, ValueError):
+            pass
+
+        zh_match = re.search(r"(\d{4})\s*[年/\-.]\s*(\d{1,2})\s*[月/\-.]\s*(\d{1,2})\s*日?", text)
+        if zh_match:
+            try:
+                return date(int(zh_match.group(1)), int(zh_match.group(2)), int(zh_match.group(3)))
+            except ValueError:
+                pass
+
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y/%m/%d %H:%M",
+            "%Y/%m/%d",
+            "%Y.%m.%d %H:%M:%S",
+            "%Y.%m.%d %H:%M",
+            "%Y.%m.%d",
+            "%Y%m%d",
+            "%b %d, %Y",
+            "%B %d, %Y",
+            "%d %b %Y",
+            "%d %B %Y",
+            "%a, %d %b %Y %H:%M:%S %z",
+        ):
+            try:
+                parsed_dt = datetime.strptime(normalized, fmt)
+                if parsed_dt.tzinfo is not None:
+                    return parsed_dt.astimezone(local_tz).date()
+                return parsed_dt.date()
+            except ValueError:
+                continue
+
+        return None
+
+    def _filter_news_response(
+        self,
+        response: SearchResponse,
+        *,
+        search_days: int,
+        max_results: int,
+        log_scope: str,
+    ) -> SearchResponse:
+        """Hard-filter results by published_date recency and normalize date strings."""
+        if not response.success or not response.results:
+            return response
+
+        today = datetime.now().date()
+        earliest = today - timedelta(days=max(0, int(search_days) - 1))
+        latest = today + timedelta(days=self.FUTURE_TOLERANCE_DAYS)
+
+        filtered: List[SearchResult] = []
+        dropped_unknown = 0
+        dropped_old = 0
+        dropped_future = 0
+
+        for item in response.results:
+            published = self._normalize_news_publish_date(item.published_date)
+            if published is None:
+                dropped_unknown += 1
+                continue
+            if published < earliest:
+                dropped_old += 1
+                continue
+            if published > latest:
+                dropped_future += 1
+                continue
+
+            filtered.append(
+                SearchResult(
+                    title=item.title,
+                    snippet=item.snippet,
+                    url=item.url,
+                    source=item.source,
+                    published_date=published.isoformat(),
+                )
+            )
+            if len(filtered) >= max_results:
+                break
+
+        if dropped_unknown or dropped_old or dropped_future:
+            logger.info(
+                "[新闻过滤] %s: provider=%s, total=%s, kept=%s, drop_unknown=%s, drop_old=%s, drop_future=%s, window=[%s,%s]",
+                log_scope,
+                response.provider,
+                len(response.results),
+                len(filtered),
+                dropped_unknown,
+                dropped_old,
+                dropped_future,
+                earliest.isoformat(),
+                latest.isoformat(),
+            )
+
+        return SearchResponse(
+            query=response.query,
+            results=filtered,
+            provider=response.provider,
+            success=response.success,
+            error_message=response.error_message,
+            search_time=response.search_time,
+        )
+
+    def _normalize_and_limit_response(
+        self,
+        response: SearchResponse,
+        *,
+        max_results: int,
+    ) -> SearchResponse:
+        """Normalize parseable dates without enforcing freshness filtering."""
+        if not response.success or not response.results:
+            return response
+
+        normalized_results: List[SearchResult] = []
+        for item in response.results[:max_results]:
+            normalized_date = self._normalize_news_publish_date(item.published_date)
+            normalized_results.append(
+                SearchResult(
+                    title=item.title,
+                    snippet=item.snippet,
+                    url=item.url,
+                    source=item.source,
+                    published_date=(
+                        normalized_date.isoformat() if normalized_date is not None else item.published_date
+                    ),
+                )
+            )
+
+        return SearchResponse(
+            query=response.query,
+            results=normalized_results,
+            provider=response.provider,
+            success=response.success,
+            error_message=response.error_message,
+            search_time=response.search_time,
+        )
     
     def search_stock_news(
         self,
@@ -2371,20 +2975,10 @@ class SearchService:
         Returns:
             SearchResponse 对象
         """
-        # 智能确定搜索时间范围
-        # 策略：
-        # 1. 周二至周五：搜索近1天（24小时）
-        # 2. 周六、周日：搜索近2-3天（覆盖周末）
-        # 3. 周一：搜索近3天（覆盖周末）
-        # 4. 用 NEWS_MAX_AGE_DAYS 限制上限
-        today_weekday = datetime.now().weekday()
-        if today_weekday == 0:  # 周一
-            weekday_days = 3
-        elif today_weekday >= 5:  # 周六(5)、周日(6)
-            weekday_days = 2
-        else:  # 周二(1) - 周五(4)
-            weekday_days = 1
-        search_days = min(weekday_days, self.news_max_age_days)
+        # 策略窗口优先：ultra_short/short/medium/long = 1/3/7/30 天，
+        # 并统一受 NEWS_MAX_AGE_DAYS 上限约束。
+        search_days = self._effective_news_window_days()
+        provider_max_results = self._provider_request_size(max_results)
 
         # 构建搜索查询（优化搜索效果）
         is_foreign = self._is_foreign_stock(stock_code)
@@ -2398,7 +2992,20 @@ class SearchService:
             # 默认主查询：股票名称 + 核心关键词
             query = f"{stock_name} {stock_code} 股票 最新消息"
 
-        logger.info(f"搜索股票新闻: {stock_name}({stock_code}), query='{query}', 时间范围: 近{search_days}天")
+        logger.info(
+            (
+                "搜索股票新闻: %s(%s), query='%s', 时间范围: 近%s天 "
+                "(profile=%s, NEWS_MAX_AGE_DAYS=%s), 目标条数=%s, provider请求条数=%s"
+            ),
+            stock_name,
+            stock_code,
+            query,
+            search_days,
+            self.news_strategy_profile,
+            self.news_max_age_days,
+            max_results,
+            provider_max_results,
+        )
 
         # Check cache first
         cache_key = self._cache_key(query, max_results, search_days)
@@ -2407,19 +3014,50 @@ class SearchService:
             logger.info(f"使用缓存搜索结果: {stock_name}({stock_code})")
             return cached
 
-        # 依次尝试各个搜索引擎
+        # 依次尝试各个搜索引擎（若过滤后为空，继续尝试下一引擎）
+        had_provider_success = False
         for provider in self._providers:
             if not provider.is_available:
                 continue
-            
-            response = provider.search(query, max_results, days=search_days)
-            
-            if response.success and response.results:
+
+            search_kwargs: Dict[str, Any] = {}
+            if isinstance(provider, TavilySearchProvider):
+                search_kwargs["topic"] = "news"
+
+            response = provider.search(query, provider_max_results, days=search_days, **search_kwargs)
+            filtered_response = self._filter_news_response(
+                response,
+                search_days=search_days,
+                max_results=max_results,
+                log_scope=f"{stock_code}:{provider.name}:stock_news",
+            )
+            had_provider_success = had_provider_success or bool(response.success)
+
+            if filtered_response.success and filtered_response.results:
                 logger.info(f"使用 {provider.name} 搜索成功")
-                self._put_cache(cache_key, response)
-                return response
+                self._put_cache(cache_key, filtered_response)
+                return filtered_response
             else:
-                logger.warning(f"{provider.name} 搜索失败: {response.error_message}，尝试下一个引擎")
+                if response.success and not filtered_response.results:
+                    logger.info(
+                        "%s 搜索成功但过滤后无有效新闻，继续尝试下一引擎",
+                        provider.name,
+                    )
+                else:
+                    logger.warning(
+                        "%s 搜索失败: %s，尝试下一个引擎",
+                        provider.name,
+                        response.error_message,
+                    )
+
+        if had_provider_success:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider="Filtered",
+                success=True,
+                error_message=None,
+            )
         
         # 所有引擎都失败
         return SearchResponse(
@@ -2450,27 +3088,10 @@ class SearchService:
             SearchResponse 对象
         """
         if event_types is None:
-            market = self._market_tag(stock_code)
-            if market == "us":
-                event_types = [
-                    "earnings report",
-                    "insider selling",
-                    "quarterly results",
-                    "SEC filing",
-                    "guidance",
-                    "dividend ex-date",
-                ]
-            elif market == "hk":
-                event_types = [
-                    "业绩公告",
-                    "profit warning",
-                    "回购",
-                    "配股",
-                    "分红除净",
-                    "HKEX announcement",
-                ]
+            if self._is_foreign_stock(stock_code):
+                event_types = ["earnings report", "insider selling", "quarterly results"]
             else:
-                event_types = ["年报预告", "减持公告", "业绩快报", "解禁", "回购", "增持"]
+                event_types = ["年报预告", "减持公告", "业绩快报"]
         
         # 构建针对性查询
         event_query = " OR ".join(event_types)
@@ -2495,6 +3116,12 @@ class SearchService:
             success=False,
             error_message="事件搜索失败"
         )
+
+    def search_x_signals(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+        """Search X social signals via xAI X Search provider."""
+        if not self._x_signal_provider or not self._x_signal_provider.is_available:
+            return self._build_failed_response(query, "xAI X Search", "未配置 XAI_API_KEY")
+        return self._x_signal_provider.search(query, max_results=max_results, days=days)
     
     def search_comprehensive_intel(
         self,
@@ -2522,91 +3149,46 @@ class SearchService:
         search_count = 0
 
         market = self._market_tag(stock_code)
+        is_foreign = self._is_foreign_stock(stock_code)
         is_index_etf = self.is_index_or_etf(stock_code, stock_name)
 
-        if market == "us":
-            if is_index_etf:
-                search_dimensions = [
-                    {'name': 'latest_news', 'query': f"{stock_name} {stock_code} latest news events past 24 hours", 'desc': '最新消息'},
-                    {
-                        'name': 'event_calendar',
-                        'query': (
-                            f"{stock_name} {stock_code} rebalancing dividend ex-date split conference call"
-                        ),
-                        'desc': '事件日历',
-                    },
-                    {'name': 'macro_flows', 'query': (
-                        f"{stock_name} {stock_code} treasury yield dxy vix sector rotation holdings flows"
-                    ), 'desc': '宏观资金'},
-                    {'name': 'risk_check', 'query': (
-                        f"{stock_name} {stock_code} index performance outlook tracking error premium discount"
-                    ), 'desc': '风险排查'},
-                    {'name': 'earnings', 'query': (
-                        f"{stock_name} {stock_code} index performance composition outlook holdings concentration"
-                    ), 'desc': '业绩预期'},
-                    {'name': 'market_analysis', 'query': (
-                        f"{stock_name} {stock_code} analyst outlook holdings change sector view"
-                    ), 'desc': '机构分析'},
-                    {'name': 'industry', 'query': (
-                        f"{stock_name} {stock_code} index sector allocation holdings top constituents"
-                    ), 'desc': '行业分析'},
-                ]
-            else:
-                search_dimensions = [
-                    {'name': 'latest_news', 'query': f"{stock_name} {stock_code} latest news events past 24 hours", 'desc': '最新消息'},
-                    {
-                        'name': 'official_filings',
-                        'query': (
-                            f"site:sec.gov {stock_name} {stock_code} "
-                            f"(10-Q OR 10-K OR 8-K OR \"Form 4\" OR \"13D\" OR \"13G\")"
-                        ),
-                        'desc': '官方披露',
-                        'direct_kind': 'sec_filings',
-                    },
-                    {
-                        'name': 'china_exposure',
-                        'query': (
-                            f"{stock_name} {stock_code} "
-                            f"(\"Greater China\" OR China revenue OR China sales OR China supply chain "
-                            f"OR tariff OR export control OR PRC)"
-                        ),
-                        'desc': '中国暴露',
-                        'direct_kind': 'sec_china_exposure',
-                    },
-                    {
-                        'name': 'event_calendar',
-                        'query': (
-                            f"{stock_name} {stock_code} earnings date guidance dividend ex-date split conference call"
-                        ),
-                        'desc': '事件日历',
-                    },
-                    {'name': 'risk_check', 'query': (
-                        f"{stock_name} risk insider selling lawsuit litigation short interest put call"
-                    ), 'desc': '风险排查'},
-                    {'name': 'earnings', 'query': (
-                        f"{stock_name} earnings revenue profit growth forecast guidance"
-                    ), 'desc': '业绩预期'},
-                    {'name': 'market_analysis', 'query': (
-                        f"{stock_name} analyst rating target price eps estimate broker note"
-                    ), 'desc': '机构分析'},
-                    {'name': 'industry', 'query': (
-                        f"{stock_name} industry competitors market share outlook supply chain"
-                    ), 'desc': '行业分析'},
-                ]
-                if self._x_signal_provider and self._x_signal_provider.is_available:
-                    search_dimensions.insert(3, {
-                        'name': 'x_signal',
-                        'query': (
-                            f"{stock_name} {stock_code} earnings guidance product launch lawsuit "
-                            f"short report analyst downgrade CEO comments"
-                        ),
-                        'desc': 'X社交信号',
-                        'direct_kind': 'x_social_signal',
-                        'engine_fallback': False,
-                    })
+        # --- Phase 1: direct-only intelligence dimensions (market-specific) ---
+        direct_dimensions: List[Dict[str, Any]] = []
+        if market == "us" and not is_index_etf:
+            direct_dimensions = [
+                {
+                    'name': 'official_filings',
+                    'query': (
+                        f"site:sec.gov {stock_name} {stock_code} "
+                        f"(10-Q OR 10-K OR 8-K OR \"Form 4\" OR \"13D\" OR \"13G\")"
+                    ),
+                    'desc': '官方披露',
+                    'direct_kind': 'sec_filings',
+                },
+                {
+                    'name': 'china_exposure',
+                    'query': (
+                        f"{stock_name} {stock_code} "
+                        f"(\"Greater China\" OR China revenue OR China sales OR China supply chain "
+                        f"OR tariff OR export control OR PRC)"
+                    ),
+                    'desc': '中国暴露',
+                    'direct_kind': 'sec_china_exposure',
+                },
+            ]
+            if self._x_signal_provider and self._x_signal_provider.is_available:
+                direct_dimensions.append({
+                    'name': 'x_signal',
+                    'query': (
+                        f"{stock_name} {stock_code} earnings guidance product launch lawsuit "
+                        f"short report analyst downgrade CEO comments"
+                    ),
+                    'desc': 'X社交信号',
+                    'direct_kind': 'x_social_signal',
+                    'engine_fallback': False,
+                })
         elif market == "hk":
-            search_dimensions = [
-                {'name': 'latest_news', 'query': f"{stock_name} {stock_code} 最新 消息 公告 24小时内", 'desc': '最新消息'},
+            direct_dimensions = [
                 {
                     'name': 'official_announcements',
                     'query': (
@@ -2616,29 +3198,9 @@ class SearchService:
                     'desc': '官方公告',
                     'direct_kind': 'hk_events',
                 },
-                {
-                    'name': 'event_calendar',
-                    'query': (
-                        f"{stock_name} {stock_code} earnings date dividend ex-date buyback shareholder meeting"
-                    ),
-                    'desc': '事件日历',
-                    'direct_kind': 'hk_events',
-                },
-                {'name': 'risk_check', 'query': (
-                    f"{stock_name} {stock_code} tracking error premium discount"
-                    if is_index_etf else f"{stock_name} {stock_code} profit warning placement litigation insider selling"
-                ), 'desc': '风险排查'},
-                {'name': 'earnings', 'query': (
-                    f"{stock_name} {stock_code} results revenue profit guidance"
-                ), 'desc': '业绩预期'},
-                {'name': 'market_analysis', 'query': f"{stock_name} {stock_code} target price rating broker report", 'desc': '机构分析'},
-                {'name': 'industry', 'query': (
-                    f"{stock_name} {stock_code} sector peers market share outlook"
-                ), 'desc': '行业分析'},
             ]
-        else:
-            search_dimensions = [
-                {'name': 'latest_news', 'query': f"{stock_name} {stock_code} 最新 新闻 重大 事件 24小时内", 'desc': '最新消息'},
+        elif market == "cn":
+            direct_dimensions = [
                 {
                     'name': 'official_announcements',
                     'query': (
@@ -2647,54 +3209,19 @@ class SearchService:
                     ),
                     'desc': '官方公告',
                     'direct_kind': 'cn_official',
+                    'engine_fallback': False,
                 },
-                {
-                    'name': 'event_calendar',
-                    'query': (
-                        f"{stock_name} {stock_code} 解禁 回购 增持 减持 分红 除权 业绩预约披露"
-                    ),
-                    'desc': '事件日历',
-                    'direct_kind': 'cn_events',
-                },
-                {'name': 'risk_check', 'query': (
-                    f"{stock_name} 指数走势 跟踪误差 净值 表现"
-                    if is_index_etf else f"{stock_name} 减持 处罚 违规 诉讼 利空 风险"
-                ), 'desc': '风险排查'},
-                {'name': 'earnings', 'query': (
-                    f"{stock_name} 指数成分 净值 跟踪表现"
-                    if is_index_etf else f"{stock_name} 业绩预告 财报 营收 净利润 同比增长"
-                ), 'desc': '业绩预期'},
-                {'name': 'market_analysis', 'query': f"{stock_name} 研报 目标价 评级 深度分析", 'desc': '机构分析'},
-                {'name': 'industry', 'query': (
-                    f"{stock_name} 指数成分股 行业配置 权重"
-                    if is_index_etf else f"{stock_name} 所在行业 竞争对手 市场份额 行业前景"
-                ), 'desc': '行业分析'},
             ]
-        
-        logger.info(f"开始多维度情报搜索: {stock_name}({stock_code})")
+
         provider_index = 0
-
-        max_searches = max(1, min(max_searches, len(search_dimensions)))
-        for dim in search_dimensions:
-            if search_count >= max_searches:
-                break
-
+        deferred_fallbacks: List[Dict[str, Any]] = []
+        for dim in direct_dimensions:
             query = dim.get('query', '')
             response: Optional[SearchResponse] = None
             direct_kind = dim.get('direct_kind')
 
             if direct_kind == 'cn_official':
                 response = self._direct_cninfo_announcements(stock_code, stock_name, query=query)
-            elif direct_kind == 'cn_events':
-                official = results.get('official_announcements')
-                if official and official.success:
-                    response = self._build_event_response_from_results(
-                        query,
-                        'CNINFO',
-                        official.results,
-                        ("解禁", "回购", "增持", "减持", "分红", "除权", "业绩", "预约披露"),
-                        fallback_message="未在官方公告中找到重点事件",
-                    )
             elif direct_kind == 'hk_events':
                 response = self._direct_hk_event_calendar(stock_code, stock_name, query=query)
             elif direct_kind == 'sec_filings':
@@ -2704,31 +3231,197 @@ class SearchService:
             elif direct_kind == 'x_social_signal':
                 response = self._direct_x_social_signal(stock_code, stock_name, query=query)
 
-            allow_engine_fallback = dim.get('engine_fallback', True)
-            if response is None or not response.success:
-                if allow_engine_fallback and query and self.is_available:
-                    logger.info(f"[情报搜索] {dim['desc']}: 搜索引擎回退")
-                    response, provider_index = self._run_provider_search(query, provider_index, max_results=3)
-                    time.sleep(0.5)
-                elif response is None:
-                    response = self._build_failed_response(query, "None", "无可用情报源")
-
-            results[dim['name']] = response
-            search_count += 1
-
-            if response.success:
+            if response is not None and response.success:
+                results[dim['name']] = response
                 logger.info(f"[情报搜索] {dim['desc']}: 获取 {len(response.results)} 条结果 (来源: {response.provider})")
             else:
-                logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
+                results[dim['name']] = response if response is not None else self._build_failed_response(query, "None", "无可用情报源")
+                if dim.get('engine_fallback', True) and query:
+                    deferred_fallbacks.append(dim)
 
+        # --- Phase 2: search-engine dimensions (with strict_freshness / tavily_topic) ---
+        if is_foreign:
+            search_dimensions = [
+                {
+                    'name': 'latest_news',
+                    'query': f"{stock_name} {stock_code} latest news events",
+                    'desc': '最新消息',
+                    'tavily_topic': 'news',
+                    'strict_freshness': True,
+                },
+                {
+                    'name': 'market_analysis',
+                    'query': f"{stock_name} analyst rating target price report",
+                    'desc': '机构分析',
+                    'tavily_topic': None,
+                    'strict_freshness': False,
+                },
+                {
+                    'name': 'risk_check',
+                    'query': (
+                        f"{stock_name} {stock_code} index performance outlook tracking error"
+                        if is_index_etf else f"{stock_name} risk insider selling lawsuit litigation"
+                    ),
+                    'desc': '风险排查',
+                    'tavily_topic': None if is_index_etf else 'news',
+                    'strict_freshness': not is_index_etf,
+                },
+                {
+                    'name': 'earnings',
+                    'query': (
+                        f"{stock_name} {stock_code} index performance composition outlook"
+                        if is_index_etf else f"{stock_name} earnings revenue profit growth forecast"
+                    ),
+                    'desc': '业绩预期',
+                    'tavily_topic': None,
+                    'strict_freshness': False,
+                },
+                {
+                    'name': 'industry',
+                    'query': (
+                        f"{stock_name} {stock_code} index sector allocation holdings"
+                        if is_index_etf else f"{stock_name} industry competitors market share outlook"
+                    ),
+                    'desc': '行业分析',
+                    'tavily_topic': None,
+                    'strict_freshness': False,
+                },
+            ]
+        else:
+            search_dimensions = [
+                {
+                    'name': 'latest_news',
+                    'query': f"{stock_name} {stock_code} 最新 新闻 重大 事件",
+                    'desc': '最新消息',
+                    'tavily_topic': 'news',
+                    'strict_freshness': True,
+                },
+                {
+                    'name': 'market_analysis',
+                    'query': f"{stock_name} 研报 目标价 评级 深度分析",
+                    'desc': '机构分析',
+                    'tavily_topic': None,
+                    'strict_freshness': False,
+                },
+                {
+                    'name': 'risk_check',
+                    'query': (
+                        f"{stock_name} 指数走势 跟踪误差 净值 表现"
+                        if is_index_etf else f"{stock_name} 减持 处罚 违规 诉讼 利空 风险"
+                    ),
+                    'desc': '风险排查',
+                    'tavily_topic': None if is_index_etf else 'news',
+                    'strict_freshness': not is_index_etf,
+                },
+                {
+                    'name': 'earnings',
+                    'query': (
+                        f"{stock_name} 指数成分 净值 跟踪表现"
+                        if is_index_etf else f"{stock_name} 业绩预告 财报 营收 净利润 同比增长"
+                    ),
+                    'desc': '业绩预期',
+                    'tavily_topic': None,
+                    'strict_freshness': False,
+                },
+                {
+                    'name': 'industry',
+                    'query': (
+                        f"{stock_name} 指数成分股 行业配置 权重"
+                        if is_index_etf else f"{stock_name} 所在行业 竞争对手 市场份额 行业前景"
+                    ),
+                    'desc': '行业分析',
+                    'tavily_topic': None,
+                    'strict_freshness': False,
+                },
+            ]
+        
+        search_days = self._effective_news_window_days()
+        target_per_dimension = 3
+        provider_max_results = self._provider_request_size(target_per_dimension)
+
+        logger.info(
+            (
+                "开始多维度情报搜索: %s(%s), 时间范围: 近%s天 "
+                "(profile=%s, NEWS_MAX_AGE_DAYS=%s), 目标条数=%s, provider请求条数=%s"
+            ),
+            stock_name,
+            stock_code,
+            search_days,
+            self.news_strategy_profile,
+            self.news_max_age_days,
+            target_per_dimension,
+            provider_max_results,
+        )
+        
+        for dim in search_dimensions:
+            if search_count >= max_searches:
+                break
+            
+            # 选择搜索引擎（轮流使用）
+            available_providers = [p for p in self._providers if p.is_available]
+            if not available_providers:
+                break
+            
+            provider = available_providers[provider_index % len(available_providers)]
+            provider_index += 1
+            
+            logger.info(f"[情报搜索] {dim['desc']}: 使用 {provider.name}")
+
+            if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
+                response = provider.search(
+                    dim['query'],
+                    max_results=provider_max_results,
+                    days=search_days,
+                    topic=dim['tavily_topic'],
+                )
+            else:
+                response = provider.search(
+                    dim['query'],
+                    max_results=provider_max_results,
+                    days=search_days,
+                )
+            if dim.get('strict_freshness'):
+                filtered_response = self._filter_news_response(
+                    response,
+                    search_days=search_days,
+                    max_results=target_per_dimension,
+                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
+                )
+            else:
+                filtered_response = self._normalize_and_limit_response(
+                    response,
+                    max_results=target_per_dimension,
+                )
+            results[dim['name']] = filtered_response
+            search_count += 1
+            
+            if response.success:
+                logger.info(
+                    "[情报搜索] %s: 原始=%s条, 过滤后=%s条",
+                    dim['desc'],
+                    len(response.results),
+                    len(filtered_response.results),
+                )
+            else:
+                logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
+            
+            # 短暂延迟避免请求过快
+            time.sleep(0.5)
+
+        # --- Phase 3: deferred engine fallback for failed direct dimensions ---
+        for dim in deferred_fallbacks:
+            if not self.is_available:
+                break
+            query = dim.get('query', '')
+            logger.info(f"[情报搜索] {dim['desc']}: 搜索引擎回退")
+            response, provider_index = self._run_provider_search(query, provider_index, max_results=3)
+            if response is not None:
+                results[dim['name']] = response
+            time.sleep(0.5)
+        
         return results
     
-    def format_intel_report(
-        self,
-        intel_results: Dict[str, SearchResponse],
-        stock_name: str,
-        stock_code: str = "",
-    ) -> str:
+    def format_intel_report(self, intel_results: Dict[str, SearchResponse], stock_name: str) -> str:
         """
         格式化情报搜索结果为报告
         
@@ -2740,23 +3433,7 @@ class SearchService:
             格式化的情报报告文本
         """
         lines = [f"【{stock_name} 情报搜索结果】"]
-
-        if stock_code:
-            summary = self.build_market_intel_summary(stock_code, stock_name, intel_results)
-            lines.extend([
-                "",
-                "## 🌍 市场规则与政策权重",
-                f"- 当前市场：{summary.get('market_label', '未知')}",
-                f"- 官方优先源：{summary.get('official_source_priority', '未指定')}",
-                f"- 分析主线：{summary.get('analysis_focus', '未指定')}",
-                f"- 政策口径：{summary.get('policy_scope', '未指定')}",
-            ])
-            china_exposure = summary.get("china_exposure")
-            if isinstance(china_exposure, dict):
-                lines.append(f"- China exposure：{china_exposure.get('level_label', '未知')}")
-                lines.append(f"- 中国政策权重：{china_exposure.get('policy_weight_label', '谨慎使用')}")
-                lines.append(f"- 判定依据：{china_exposure.get('reasoning', '未提供')}")
-
+        
         # 维度展示顺序
         display_order = [
             'latest_news',
@@ -2871,7 +3548,7 @@ class SearchService:
                 results=[],
                 provider="None",
                 success=False,
-                error_message="未配置搜索引擎 API Key"
+                error_message="未配置搜索能力"
             )
         
         logger.info(f"[增强搜索] 数据源失败，启动增强搜索: {stock_name}({stock_code})")
@@ -3035,7 +3712,9 @@ def get_search_service() -> SearchService:
             xai_keys=config.xai_api_keys,
             xai_search_model=config.xai_search_model,
             searxng_base_urls=config.searxng_base_urls,
+            searxng_public_instances_enabled=config.searxng_public_instances_enabled,
             news_max_age_days=config.news_max_age_days,
+            news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
         )
     
     return _search_service
@@ -3066,4 +3745,4 @@ if __name__ == "__main__":
         print(f"耗时: {response.search_time:.2f}s")
         print("\n" + response.to_context())
     else:
-        print("未配置搜索引擎 API Key，跳过测试")
+        print("未配置搜索能力，跳过测试")

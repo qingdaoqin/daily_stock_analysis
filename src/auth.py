@@ -368,11 +368,16 @@ def verify_session(value: str) -> bool:
 
 
 def get_client_ip(request) -> str:
-    """Get client IP, respecting TRUST_X_FORWARDED_FOR."""
-    if os.getenv("TRUST_X_FORWARDED_FOR", "false").lower() == "true":
+    """Get client IP, respecting TRUST_X_FORWARDED_FOR.
+
+    When trusted, use the **rightmost** IP in X-Forwarded-For because proxies
+    append the real client IP at the end; the leftmost value can be spoofed.
+    """
+    trust_flag = os.getenv("TRUST_X_FORWARDED_FOR", "false").strip().lower()
+    if trust_flag in ("true", "1", "yes"):
         forwarded = request.headers.get("X-Forwarded-For")
         if forwarded:
-            return forwarded.split(",")[0].strip()
+            return forwarded.split(",")[-1].strip()
     if request.client:
         return request.client.host or "127.0.0.1"
     return "127.0.0.1"

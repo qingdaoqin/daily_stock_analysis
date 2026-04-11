@@ -20,7 +20,14 @@ except Exception:  # pragma: no cover - optional dependency
     litellm = None
     Router = None
 
-from src.config import get_config, get_api_keys_for_model, extra_litellm_params, get_configured_llm_models
+from src.config import (
+    extra_litellm_params,
+    get_api_keys_for_model,
+    get_config,
+    get_configured_llm_models,
+    get_effective_agent_models_to_try,
+    get_effective_agent_primary_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +63,32 @@ _AUTO_THINKING_MODELS: List[str] = ["deepseek-reasoner", "deepseek-r1", "qwq"]
 # Models that need explicit opt-in via extra_body; payload decoupled from model name.
 _OPT_IN_THINKING_MODELS: Dict[str, dict] = {
     "deepseek-chat": {"thinking": {"type": "enabled"}},
+}
+
+# Custom model pricing for models not in LiteLLM's built-in price list
+# Official MiniMax pricing: https://platform.minimax.io/docs/guides/pricing-paygo
+# - MiniMax-M2.7 / M2.5: $0.3/M input tokens, $1.2/M output tokens
+_CUSTOM_MODEL_PRICING: Dict[str, dict] = {
+    "MiniMax-M2.7": {
+        "supports_function_calling": True,
+        "supports_vision": False,
+        "supports_audio_input": False,
+        "supports_audio_output": False,
+        "context_window": 100000,
+        "max_tokens": 10000,
+        "input_cost_per_token": 0.0000003,   # $0.3 / 1M tokens
+        "output_cost_per_token": 0.0000012,   # $1.2 / 1M tokens
+    },
+    "MiniMax-M2.5": {
+        "supports_function_calling": True,
+        "supports_vision": False,
+        "supports_audio_input": False,
+        "supports_audio_output": False,
+        "context_window": 100000,
+        "max_tokens": 10000,
+        "input_cost_per_token": 0.0000003,   # $0.3 / 1M tokens
+        "output_cost_per_token": 0.0000012,   # $1.2 / 1M tokens
+    },
 }
 
 
@@ -122,7 +155,25 @@ class LLMToolAdapter:
         self._config = config
         self._router = None          # litellm Router (multi-key primary model)
         self._litellm_available = False
+        self._register_custom_model_pricing()
         self._init_litellm()
+
+    @staticmethod
+    def _register_custom_model_pricing() -> None:
+        """Register custom model pricing for models not in LiteLLM's built-in price list.
+
+        This prevents cost calculation errors for MiniMax-M2.7 and similar models.
+        """
+        for model_name, pricing in _CUSTOM_MODEL_PRICING.items():
+            try:
+                litellm.register_model(
+                    {
+                        model_name: pricing
+                    }
+                )
+                logger.debug(f"Registered custom pricing for {model_name}")
+            except Exception as e:
+                logger.debug(f"Model {model_name} may already be registered or pricing error: {e}")
 
     def _has_channel_config(self) -> bool:
         """Check if multi-channel config (channels / YAML) is active."""
@@ -136,9 +187,9 @@ class LLMToolAdapter:
             logger.warning("Agent LLM: litellm not installed")
             return
         config = self._config
-        litellm_model = config.litellm_model
+        litellm_model = get_effective_agent_primary_model(config)
         if not litellm_model:
-            logger.warning("Agent LLM: LITELLM_MODEL not configured")
+            logger.warning("Agent LLM: no effective primary model configured")
             return
 
         self._litellm_available = True
@@ -202,7 +253,7 @@ class LLMToolAdapter:
     @property
     def primary_provider(self) -> str:
         """Provider name extracted from litellm_model prefix."""
-        model = self._config.litellm_model or ""
+        model = get_effective_agent_primary_model(self._config)
         if "/" in model:
             return model.split("/")[0]
         return model or "none"
@@ -244,6 +295,7 @@ class LLMToolAdapter:
         messages: List[Dict[str, Any]],
         tools: List[dict],
         provider: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> LLMResponse:
         """Send messages + tool declarations to LLM, return normalized response.
 
@@ -252,11 +304,12 @@ class LLMToolAdapter:
                       [{"role": "system"/"user"/"assistant"/"tool", "content": ...}, ...]
             tools: OpenAI-format tool declarations; litellm converts to each provider's format.
             provider: Ignored (kept for backward compatibility).
+            timeout: Optional timeout in seconds for the completion call.
 
         Returns:
             LLMResponse with either content (final answer) or tool_calls.
         """
-        return self.call_completion(messages, tools=tools, provider=provider)
+        return self.call_completion(messages, tools=tools, provider=provider, timeout=timeout)
 
     def call_text(
         self,
@@ -289,11 +342,21 @@ class LLMToolAdapter:
     ) -> LLMResponse:
         """Shared completion path for both tool and text-only calls."""
         config = self._config
-        models_to_try = [config.litellm_model] + (config.litellm_fallback_models or [])
-        models_to_try = [m for m in models_to_try if m]
+        models_to_try = get_effective_agent_models_to_try(config)
+        started_at = time.time()
+        providers = [self._get_model_provider(m) for m in models_to_try]
 
         last_error = None
-        for model in models_to_try:
+        hit_rate_limit = False
+        for idx, model in enumerate(models_to_try):
+            remaining_timeout = timeout
+            if timeout is not None and timeout > 0:
+                remaining_timeout = max(0.0, float(timeout) - (time.time() - started_at))
+                if remaining_timeout <= 0:
+                    last_error = TimeoutError(
+                        f"LLM completion timed out before trying fallback model {model}"
+                    )
+                    break
             try:
                 return self._call_litellm_model(
                     messages,
@@ -301,22 +364,44 @@ class LLMToolAdapter:
                     model,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    timeout=timeout,
+                    timeout=remaining_timeout,
                 )
             except Exception as e:
                 if self._is_context_window_error(e):
-                    logger.warning("Agent LLM call skipped for %s due to context window overflow: %s", model, e)
+                    logger.warning("Agent LLM context window exceeded on %s: %s", model, e)
                 elif self._is_rate_limit_error(e):
-                    logger.warning("Agent LLM call hit rate limit on %s, backing off before fallback: %s", model, e)
-                    time.sleep(1.5)
+                    logger.warning("Agent LLM rate-limited on %s: %s", model, e)
+                    hit_rate_limit = True
+                    # Avoid blind backoff across different providers; cross-provider
+                    # fallback usually means different accounts/rate-limit buckets.
+                    should_backoff = (
+                        idx + 1 < len(models_to_try)
+                        and providers[idx] == providers[idx + 1]
+                    )
+                    if should_backoff:
+                        backoff_sleep = min(2.0, (time.time() - started_at) * 0.1 + 0.5)
+                        if timeout is not None and timeout > 0:
+                            remaining = max(0.0, float(timeout) - (time.time() - started_at))
+                            if remaining > 0:
+                                time.sleep(min(backoff_sleep, remaining))
+                        else:
+                            time.sleep(backoff_sleep)
                 else:
-                    logger.warning(f"Agent LLM call failed with {model}: {e}")
+                    logger.warning("Agent LLM call failed with %s: %s", model, e)
                 last_error = e
                 continue
 
-        error_msg = f"All LLM models failed. Last error: {last_error}"
+        suffix = " (rate-limit encountered during fallback)" if hit_rate_limit else ""
+        error_msg = f"All LLM models failed{suffix}. Last error: {last_error}"
         logger.error(error_msg)
         return LLMResponse(content=error_msg, provider="error")
+
+    @staticmethod
+    def _get_model_provider(model: str) -> str:
+        """Return LiteLLM provider namespace for model fallback grouping."""
+        if "/" in model:
+            return model.split("/", 1)[0]
+        return "openai"
 
     def _call_litellm_model(
         self,
@@ -420,7 +505,32 @@ class LLMToolAdapter:
         """Parse litellm OpenAI-compatible response into LLMResponse."""
         choice = response.choices[0]
         tool_calls: List[ToolCall] = []
+
+        # Handle MiniMax-specific content_blocks format
+        # MiniMax-M2.7 may return content_blocks at choice level or inside message
+        # Check both possible locations for content_blocks to ensure consistency
+        # Concatenate ALL text blocks to avoid truncating multi-block responses
         text_content = choice.message.content
+        if text_content is None:
+            content_blocks = None
+            if hasattr(choice, "content_blocks"):
+                content_blocks = choice.content_blocks
+            elif hasattr(choice.message, "content_blocks"):
+                content_blocks = choice.message.content_blocks
+
+            if content_blocks:
+                # MiniMax response format: content_blocks[].text
+                # Concatenate ALL text blocks to preserve complete response
+                text_parts = []
+                for block in content_blocks:
+                    if getattr(block, "type", None) == "text":
+                        text = getattr(block, "text", "") or ""
+                        if text:
+                            text_parts.append(text)
+                    elif hasattr(block, "content") and block.content:
+                        text_parts.append(block.content)
+                text_content = "".join(text_parts).strip()
+
         # DeepSeek/Qwen thinking mode; not in standard OpenAI type, accessed via getattr
         reasoning_content = getattr(choice.message, "reasoning_content", None)
 

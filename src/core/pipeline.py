@@ -39,7 +39,7 @@ from src.search_service import SearchService
 from src.services.analysis_calibration_service import AnalysisCalibrationService
 from src.enums import ReportType
 from src.stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
-from src.core.trading_calendar import get_market_for_stock, get_market_today, is_market_open, get_market_session, get_session_label
+from src.core.trading_calendar import get_market_for_stock, get_market_now, get_market_today, is_market_open, get_market_session, get_session_label
 from bot.models import BotMessage
 
 
@@ -153,7 +153,12 @@ class StockAnalysisPipeline:
         if not result or not self.notifier.is_available():
             return
 
-        with self._single_stock_notify_lock:
+        lock = getattr(self, '_single_stock_notify_lock', None)
+        if lock is None:
+            lock = Lock()
+            self._single_stock_notify_lock = lock
+
+        with lock:
             if report_type == ReportType.FULL:
                 report_content = self.notifier.generate_dashboard_report([result])
                 logger.info("[%s] 使用完整报告格式", result.code)
@@ -663,7 +668,7 @@ class StockAnalysisPipeline:
                 enhanced['ma_status'] = self._compute_ma_status(
                     price, trend_result.ma5, trend_result.ma10, trend_result.ma20
                 )
-                enhanced['date'] = get_market_today(get_market_for_stock(context.get('code', ''))).isoformat()
+                enhanced['date'] = get_market_now(get_market_for_stock(context.get('code', ''))).date().isoformat()
                 if yesterday_close is not None:
                     try:
                         yc = float(yesterday_close)
@@ -691,6 +696,10 @@ class StockAnalysisPipeline:
         enhanced['is_index_etf'] = SearchService.is_index_or_etf(
             context.get('code', ''), enhanced.get('stock_name', stock_name)
         )
+
+        # Expose news search window so downstream consumers can align date ranges
+        if self.search_service is not None:
+            enhanced['news_window_days'] = getattr(self.search_service, 'news_window_days', 3)
 
         market_tag = get_market_for_stock(context.get('code', '')) or "cn"
         fallback_market_context = {
@@ -1022,7 +1031,7 @@ class StockAnalysisPipeline:
         if not enable_realtime_tech:
             return df
         market = get_market_for_stock(code)
-        market_today = get_market_today(market)
+        market_today = get_market_now(market).date()
         if market and not is_market_open(market, market_today):
             return df
 
@@ -1257,6 +1266,13 @@ class StockAnalysisPipeline:
                         f"[{code}] 分析完成: {result.operation_advice}, "
                         f"评分 {result.sentiment_score}"
                     )
+
+                # Issue #55: single-stock notify when called directly (not via run())
+                if single_stock_notify and result.success:
+                    try:
+                        self._send_single_stock_notification(result, report_type)
+                    except Exception as notify_err:
+                        logger.error("[%s] 单股推送异常: %s", code, notify_err)
                 
             return result
             

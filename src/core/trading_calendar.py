@@ -171,6 +171,29 @@ def get_market_today(market: Optional[str]) -> date:
         return date.today()
 
 
+def get_market_now(market: Optional[str] = None) -> datetime:
+    """Return the current datetime in the market's local timezone.
+
+    Unlike ``get_market_today`` (which returns only the date), this function
+    returns a full timezone-aware ``datetime``.  Useful when callers need to
+    compare intraday timestamps or pin a clock for deterministic tests.
+
+    Falls back to ``datetime.now(timezone.utc)`` when the market is unknown or
+    timezone resolution fails.
+    """
+    if market not in MARKET_TIMEZONE:
+        return datetime.now(timezone.utc)
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(MARKET_TIMEZONE[market])
+        return datetime.now(tz)
+    except Exception as e:
+        logger.warning("get_market_now fail-open for %s: %s", market, e)
+        return datetime.now(timezone.utc)
+
+
 # Market trading-hour windows (local time, half-open: [start, end))
 # Used for session labelling; not for gating logic (is_market_open handles that).
 _MARKET_HOURS = {

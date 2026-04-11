@@ -400,22 +400,17 @@ class MainScheduleModeTestCase(unittest.TestCase):
         self.assertEqual(exit_code, 1)
 
     def test_lazy_pipeline_triggers_env_bootstrap(self) -> None:
-        """P2: lazy StockAnalysisPipeline access must call _bootstrap_environment."""
-        # Reset the lazy descriptor cache so __get__ fires again
-        main._LazyPipelineDescriptor._resolved = None
-        main._env_bootstrapped = False
+        """P2: _get_stock_analysis_pipeline must call _bootstrap_environment.
 
-        with patch("main._bootstrap_environment", wraps=main._bootstrap_environment) as mock_boot, \
-             patch("src.core.pipeline.StockAnalysisPipeline", create=True, new_callable=lambda: type("FakePipeline", (), {})):
-            try:
-                _ = main.StockAnalysisPipeline
-            except Exception:
-                pass
-            mock_boot.assert_called()
+        Tests the underlying function directly, bypassing the _LazyPipelineDescriptor
+        class-level cache which is shared across the whole test session and causes
+        order-dependent (flaky) failures when a previous test has already resolved it.
+        """
+        with patch("main._bootstrap_environment") as mock_boot, \
+             patch("src.core.pipeline.StockAnalysisPipeline", create=True):
+            main._get_stock_analysis_pipeline()
 
-        # Cleanup: reset state
-        main._LazyPipelineDescriptor._resolved = None
-        main._env_bootstrapped = False
+        mock_boot.assert_called_once()
 
 
 if __name__ == "__main__":

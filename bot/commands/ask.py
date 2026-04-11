@@ -187,11 +187,13 @@ class AskCommand(BotCommand):
 
     @staticmethod
     def _build_execution_context(stock_code: str, skill_id: str) -> Dict[str, Any]:
+        from src.config import Config
         selected = [skill_id] if skill_id else []
         return {
             "stock_code": stock_code,
             "skills": selected,
             "strategies": selected,
+            "report_language": getattr(Config.get_instance(), "report_language", "zh"),
         }
 
     @staticmethod

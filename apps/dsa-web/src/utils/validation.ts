@@ -29,3 +29,33 @@ export const validateStockCode = (value: string): ValidationResult => {
     normalized,
   };
 };
+
+/**
+ * 判断输入是否明显不是有效的股票查询（过短、纯标点/空白等）
+ */
+export const isObviouslyInvalidStockQuery = (query: string): boolean => {
+  const trimmed = query.trim();
+  if (trimmed.length === 0) return true;
+  // 纯标点或空白
+  if (/^[\s\p{P}\p{S}]+$/u.test(trimmed)) return true;
+  // 单个非字母数字非中文字符
+  if (trimmed.length === 1 && !/[\da-zA-Z\u4e00-\u9fff]/.test(trimmed)) return true;
+  return false;
+};
+
+/**
+ * 判断输入是否看起来像股票代码（纯数字、带交易所前缀/后缀、英文 Ticker 等）
+ */
+export const looksLikeStockCode = (value: string): boolean => {
+  const normalized = value.trim().toUpperCase();
+  if (!normalized) return false;
+  const codePatterns = [
+    /^\d{4,6}$/, // 纯数字 4-6 位
+    /^(SH|SZ|BJ)\d{6}$/, // A 股带前缀
+    /^HK\d{1,5}$/, // 港股 HK 前缀
+    /^\d{1,5}\.HK$/, // 港股 .HK 后缀
+    /^[A-Z]{1,6}$/, // 美股 Ticker
+    /^[A-Z]{1,6}\.[A-Z]{1,2}$/, // 美股带后缀
+  ];
+  return codePatterns.some((p) => p.test(normalized));
+};

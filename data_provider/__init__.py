@@ -20,6 +20,7 @@ _EXPORTS: Dict[str, Tuple[str, str]] = {
     "AkshareFetcher": ("data_provider.akshare_fetcher", "AkshareFetcher"),
     "is_hk_stock_code": ("data_provider.akshare_fetcher", "is_hk_stock_code"),
     "TushareFetcher": ("data_provider.tushare_fetcher", "TushareFetcher"),
+    "TickFlowFetcher": ("data_provider.tickflow_fetcher", "TickFlowFetcher"),
     "PytdxFetcher": ("data_provider.pytdx_fetcher", "PytdxFetcher"),
     "BaostockFetcher": ("data_provider.baostock_fetcher", "BaostockFetcher"),
     "YfinanceFetcher": ("data_provider.yfinance_fetcher", "YfinanceFetcher"),

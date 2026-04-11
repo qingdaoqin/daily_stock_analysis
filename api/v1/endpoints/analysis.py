@@ -481,6 +481,7 @@ def get_analysis_status(task_id: str) -> TaskStatus:
             progress=task.progress,
             result=None,  # 进行中的任务没有结果
             error=task.error,
+            stock_name=task.stock_name,
         )
     
     # 2. 从数据库查询已完成的记录
@@ -530,7 +531,8 @@ def get_analysis_status(task_id: str) -> TaskStatus:
                     report=report_dict,
                     created_at=record.created_at.isoformat() if record.created_at else datetime.now().isoformat()
                 ),
-                error=None
+                error=None,
+                stock_name=record.name,
             )
 
     except Exception as e:

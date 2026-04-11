@@ -492,7 +492,8 @@ class DataFetcherManager:
             fetchers: 数据源列表（可选，默认按优先级自动创建）
         """
         self._fetchers: List[BaseFetcher] = []
-        
+        self._tickflow_fetcher: Optional['BaseFetcher'] = None  # set by _init_default_fetchers when TICKFLOW_API_KEY configured
+
         if fetchers:
             # 按优先级排序
             self._fetchers = sorted(fetchers, key=lambda f: f.priority)
@@ -764,10 +765,25 @@ class DataFetcherManager:
         # 按优先级排序（Tushare 如果配置了 Token 且初始化成功，优先级为 0）
         self._fetchers.sort(key=lambda f: f.priority)
 
+        # TickFlowFetcher: 大盘复盘专用，不参与 daily/realtime 管道，单独存储
+        # 只在 TICKFLOW_API_KEY 配置时启用
+        self._tickflow_fetcher = None
+        try:
+            from src.config import get_config
+            _cfg = get_config()
+            _tf_key = getattr(_cfg, "tickflow_api_key", None)
+            if _tf_key:
+                from .tickflow_fetcher import TickFlowFetcher
+                self._tickflow_fetcher = TickFlowFetcher(api_key=_tf_key)
+                logger.info("[DataFetcherManager] TickFlowFetcher 已启用（大盘复盘增强）")
+        except Exception as _tf_exc:
+            logger.debug("[DataFetcherManager] TickFlowFetcher 初始化跳过: %s", _tf_exc)
+
         # 构建优先级说明
         priority_info = ", ".join([f"{f.name}(P{f.priority})" for f in self._fetchers])
         logger.info(f"已初始化 {len(self._fetchers)} 个数据源（按优先级）: {priority_info}")
     
+
     def add_fetcher(self, fetcher: BaseFetcher) -> None:
         """添加数据源并重新排序"""
         self._fetchers.append(fetcher)
@@ -1467,7 +1483,17 @@ class DataFetcherManager:
         return result
 
     def get_main_indices(self, region: str = "cn") -> List[Dict[str, Any]]:
-        """获取主要指数实时行情（自动切换数据源）"""
+        """获取主要指数实时行情（TickFlow 优先，自动切换数据源）"""
+        # TickFlow 优先尝试（仅 A 股 / cn 区域）
+        if region == "cn" and getattr(self, "_tickflow_fetcher", None) is not None:
+            try:
+                data = self._tickflow_fetcher.get_main_indices(region=region)
+                if data:
+                    logger.info("[TickFlowFetcher] 获取指数行情成功")
+                    return data
+            except Exception as e:
+                logger.warning("[TickFlowFetcher] 获取指数行情失败，降级到其他数据源: %s", e)
+        # 原有数据源链路
         for fetcher in self._fetchers:
             try:
                 data = fetcher.get_main_indices(region=region)
@@ -1480,7 +1506,17 @@ class DataFetcherManager:
         return []
 
     def get_market_stats(self) -> Dict[str, Any]:
-        """获取市场涨跌统计（自动切换数据源）"""
+        """获取市场涨跌统计（TickFlow 优先，自动切换数据源）"""
+        # TickFlow 优先尝试
+        if getattr(self, "_tickflow_fetcher", None) is not None:
+            try:
+                data = self._tickflow_fetcher.get_market_stats()
+                if data:
+                    logger.info("[TickFlowFetcher] 获取市场统计成功")
+                    return data
+            except Exception as e:
+                logger.warning("[TickFlowFetcher] 获取市场统计失败，降级到其他数据源: %s", e)
+        # 原有数据源链路
         for fetcher in self._fetchers:
             try:
                 data = fetcher.get_market_stats()

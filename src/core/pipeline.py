@@ -760,6 +760,7 @@ class StockAnalysisPipeline:
                 "stock_code": code,
                 "stock_name": stock_name,
                 "report_type": report_type.value,
+                "report_language": getattr(self.config, "report_language", "zh"),
                 "fundamental_context": fundamental_context,
             }
             if isinstance(market_context, dict) and market_context:

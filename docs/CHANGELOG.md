@@ -36,6 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] Agent SSE 流清理阶段静默吞掉后台执行器异常 — 流结束时后台任务异常现在正确记录并上报，避免错误无法感知（fixes #969）
 - [文档] FAQ 补充 Ollama `OllamaException / APIConnectionError` 连接失败排障条目（Q12c），覆盖服务未启动、URL 配置错误、模型前缀缺失、模型未下载、远程防火墙等 5 个检查点
 - [修复] 技能加载异常被静默吞没问题 — 在 ask.py、skills/aggregator.py、skills/router.py 的静默 except 块补充 logger.warning 日志，确保技能列表为空时有日志可查（fixes #970）
+- [改进] Tushare 港股数据接入 — `TushareFetcher` 新增 `_convert_hk_stock_code_for_tushare` 方法（支持 HK00700/00700.HK/00700 等多格式归一为 nnnnn.HK）；`_fetch_raw_data` 对港股改用 `hk_daily` 接口；`_normalize_data` 对港股跳过 vol/amount 的「手→股/千元→元」单位缩放；`get_stock_name` 对港股使用 `hk_basic` 接口；补充配套单元测试（tests/test_tushare_fetcher_get_stock_list.py）
+- [测试] 新增 `tests/test_data_tools_get_capital_flow.py` — 覆盖 `get_capital_flow` 工具的 ok/not_supported/异常/None 四种合约路径
+- [改进] LiteLLM 流式输出 — `GeminiAnalyzer` 新增 `_LiteLLMStreamError`、`_dispatch_litellm_completion`、`_normalize_usage`、`_extract_stream_text`、`_consume_litellm_stream` 五个方法；`_call_litellm` 增加 `stream` 参数（优先尝试 streaming，失败自动降级 non-stream）；`analyze()` 增加 `progress_callback`/`stream_progress_callback` 参数；补充 `tests/test_analyzer_litellm_stream.py`（22 用例）
+- [新功能] TickFlow API 大盘复盘增强 — 新增 `data_provider/tickflow_fetcher.py`（`TickFlowFetcher`，priority=99，市场复盘专用）；`DataFetcherManager.get_main_indices`/`get_market_stats` 优先走 TickFlow，失败降级至原有链路；`Config` 新增 `tickflow_api_key` 字段读取 `TICKFLOW_API_KEY` 环境变量（opt-in，未配置不影响现有功能）；补充 `tests/test_tickflow_fetcher.py`（28 用例）
+- [新功能] 集成 Anspire Search 作为最高优先级搜索引擎 — `search_service.py` 新增 `AnspireSearchProvider`，`Config` 新增 `anspire_api_keys` 字段（读取 `ANSPIRE_API_KEYS`），未配置时不影响现有搜索链路
+- [新功能] **Web 股票自动补全索引** — 新增 `stocks.index.json` 离线索引支持与 `StockAutocomplete` 组件：补全 `types/stockIndex.ts`、`utils/searchStocks.ts`、`utils/stockIndexLoader.ts`、`utils/normalizeQuery.ts`、`utils/reportLanguage.ts`、`hooks/useStockIndex.ts`、`hooks/useAutocomplete.ts`、`hooks/useDashboardLifecycle.ts`、`hooks/useHomeDashboardState.ts`、`components/StockAutocomplete/`、`components/dashboard/DashboardStateBlock.tsx`、`components/dashboard/DashboardPanelHeader.tsx` 等 17 个前端模块；新增 `scripts/generate_index_from_csv.py`（CSV → 压缩索引）和 `scripts/fetch_tushare_stock_list.py`（Tushare 股票列表获取）
+- [修复] `utils/validation.ts` 补全 `isObviouslyInvalidStockQuery` 与 `looksLikeStockCode` 两个缺失的导出函数，修复 `stockPoolStore.ts` 编译报错
 
 ## [3.11.0] - 2026-03-27
 ## [3.12.0] - 2026-04-01

@@ -778,7 +778,8 @@ def main() -> int:
     # 解析股票列表（统一为大写 Issue #355）
     stock_codes = None
     if args.stocks:
-        stock_codes = [canonical_stock_code(c) for c in args.stocks.split(',') if (c or "").strip()]
+        import re as _re
+        stock_codes = [canonical_stock_code(c) for c in _re.split(r'[,，]', args.stocks) if (c or "").strip()]
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
 
     # 验证配置

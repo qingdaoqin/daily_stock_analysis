@@ -352,9 +352,16 @@ class AgentOrchestrator:
             if result.success and agent.agent_name == "decision":
                 self._apply_risk_override(ctx)
 
-            # Abort pipeline on critical failure (except intel/risk — degrade gracefully)
+            # Abort pipeline on critical failure.
+            # Non-critical stages (intel, risk, strategy/skill agents) degrade
+            # gracefully so a single auxiliary failure doesn't block the final
+            # dashboard.
             if result.status == StageStatus.FAILED:
-                if agent.agent_name not in ("intel", "risk"):
+                is_non_critical = (
+                    agent.agent_name in ("intel", "risk")
+                    or agent.agent_name.startswith("strategy_")
+                )
+                if not is_non_critical:
                     logger.error("[Orchestrator] critical stage '%s' failed: %s", agent.agent_name, result.error)
                     return OrchestratorResult(
                         success=False,

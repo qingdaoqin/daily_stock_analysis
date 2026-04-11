@@ -74,3 +74,4 @@ def get_profile(region: str) -> MarketProfile:
     if region == "hk":
         return HK_PROFILE
     return CN_PROFILE
+

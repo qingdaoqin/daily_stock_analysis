@@ -16,7 +16,7 @@ import math
 import time
 from collections import Counter
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Callable, Optional, Dict, Any, List, Tuple
 
 try:
     import litellm
@@ -38,6 +38,14 @@ from src.data.stock_mapping import STOCK_NAME_MAP
 from src.schemas.report_schema import AnalysisReportSchema
 
 logger = logging.getLogger(__name__)
+
+
+class _LiteLLMStreamError(RuntimeError):
+    """Internal error wrapper that records whether any text was streamed."""
+
+    def __init__(self, message: str, *, partial_received: bool = False):
+        super().__init__(message)
+        self.partial_received = partial_received
 
 
 _BUY_SIGNAL_HINTS = {
@@ -1295,7 +1303,136 @@ class GeminiAnalyzer:
         )
         return any(marker in text for marker in retryable_markers)
 
-    def _call_litellm(self, prompt: str, generation_config: dict) -> Tuple[str, str, Dict[str, Any]]:
+    def _dispatch_litellm_completion(
+        self,
+        model: str,
+        call_kwargs: Dict[str, Any],
+        *,
+        config: Config,
+        use_channel_router: bool,
+        router_model_names: set,
+    ) -> Any:
+        """Dispatch a LiteLLM completion through router or direct fallback."""
+        effective_kwargs = dict(call_kwargs)
+        if use_channel_router and self._router and model in router_model_names:
+            return self._router.completion(**effective_kwargs)
+        if self._router and model == config.litellm_model and not use_channel_router:
+            return self._router.completion(**effective_kwargs)
+
+        keys = get_api_keys_for_model(model, config)
+        if keys:
+            effective_kwargs["api_key"] = keys[0]
+        effective_kwargs.update(extra_litellm_params(model, config))
+        return litellm.completion(**effective_kwargs)
+
+    def _normalize_usage(self, usage_obj: Any) -> Dict[str, Any]:
+        """Normalize usage objects from LiteLLM responses/chunks."""
+        if not usage_obj:
+            return {}
+
+        def _get_value(key: str) -> int:
+            if isinstance(usage_obj, dict):
+                return int(usage_obj.get(key) or 0)
+            return int(getattr(usage_obj, key, 0) or 0)
+
+        return {
+            "prompt_tokens": _get_value("prompt_tokens"),
+            "completion_tokens": _get_value("completion_tokens"),
+            "total_tokens": _get_value("total_tokens"),
+        }
+
+    def _extract_stream_text(self, chunk: Any) -> str:
+        """Extract provider-agnostic text delta from a LiteLLM streaming chunk."""
+        choices = chunk.get("choices") if isinstance(chunk, dict) else getattr(chunk, "choices", None)
+        if not choices:
+            return ""
+
+        choice = choices[0]
+        delta = choice.get("delta") if isinstance(choice, dict) else getattr(choice, "delta", None)
+        message = choice.get("message") if isinstance(choice, dict) else getattr(choice, "message", None)
+
+        content: Any = None
+        if isinstance(delta, dict):
+            content = delta.get("content")
+        elif isinstance(delta, str):
+            content = delta
+        elif delta is not None:
+            content = getattr(delta, "content", None)
+
+        if content is None:
+            if isinstance(message, dict):
+                content = message.get("content")
+            elif message is not None:
+                content = getattr(message, "content", None)
+
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "".join(parts)
+
+        return content if isinstance(content, str) else ""
+
+    def _consume_litellm_stream(
+        self,
+        stream_response: Any,
+        *,
+        model: str,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Consume a LiteLLM stream into a single text payload."""
+        chunks: List[str] = []
+        usage: Dict[str, Any] = {}
+        chars_received = 0
+        next_emit_at = 1
+
+        try:
+            for chunk in stream_response:
+                chunk_usage = chunk.get("usage") if isinstance(chunk, dict) else getattr(chunk, "usage", None)
+                normalized_usage = self._normalize_usage(chunk_usage)
+                if normalized_usage:
+                    usage = normalized_usage
+
+                delta_text = self._extract_stream_text(chunk)
+                if not delta_text:
+                    continue
+
+                chunks.append(delta_text)
+                chars_received += len(delta_text)
+                if progress_callback and chars_received >= next_emit_at:
+                    progress_callback(chars_received)
+                    next_emit_at = chars_received + 160
+        except Exception as exc:
+            raise _LiteLLMStreamError(
+                f"{model} stream interrupted: {exc}",
+                partial_received=chars_received > 0,
+            ) from exc
+
+        response_text = "".join(chunks).strip()
+        if not response_text:
+            raise _LiteLLMStreamError(
+                f"{model} stream returned empty response",
+                partial_received=False,
+            )
+
+        if progress_callback and chars_received > 0:
+            progress_callback(chars_received)
+
+        return response_text, usage
+
+    def _call_litellm(
+        self,
+        prompt: str,
+        generation_config: dict,
+        *,
+        stream: bool = False,
+        stream_progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> Tuple[str, str, Dict[str, Any]]:
         """Call LLM via litellm with fallback across configured models.
 
         When channels/YAML are configured, every model goes through the Router
@@ -1303,13 +1440,18 @@ class GeminiAnalyzer:
         In legacy mode, the primary model may use the Router while fallback
         models fall back to direct litellm.completion().
 
+        When stream=True, attempts streaming first for each model; falls back to
+        non-stream on _LiteLLMStreamError. Retries for transient errors are
+        preserved from the non-stream path.
+
         Args:
             prompt: User prompt text.
             generation_config: Dict with optional keys: temperature, max_output_tokens, max_tokens.
+            stream: Whether to attempt streaming mode first.
+            stream_progress_callback: Optional callback(chars_received) fired during stream.
 
         Returns:
-            Tuple of (response text, model_used, usage). On success model_used is the full model
-            name and usage is a dict with prompt_tokens, completion_tokens, total_tokens.
+            Tuple of (response text, model_used, usage).
         """
         config = get_config()
         max_tokens = (
@@ -1323,6 +1465,7 @@ class GeminiAnalyzer:
         models_to_try = [m for m in models_to_try if m]
 
         use_channel_router = self._has_channel_config(config)
+        router_model_names = set(get_configured_llm_models(config.llm_model_list))
 
         last_error = None
         for model in models_to_try:
@@ -1345,31 +1488,53 @@ class GeminiAnalyzer:
                     if extra:
                         call_kwargs["extra_body"] = extra
 
-                    _router_model_names = set(get_configured_llm_models(config.llm_model_list))
-                    if use_channel_router and self._router and model in _router_model_names:
-                        # Channel / YAML path: Router manages key + base_url per model
-                        response = self._router.completion(**call_kwargs)
-                    elif self._router and model == config.litellm_model and not use_channel_router:
-                        # Legacy path: Router only for primary model multi-key
-                        response = self._router.completion(**call_kwargs)
-                    else:
-                        # Legacy/direct-env path: direct call (also handles direct-env
-                        # providers like groq/ or bedrock/ that are not in the Router
-                        # model_list even when channel mode is active)
-                        keys = get_api_keys_for_model(model, config)
-                        if keys:
-                            call_kwargs["api_key"] = keys[0]
-                        call_kwargs.update(extra_litellm_params(model, config))
-                        response = litellm.completion(**call_kwargs)
+                    # --- Stream path (try first, fallback to non-stream on error) ---
+                    if stream:
+                        try:
+                            stream_response = self._dispatch_litellm_completion(
+                                model,
+                                {**call_kwargs, "stream": True},
+                                config=config,
+                                use_channel_router=use_channel_router,
+                                router_model_names=router_model_names,
+                            )
+                            response_text, usage = self._consume_litellm_stream(
+                                stream_response,
+                                model=model,
+                                progress_callback=stream_progress_callback,
+                            )
+                            return response_text, model, usage
+                        except _LiteLLMStreamError as exc:
+                            if exc.partial_received:
+                                logger.warning(
+                                    "[LiteLLM] %s stream failed after partial output, "
+                                    "retrying non-stream for same model: %s",
+                                    model, exc,
+                                )
+                            else:
+                                logger.warning(
+                                    "[LiteLLM] %s stream unavailable before first chunk, "
+                                    "falling back to non-stream: %s",
+                                    model, exc,
+                                )
+                            last_error = exc
+                        except Exception as exc:
+                            logger.warning(
+                                "[LiteLLM] %s stream request failed, falling back to non-stream: %s",
+                                model, exc,
+                            )
+
+                    # --- Non-stream path ---
+                    response = self._dispatch_litellm_completion(
+                        model,
+                        call_kwargs,
+                        config=config,
+                        use_channel_router=use_channel_router,
+                        router_model_names=router_model_names,
+                    )
 
                     if response and response.choices and response.choices[0].message.content:
-                        usage: Dict[str, Any] = {}
-                        if response.usage:
-                            usage = {
-                                "prompt_tokens": response.usage.prompt_tokens or 0,
-                                "completion_tokens": response.usage.completion_tokens or 0,
-                                "total_tokens": response.usage.total_tokens or 0,
-                            }
+                        usage = self._normalize_usage(getattr(response, "usage", None))
                         return (response.choices[0].message.content, model, usage)
                     raise ValueError("LLM returned empty response")
 
@@ -1433,9 +1598,11 @@ class GeminiAnalyzer:
             return None
 
     def analyze(
-        self, 
+        self,
         context: Dict[str, Any],
-        news_context: Optional[str] = None
+        news_context: Optional[str] = None,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        stream_progress_callback: Optional[Callable[[int], None]] = None,
     ) -> AnalysisResult:
         """
         分析单只股票
@@ -1512,6 +1679,14 @@ class GeminiAnalyzer:
 
             logger.info(f"[LLM调用] 开始调用 {model_name}...")
 
+            def _emit_progress(progress: int, message: str) -> None:
+                if progress_callback is None:
+                    return
+                try:
+                    progress_callback(progress, message)
+                except Exception as exc:
+                    logger.debug("[analyzer] progress callback skipped: %s", exc)
+
             # 使用 litellm 调用（支持完整性校验重试）
             current_prompt = prompt
             retry_count = 0
@@ -1519,7 +1694,13 @@ class GeminiAnalyzer:
 
             while True:
                 start_time = time.time()
-                response_text, model_used, llm_usage = self._call_litellm(current_prompt, generation_config)
+                _emit_progress(68, f"{context.get('code', '')} 正在调用 LLM...")
+                response_text, model_used, llm_usage = self._call_litellm(
+                    current_prompt,
+                    generation_config,
+                    stream=stream_progress_callback is not None,
+                    stream_progress_callback=stream_progress_callback,
+                )
                 elapsed = time.time() - start_time
 
                 # 记录响应信息
@@ -1644,7 +1825,7 @@ class GeminiAnalyzer:
 | 最低价 | {today.get('low', 'N/A')} {currency} |
 | 涨跌幅 | {today.get('pct_chg', 'N/A')}% |
 | 成交量 | {self._format_volume(today.get('volume'), market)} |
-| 成交额 | {self._format_amount(today.get('amount'), currency)} |
+| 成交额 | {self._format_amount(today.get('amount'), currency, market)} |
 
 ### 均线系统（关键判断指标）
 | 均线 | 数值 | 说明 |
@@ -1670,8 +1851,8 @@ class GeminiAnalyzer:
 | **换手率** | **{rt.get('turnover_rate', 'N/A')}%** | |
 | 市盈率(动态) | {rt.get('pe_ratio', 'N/A')} | |
 | 市净率 | {rt.get('pb_ratio', 'N/A')} | |
-| 总市值 | {self._format_amount(rt.get('total_mv'), currency)} | |
-| 流通市值 | {self._format_amount(rt.get('circ_mv'), currency)} | |
+| 总市值 | {self._format_amount(rt.get('total_mv'), currency, market)} | |
+| 流通市值 | {self._format_amount(rt.get('circ_mv'), currency, market)} | |
 | 60日涨跌幅 | {rt.get('change_60d', 'N/A')}% | 中期表现 |
 """
         
@@ -1834,10 +2015,20 @@ class GeminiAnalyzer:
         else:
             return f"{volume:.0f} 股"
     
-    def _format_amount(self, amount: Optional[float], currency: str = "元") -> str:
-        """格式化成交额显示（支持多币种标签）"""
+    def _format_amount(self, amount: Optional[float], currency: str = "元", market: str = "cn") -> str:
+        """格式化成交额显示（市场感知，支持多币种标签）"""
         if amount is None:
             return 'N/A'
+        if market == "us":
+            if amount >= 1e9:
+                return f"${amount / 1e9:.2f}B"
+            elif amount >= 1e6:
+                return f"${amount / 1e6:.2f}M"
+            elif amount >= 1e3:
+                return f"${amount / 1e3:.2f}K"
+            else:
+                return f"${amount:.0f}"
+        # cn / hk 使用中文单位
         if amount >= 1e8:
             return f"{amount / 1e8:.2f} 亿{currency}"
         elif amount >= 1e4:
@@ -1962,7 +2153,7 @@ class GeminiAnalyzer:
             "change_amount": self._format_price(change_amount),
             "amplitude": self._format_percent(amplitude),
             "volume": self._format_volume(today.get('volume'), market),
-            "amount": self._format_amount(today.get('amount'), currency),
+            "amount": self._format_amount(today.get('amount'), currency, market),
         }
 
         if realtime:

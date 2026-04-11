@@ -422,6 +422,7 @@ class Config:
 
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
+    tickflow_api_key: Optional[str] = None  # TickFlow 市场复盘 API Key（opt-in）
     
     # === AI 分析配置 ===
     # LiteLLM unified model config (provider/model format, e.g. gemini/gemini-2.5-flash)
@@ -479,6 +480,7 @@ class Config:
     vision_provider_priority: str = "gemini,anthropic,openai"
 
     # === 搜索引擎配置（支持多 Key 负载均衡）===
+    anspire_api_keys: List[str] = field(default_factory=list)  # Anspire Search API Keys
     bocha_api_keys: List[str] = field(default_factory=list)  # Bocha API Keys
     minimax_api_keys: List[str] = field(default_factory=list)  # MiniMax API Keys
     tavily_api_keys: List[str] = field(default_factory=list)  # Tavily API Keys
@@ -562,6 +564,9 @@ class Config:
 
     # 报告类型：simple(精简) 或 full(完整)
     report_type: str = "simple"
+
+    # 报告语言：zh(中文, 默认) 或 en(英文)
+    report_language: str = "zh"
 
     # 仅分析结果摘要：true 时只推送汇总，不含个股详情（Issue #262）
     report_summary_only: bool = False
@@ -776,6 +781,13 @@ class Config:
                 self.agent_strategy_routing, self._VALID_STRATEGY_ROUTING,
             )
             object.__setattr__(self, "agent_strategy_routing", "auto")
+        _valid_report_languages = ("zh", "en")
+        if self.report_language not in _valid_report_languages:
+            _log.warning(
+                "Invalid REPORT_LANGUAGE=%r, falling back to 'zh'. Valid: %s",
+                self.report_language, _valid_report_languages,
+            )
+            object.__setattr__(self, "report_language", "zh")
 
     # 单例实例存储
     _instance: Optional['Config'] = None
@@ -851,9 +863,10 @@ class Config:
         
         # 解析自选股列表（逗号分隔，统一为大写 Issue #355）
         stock_list_str = os.getenv('STOCK_LIST', '')
+        import re as _re
         stock_list = [
             (c or "").strip().upper()
-            for c in stock_list_str.split(',')
+            for c in _re.split(r'[,，]', stock_list_str)
             if (c or "").strip()
         ]
         
@@ -976,6 +989,10 @@ class Config:
             ]
 
         # 解析搜索引擎 API Keys（支持多个 key，逗号分隔）
+        # Anspire Search
+        anspire_keys_str = os.getenv('ANSPIRE_API_KEYS', '')
+        anspire_api_keys = [k.strip() for k in anspire_keys_str.split(',') if k.strip()]
+
         bocha_keys_str = os.getenv('BOCHA_API_KEYS', '')
         bocha_api_keys = [k.strip() for k in bocha_keys_str.split(',') if k.strip()]
 
@@ -1042,6 +1059,7 @@ class Config:
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
+            tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
             litellm_model=litellm_model,
             litellm_fallback_models=litellm_fallback_models,
             llm_temperature=resolve_unified_llm_temperature(litellm_model),
@@ -1084,6 +1102,7 @@ class Config:
                 or ""
             ),
             vision_provider_priority=os.getenv('VISION_PROVIDER_PRIORITY', 'gemini,anthropic,openai'),
+            anspire_api_keys=anspire_api_keys,
             bocha_api_keys=bocha_api_keys,
             minimax_api_keys=minimax_api_keys,
             tavily_api_keys=tavily_api_keys,
@@ -1148,6 +1167,7 @@ class Config:
             astrbot_token=os.getenv('ASTRBOT_TOKEN'),
             single_stock_notify=os.getenv('SINGLE_STOCK_NOTIFY', 'false').lower() == 'true',
             report_type=cls._parse_report_type(os.getenv('REPORT_TYPE', 'simple')),
+            report_language=os.getenv('REPORT_LANGUAGE', 'zh').strip().lower(),
             report_summary_only=os.getenv('REPORT_SUMMARY_ONLY', 'false').lower() == 'true',
             report_templates_dir=os.getenv('REPORT_TEMPLATES_DIR', 'templates'),
             report_renderer_enabled=os.getenv('REPORT_RENDERER_ENABLED', 'false').lower() == 'true',
@@ -1782,7 +1802,8 @@ class Config:
 
         # --- Search engine (informational only) ---
         if not (
-            self.bocha_api_keys
+            self.anspire_api_keys
+            or self.bocha_api_keys
             or self.minimax_api_keys
             or self.tavily_api_keys
             or self.brave_api_keys
@@ -1791,7 +1812,7 @@ class Config:
         ):
             issues.append(ConfigIssue(
                 severity="info",
-                message="未配置搜索引擎 API Key (Bocha/MiniMax/Tavily/Brave/SerpAPI/SearXNG)，新闻搜索功能将不可用",
+                message="未配置搜索引擎 API Key (Anspire/Bocha/MiniMax/Tavily/Brave/SerpAPI/SearXNG)，新闻搜索功能将不可用",
                 field="BOCHA_API_KEY",
             ))
 

@@ -893,12 +893,7 @@ class AnalysisResult:
 
     def get_emoji(self) -> str:
         """根据操作建议返回对应 emoji"""
-        _, emoji, _ = get_signal_level(
-            self.operation_advice,
-            self.sentiment_score,
-            self.report_language,
-        )
-        return emoji
+        return get_result_signal_level(self)[1]
 
     def get_confidence_stars(self) -> str:
         """返回置信度星级"""
@@ -2001,7 +1996,6 @@ class GeminiAnalyzer:
         如果解析失败，尝试智能提取或返回默认结果
         """
         try:
-            report_language = normalize_report_language(getattr(get_config(), "report_language", "zh"))
             # 清理响应文本：移除 markdown 代码块标记
             cleaned_text = response_text
             if '```json' in cleaned_text:
@@ -2038,26 +2032,69 @@ class GeminiAnalyzer:
                 if ai_stock_name and (name.startswith('股票') or name == code or 'Unknown' in name):
                     name = ai_stock_name
 
-                # 解析所有字段，使用默认值防止缺失
-                # 解析 decision_type，如果没有则根据 operation_advice 推断
-                decision_type = data.get('decision_type', '')
-                if not decision_type:
-                    op = data.get('operation_advice', 'Hold' if report_language == "en" else '持有')
-                    decision_type = infer_decision_type_from_advice(op, default='hold')
+                # 解析所有字段，优先做一致性校验，避免出现"看空但买入"之类互相打架的结论
+                raw_score = _coerce_sentiment_score_value(data.get('sentiment_score', 50))
+                raw_trend_prediction = data.get('trend_prediction', '震荡')
+                raw_operation_advice = data.get('operation_advice', '持有')
+                raw_decision_type = data.get('decision_type', '')
+
+                decision_signal = _canonical_decision_signal(raw_decision_type)
+                operation_signal = _signal_from_operation_advice(raw_operation_advice)
+                trend_signal = _signal_from_trend_prediction(raw_trend_prediction)
+                score_signal = _signal_from_sentiment_score(raw_score)
+
+                action_signal = decision_signal or operation_signal
+                final_signal, has_conflict, hold_bias = _resolve_signal_state(
+                    decision_signal=decision_signal,
+                    operation_signal=operation_signal,
+                    trend_signal=trend_signal,
+                    score_signal=score_signal,
+                    raw_trend_prediction=raw_trend_prediction,
+                )
+
+                normalized_score = raw_score
+                if raw_score < 0 or raw_score > 100 or has_conflict or score_signal not in ("", final_signal):
+                    normalized_score = _clamp_sentiment_score_to_signal_with_bias(
+                        max(0, min(100, raw_score)),
+                        final_signal,
+                        hold_bias,
+                    )
+
+                normalized_trend_prediction = raw_trend_prediction
+                canonical_trend = _canonical_trend_prediction_with_bias(final_signal, hold_bias)
+                if (
+                    has_conflict
+                    or trend_signal not in ("", final_signal)
+                    or (final_signal == "hold" and hold_bias != "neutral" and str(raw_trend_prediction).strip() != canonical_trend)
+                ):
+                    normalized_trend_prediction = canonical_trend
+
+                normalized_operation_advice = raw_operation_advice
+                canonical_advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
+                if (
+                    not action_signal
+                    or has_conflict
+                    or operation_signal not in ("", final_signal)
+                    or (final_signal == "hold" and hold_bias != "neutral" and str(raw_operation_advice).strip() != canonical_advice)
+                ):
+                    normalized_operation_advice = canonical_advice
+
+                dashboard = _normalize_dashboard_signal_fields(
+                    dashboard,
+                    final_signal,
+                    has_conflict=has_conflict,
+                    hold_bias=hold_bias,
+                )
                 
                 return AnalysisResult(
                     code=code,
                     name=name,
                     # 核心指标
-                    sentiment_score=int(data.get('sentiment_score', 50)),
-                    trend_prediction=data.get('trend_prediction', 'Sideways' if report_language == "en" else '震荡'),
-                    operation_advice=data.get('operation_advice', 'Hold' if report_language == "en" else '持有'),
-                    decision_type=decision_type,
-                    confidence_level=localize_confidence_level(
-                        data.get('confidence_level', 'Medium' if report_language == "en" else '中'),
-                        report_language,
-                    ),
-                    report_language=report_language,
+                    sentiment_score=normalized_score,
+                    trend_prediction=normalized_trend_prediction,
+                    operation_advice=normalized_operation_advice,
+                    decision_type=final_signal,
+                    confidence_level=data.get('confidence_level', '中'),
                     # 决策仪表盘
                     dashboard=dashboard,
                     # 走势分析
@@ -2078,13 +2115,13 @@ class GeminiAnalyzer:
                     market_sentiment=data.get('market_sentiment', ''),
                     hot_topics=data.get('hot_topics', ''),
                     # 综合
-                    analysis_summary=data.get('analysis_summary', 'Analysis completed' if report_language == "en" else '分析完成'),
+                    analysis_summary=data.get('analysis_summary', '分析完成'),
                     key_points=data.get('key_points', ''),
                     risk_warning=data.get('risk_warning', ''),
                     buy_reason=data.get('buy_reason', ''),
                     # 元数据
                     search_performed=data.get('search_performed', False),
-                    data_sources=data.get('data_sources', 'Technical data' if report_language == "en" else '技术面数据'),
+                    data_sources=data.get('data_sources', '技术面数据'),
                     success=True,
                 )
             else:
@@ -2111,9 +2148,15 @@ class GeminiAnalyzer:
         # 确保布尔值是小写
         json_str = json_str.replace('True', 'true').replace('False', 'false')
         
-        # fix by json-repair
-        json_str = repair_json(json_str)
-        
+        # fix by json-repair when available
+        if callable(repair_json):
+            try:
+                repaired = repair_json(json_str)
+                if isinstance(repaired, str) and repaired.strip():
+                    json_str = repaired
+            except Exception:
+                pass
+
         return json_str
     
     def _parse_text_response(
@@ -2123,36 +2166,67 @@ class GeminiAnalyzer:
         name: str
     ) -> AnalysisResult:
         """从纯文本响应中尽可能提取分析信息"""
-        report_language = normalize_report_language(getattr(get_config(), "report_language", "zh"))
-        # 尝试识别关键词来判断情绪
-        sentiment_score = 50
-        trend = 'Sideways' if report_language == "en" else '震荡'
-        advice = 'Hold' if report_language == "en" else '持有'
-        
-        text_lower = response_text.lower()
-        
-        # 简单的情绪识别
-        positive_keywords = ['看多', '买入', '上涨', '突破', '强势', '利好', '加仓', 'bullish', 'buy']
-        negative_keywords = ['看空', '卖出', '下跌', '跌破', '弱势', '利空', '减仓', 'bearish', 'sell']
-        
+        text = response_text or ""
+        text_lower = text.lower()
+
+        action_buy_keywords = ['买入', '加仓', '建仓', '试仓', 'buy']
+        action_sell_keywords = ['卖出', '减仓', '止盈', '止损', 'sell']
+        hold_keywords = ['持有', '观望', '等待', 'wait', 'hold']
+        positive_keywords = ['看多', '上涨', '突破', '强势', '利好', 'bullish']
+        negative_keywords = ['看空', '下跌', '跌破', '弱势', '利空', 'bearish']
+
+        has_buy_action = any(keyword in text_lower for keyword in action_buy_keywords)
+        has_sell_action = any(keyword in text_lower for keyword in action_sell_keywords)
+        has_hold_action = any(keyword in text_lower for keyword in hold_keywords)
+
+        explicit_action_signal = ""
+        if has_buy_action and not has_sell_action:
+            explicit_action_signal = "buy"
+        elif has_sell_action and not has_buy_action:
+            explicit_action_signal = "sell"
+        elif has_hold_action or (has_buy_action and has_sell_action):
+            explicit_action_signal = "hold"
+
         positive_count = sum(1 for kw in positive_keywords if kw in text_lower)
         negative_count = sum(1 for kw in negative_keywords if kw in text_lower)
-        
-        if positive_count > negative_count + 1:
-            sentiment_score = 65
-            trend = 'Bullish' if report_language == "en" else '看多'
-            advice = 'Buy' if report_language == "en" else '买入'
-            decision_type = 'buy'
-        elif negative_count > positive_count + 1:
-            sentiment_score = 35
-            trend = 'Bearish' if report_language == "en" else '看空'
-            advice = 'Sell' if report_language == "en" else '卖出'
-            decision_type = 'sell'
+
+        trend_signal = ""
+        if positive_count >= negative_count + 2:
+            trend_signal = "buy"
+        elif negative_count >= positive_count + 2:
+            trend_signal = "sell"
+        elif positive_count or negative_count or has_hold_action:
+            trend_signal = "hold"
+
+        final_signal, _ = _resolve_consistent_signal(
+            [explicit_action_signal, trend_signal]
+        )
+        hold_bias = "neutral"
+        if final_signal == "hold":
+            hold_bias = _derive_hold_bias([explicit_action_signal, trend_signal])
+
+        if final_signal == "buy":
+            sentiment_score = 62
+        elif final_signal == "sell":
+            sentiment_score = 38
         else:
-            decision_type = 'hold'
+            base_score = {
+                "bullish": 56,
+                "neutral": 50,
+                "bearish": 44,
+            }.get(hold_bias, 50)
+            sentiment_score = _clamp_sentiment_score_to_signal_with_bias(
+                base_score,
+                "hold",
+                hold_bias,
+            )
+
+        trend = _canonical_trend_prediction_with_bias(final_signal, hold_bias)
+        advice = _canonical_operation_advice_with_bias(final_signal, hold_bias)
+        decision_type = final_signal
         
         # 截取前500字符作为摘要
-        summary = response_text[:500] if response_text else ('No analysis result' if report_language == "en" else '无分析结果')
+        summary = text[:500] if text else '无分析结果'
         
         return AnalysisResult(
             code=code,
@@ -2161,13 +2235,12 @@ class GeminiAnalyzer:
             trend_prediction=trend,
             operation_advice=advice,
             decision_type=decision_type,
-            confidence_level='Low' if report_language == "en" else '低',
+            confidence_level='低',
             analysis_summary=summary,
-            key_points='JSON parsing failed; treat this as best-effort output.' if report_language == "en" else 'JSON解析失败，仅供参考',
-            risk_warning='The result may be inaccurate. Cross-check with other information.' if report_language == "en" else '分析结果可能不准确，建议结合其他信息判断',
+            key_points='JSON解析失败，已降级为保守文本提取结果，仅供参考',
+            risk_warning='结构化解析失败，结论已按保守逻辑降级，建议结合原文与其他信息判断',
             raw_response=response_text,
             success=True,
-            report_language=report_language,
         )
     
     def batch_analyze(

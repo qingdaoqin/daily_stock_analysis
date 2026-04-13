@@ -489,6 +489,7 @@ class Config:
     xai_api_keys: List[str] = field(default_factory=list)  # xAI X Search API Keys
     xai_search_model: str = "grok-4-1-fast-reasoning"  # xAI model for X Search social signals
     searxng_base_urls: List[str] = field(default_factory=list)  # SearXNG instance URLs (self-hosted, no quota)
+    searxng_public_instances_enabled: bool = True  # Auto-discover public SearXNG instances when SEARXNG_BASE_URLS is empty
 
     # === 新闻与分析筛选配置 ===
     news_max_age_days: int = 3   # 新闻最大时效（天）
@@ -1111,6 +1112,7 @@ class Config:
             xai_api_keys=xai_api_keys,
             xai_search_model=os.getenv('XAI_SEARCH_MODEL', 'grok-4-1-fast-reasoning'),
             searxng_base_urls=searxng_base_urls,
+            searxng_public_instances_enabled=os.getenv('SEARXNG_PUBLIC_INSTANCES_ENABLED', 'true').lower() in ('true', '1', 'yes'),
             news_max_age_days=parse_env_int(os.getenv('NEWS_MAX_AGE_DAYS'), 3, field_name='NEWS_MAX_AGE_DAYS', minimum=1),
             news_strategy_profile=normalize_news_strategy_profile(os.getenv('NEWS_STRATEGY_PROFILE', 'short')),
             bias_threshold=parse_env_float(os.getenv('BIAS_THRESHOLD'), 5.0, field_name='BIAS_THRESHOLD', minimum=1.0),
@@ -1655,6 +1657,20 @@ class Config:
         if self.litellm_model:
             return True
         return False
+
+    def has_search_capability_enabled(self) -> bool:
+        """Check if any search engine capability is available."""
+        return bool(
+            self.anspire_api_keys
+            or self.bocha_api_keys
+            or self.minimax_api_keys
+            or self.tavily_api_keys
+            or self.brave_api_keys
+            or self.serpapi_keys
+            or self.xai_api_keys
+            or self.searxng_base_urls
+            or self.searxng_public_instances_enabled
+        )
 
     def refresh_stock_list(self) -> None:
         """

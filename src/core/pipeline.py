@@ -105,6 +105,7 @@ class StockAnalysisPipeline:
                 xai_keys=self.config.xai_api_keys,
                 xai_search_model=self.config.xai_search_model,
                 searxng_base_urls=self.config.searxng_base_urls,
+                searxng_public_instances_enabled=self.config.searxng_public_instances_enabled,
                 news_max_age_days=self.config.news_max_age_days,
                 news_strategy_profile=self.config.news_strategy_profile,
             )

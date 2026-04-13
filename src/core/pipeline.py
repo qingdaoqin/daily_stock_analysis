@@ -300,7 +300,8 @@ class StockAnalysisPipeline:
                     turnover_rate = getattr(realtime_quote, 'turnover_rate', None)
                     session = get_market_session(get_market_for_stock(code))
                     session_tag = {"pre_market": "[盘前]", "trading": "[盘中]", "post_market": "[盘后]", "closed": "[休市]"}.get(session, "")
-                    logger.info(f"{stock_name}({code}) 实时行情{session_tag}: 价格={realtime_quote.price}, "
+                    _price_display = round(realtime_quote.price, 4) if realtime_quote.price is not None else None
+                    logger.info(f"{stock_name}({code}) 实时行情{session_tag}: 价格={_price_display}, "
                               f"量比={volume_ratio}, 换手率={turnover_rate}% "
                               f"(来源: {realtime_quote.source.value if hasattr(realtime_quote, 'source') else 'unknown'})")
                 else:

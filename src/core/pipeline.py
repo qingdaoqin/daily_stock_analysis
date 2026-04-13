@@ -421,7 +421,6 @@ class StockAnalysisPipeline:
                         news_context = self.search_service.format_intel_report(
                             intel_results,
                             stock_name,
-                            stock_code=code,
                         )
                         total_results = sum(
                             len(r.results) for r in intel_results.values() if r.success

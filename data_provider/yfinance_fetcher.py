@@ -700,12 +700,18 @@ class YfinanceFetcher(BaseFetcher):
                 info = ticker.fast_info
                 if info is None:
                     raise ValueError("fast_info is None")
-                price = getattr(info, 'lastPrice', None) or getattr(info, 'last_price', None)
-                prev_close = getattr(info, 'previousClose', None) or getattr(info, 'previous_close', None)
-                open_price = getattr(info, 'open', None)
-                high = getattr(info, 'dayHigh', None) or getattr(info, 'day_high', None)
-                low = getattr(info, 'dayLow', None) or getattr(info, 'day_low', None)
+                _price = getattr(info, 'lastPrice', None) or getattr(info, 'last_price', None)
+                _prev_close = getattr(info, 'previousClose', None) or getattr(info, 'previous_close', None)
+                _open = getattr(info, 'open', None)
+                _high = getattr(info, 'dayHigh', None) or getattr(info, 'day_high', None)
+                _low = getattr(info, 'dayLow', None) or getattr(info, 'day_low', None)
                 volume = getattr(info, 'lastVolume', None) or getattr(info, 'last_volume', None)
+                # fast_info returns numpy.float32; round to avoid precision noise
+                price = round(float(_price), 2) if _price is not None else None
+                prev_close = round(float(_prev_close), 2) if _prev_close is not None else None
+                open_price = round(float(_open), 2) if _open is not None else None
+                high = round(float(_high), 2) if _high is not None else None
+                low = round(float(_low), 2) if _low is not None else None
             except Exception:
                 logger.debug("[Yfinance] fast_info 失败，尝试 history 方法")
                 hist = ticker.history(period='2d')
@@ -805,13 +811,19 @@ class YfinanceFetcher(BaseFetcher):
                 if info is None:
                     raise ValueError("fast_info is None")
 
-                price = getattr(info, 'lastPrice', None) or getattr(info, 'last_price', None)
-                prev_close = getattr(info, 'previousClose', None) or getattr(info, 'previous_close', None)
-                open_price = getattr(info, 'open', None)
-                high = getattr(info, 'dayHigh', None) or getattr(info, 'day_high', None)
-                low = getattr(info, 'dayLow', None) or getattr(info, 'day_low', None)
+                _price = getattr(info, 'lastPrice', None) or getattr(info, 'last_price', None)
+                _prev_close = getattr(info, 'previousClose', None) or getattr(info, 'previous_close', None)
+                _open = getattr(info, 'open', None)
+                _high = getattr(info, 'dayHigh', None) or getattr(info, 'day_high', None)
+                _low = getattr(info, 'dayLow', None) or getattr(info, 'day_low', None)
                 volume = getattr(info, 'lastVolume', None) or getattr(info, 'last_volume', None)
                 market_cap = getattr(info, 'marketCap', None) or getattr(info, 'market_cap', None)
+                # fast_info returns numpy.float32; round to avoid precision noise
+                price = round(float(_price), 2) if _price is not None else None
+                prev_close = round(float(_prev_close), 2) if _prev_close is not None else None
+                open_price = round(float(_open), 2) if _open is not None else None
+                high = round(float(_high), 2) if _high is not None else None
+                low = round(float(_low), 2) if _low is not None else None
 
             except Exception:
                 # 回退到 history 方法获取最新数据

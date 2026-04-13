@@ -98,10 +98,15 @@ class StockAnalysisPipeline:
             self.search_service = SearchService(
                 bocha_keys=self.config.bocha_api_keys,
                 tavily_keys=self.config.tavily_api_keys,
+                anspire_keys=self.config.anspire_api_keys,
                 brave_keys=self.config.brave_api_keys,
                 serpapi_keys=self.config.serpapi_keys,
                 minimax_keys=self.config.minimax_api_keys,
+                xai_keys=self.config.xai_api_keys,
+                xai_search_model=self.config.xai_search_model,
+                searxng_base_urls=self.config.searxng_base_urls,
                 news_max_age_days=self.config.news_max_age_days,
+                news_strategy_profile=self.config.news_strategy_profile,
             )
         except Exception as e:
             logger.warning("搜索服务初始化失败，后续将按 fail-open 跳过情报搜索: %s", e)
@@ -118,7 +123,10 @@ class StockAnalysisPipeline:
         else:
             logger.info("筹码分布分析已禁用")
         if self.search_service and self.search_service.is_available:
-            logger.info("搜索服务已启用 (Tavily/SerpAPI)")
+            provider_names = [p.name for p in self.search_service._providers]
+            if self.search_service._x_signal_provider:
+                provider_names.append("xAI")
+            logger.info(f"搜索服务已启用 ({', '.join(provider_names) or 'N/A'})")
         else:
             logger.warning("搜索服务未启用（未配置 API Key）")
 

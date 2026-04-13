@@ -80,6 +80,7 @@ class AgentOrchestrator:
         tool_registry: ToolRegistry,
         llm_adapter: LLMToolAdapter,
         skill_instructions: str = "",
+        technical_skill_policy: str = "",
         max_steps: int = 10,
         mode: str = "standard",
         skill_manager=None,
@@ -88,6 +89,7 @@ class AgentOrchestrator:
         self.tool_registry = tool_registry
         self.llm_adapter = llm_adapter
         self.skill_instructions = skill_instructions
+        self.technical_skill_policy = technical_skill_policy
         self.max_steps = max_steps
         self.mode = mode if mode in VALID_MODES else "standard"
         self.skill_manager = skill_manager

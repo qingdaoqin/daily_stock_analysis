@@ -491,6 +491,10 @@ class Config:
     searxng_base_urls: List[str] = field(default_factory=list)  # SearXNG instance URLs (self-hosted, no quota)
     searxng_public_instances_enabled: bool = True  # Auto-discover public SearXNG instances when SEARXNG_BASE_URLS is empty
 
+    # === Social Sentiment (US stocks only) ===
+    social_sentiment_api_key: Optional[str] = None
+    social_sentiment_api_url: str = "https://api.adanos.org"
+
     # === 新闻与分析筛选配置 ===
     news_max_age_days: int = 3   # 新闻最大时效（天）
     news_strategy_profile: str = "short"  # News window strategy: ultra_short/short/medium/long
@@ -525,6 +529,8 @@ class Config:
     
     # 飞书 Webhook
     feishu_webhook_url: Optional[str] = None
+    feishu_webhook_secret: Optional[str] = None  # 自定义机器人签名密钥（可选）
+    feishu_webhook_keyword: Optional[str] = None  # 自定义机器人关键词（可选）
     
     # Telegram 配置（需要同时配置 Bot Token 和 Chat ID）
     telegram_bot_token: Optional[str] = None  # Bot Token（@BotFather 获取）
@@ -555,6 +561,12 @@ class Config:
     discord_bot_token: Optional[str] = None  # Discord Bot Token
     discord_main_channel_id: Optional[str] = None  # Discord 主频道 ID
     discord_webhook_url: Optional[str] = None  # Discord Webhook URL
+    discord_interactions_public_key: Optional[str] = None  # Discord Interaction 入站验签公钥
+
+    # Slack 通知配置
+    slack_webhook_url: Optional[str] = None  # Slack Incoming Webhook URL
+    slack_bot_token: Optional[str] = None  # Slack Bot Token (xoxb-...)
+    slack_channel_id: Optional[str] = None  # Slack 频道 ID
 
     # AstrBot 通知配置
     astrbot_token: Optional[str] = None
@@ -582,6 +594,7 @@ class Config:
     # PushPlus 推送配置
     pushplus_token: Optional[str] = None  # PushPlus Token
     pushplus_topic: Optional[str] = None  # PushPlus 群组编码（一对多推送）
+    pushplus_max_bytes: int = 20000  # PushPlus 消息分批阈值（字节）
 
     # Server酱3 推送配置
     serverchan3_sendkey: Optional[str] = None  # Server酱3 SendKey
@@ -1113,6 +1126,8 @@ class Config:
             xai_search_model=os.getenv('XAI_SEARCH_MODEL', 'grok-4-1-fast-reasoning'),
             searxng_base_urls=searxng_base_urls,
             searxng_public_instances_enabled=os.getenv('SEARXNG_PUBLIC_INSTANCES_ENABLED', 'true').lower() in ('true', '1', 'yes'),
+            social_sentiment_api_key=os.getenv('SOCIAL_SENTIMENT_API_KEY') or None,
+            social_sentiment_api_url=os.getenv('SOCIAL_SENTIMENT_API_URL', 'https://api.adanos.org').rstrip('/'),
             news_max_age_days=parse_env_int(os.getenv('NEWS_MAX_AGE_DAYS'), 3, field_name='NEWS_MAX_AGE_DAYS', minimum=1),
             news_strategy_profile=normalize_news_strategy_profile(os.getenv('NEWS_STRATEGY_PROFILE', 'short')),
             bias_threshold=parse_env_float(os.getenv('BIAS_THRESHOLD'), 5.0, field_name='BIAS_THRESHOLD', minimum=1.0),
@@ -1143,6 +1158,8 @@ class Config:
             agent_event_alert_rules_json=os.getenv('AGENT_EVENT_ALERT_RULES_JSON', ''),
             wechat_webhook_url=os.getenv('WECHAT_WEBHOOK_URL'),
             feishu_webhook_url=os.getenv('FEISHU_WEBHOOK_URL'),
+            feishu_webhook_secret=os.getenv('FEISHU_WEBHOOK_SECRET'),
+            feishu_webhook_keyword=os.getenv('FEISHU_WEBHOOK_KEYWORD'),
             telegram_bot_token=os.getenv('TELEGRAM_BOT_TOKEN'),
             telegram_chat_id=os.getenv('TELEGRAM_CHAT_ID'),
             telegram_message_thread_id=os.getenv('TELEGRAM_MESSAGE_THREAD_ID'),
@@ -1155,6 +1172,7 @@ class Config:
             pushover_api_token=os.getenv('PUSHOVER_API_TOKEN'),
             pushplus_token=os.getenv('PUSHPLUS_TOKEN'),
             pushplus_topic=os.getenv('PUSHPLUS_TOPIC'),
+            pushplus_max_bytes=parse_env_int(os.getenv('PUSHPLUS_MAX_BYTES'), 20000, field_name='PUSHPLUS_MAX_BYTES', minimum=1),
             serverchan3_sendkey=os.getenv('SERVERCHAN3_SENDKEY'),
             custom_webhook_urls=[u.strip() for u in os.getenv('CUSTOM_WEBHOOK_URLS', '').split(',') if u.strip()],
             custom_webhook_bearer_token=os.getenv('CUSTOM_WEBHOOK_BEARER_TOKEN'),
@@ -1165,6 +1183,10 @@ class Config:
                 or os.getenv('DISCORD_CHANNEL_ID')
             ),
             discord_webhook_url=os.getenv('DISCORD_WEBHOOK_URL'),
+            discord_interactions_public_key=os.getenv('DISCORD_INTERACTIONS_PUBLIC_KEY'),
+            slack_webhook_url=os.getenv('SLACK_WEBHOOK_URL'),
+            slack_bot_token=os.getenv('SLACK_BOT_TOKEN'),
+            slack_channel_id=os.getenv('SLACK_CHANNEL_ID'),
             astrbot_url=os.getenv('ASTRBOT_URL'),
             astrbot_token=os.getenv('ASTRBOT_TOKEN'),
             single_stock_notify=os.getenv('SINGLE_STOCK_NOTIFY', 'false').lower() == 'true',
@@ -1273,6 +1295,10 @@ class Config:
             telegram_webhook_secret=os.getenv('TELEGRAM_WEBHOOK_SECRET'),
             # Discord 机器人扩展配置
             discord_bot_status=os.getenv('DISCORD_BOT_STATUS', '多市场智能分析 | /help'),
+            # 流控配置
+            akshare_sleep_min=parse_env_float(os.getenv('AKSHARE_SLEEP_MIN'), 2.0, field_name='AKSHARE_SLEEP_MIN', minimum=0.0),
+            akshare_sleep_max=parse_env_float(os.getenv('AKSHARE_SLEEP_MAX'), 5.0, field_name='AKSHARE_SLEEP_MAX', minimum=0.0),
+            tushare_rate_limit_per_minute=parse_env_int(os.getenv('TUSHARE_RATE_LIMIT_PER_MINUTE'), 80, field_name='TUSHARE_RATE_LIMIT_PER_MINUTE', minimum=1),
             # 实时行情增强数据配置
             enable_realtime_quote=os.getenv('ENABLE_REALTIME_QUOTE', 'true').lower() == 'true',
             enable_realtime_technical_indicators=os.getenv(
@@ -1844,6 +1870,8 @@ class Config:
             or self.custom_webhook_urls
             or (self.discord_bot_token and self.discord_main_channel_id)
             or self.discord_webhook_url
+            or self.slack_webhook_url
+            or (self.slack_bot_token and self.slack_channel_id)
         )
 
         if not has_notification:

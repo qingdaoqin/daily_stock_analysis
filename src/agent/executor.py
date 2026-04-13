@@ -275,6 +275,7 @@ class AgentExecutor:
         llm_adapter: LLMToolAdapter,
         skill_instructions: str = "",
         default_skill_policy: str = "",
+        use_legacy_default_prompt: bool = False,
         max_steps: int = 10,
         timeout_seconds: Optional[float] = None,
     ):
@@ -282,6 +283,7 @@ class AgentExecutor:
         self.llm_adapter = llm_adapter
         self.skill_instructions = skill_instructions
         self.default_skill_policy = default_skill_policy
+        self.use_legacy_default_prompt = use_legacy_default_prompt
         self.max_steps = max_steps
         self.timeout_seconds = timeout_seconds
 

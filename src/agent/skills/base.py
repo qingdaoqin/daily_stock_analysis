@@ -48,8 +48,21 @@ class Skill:
     category: str = "trend"
     core_rules: List[int] = field(default_factory=list)
     required_tools: List[str] = field(default_factory=list)
+    allowed_tools: List[str] = field(default_factory=list)
+    aliases: List[str] = field(default_factory=list)
     enabled: bool = False
     source: str = "builtin"
+    entrypoint: str = ""
+    bundle_dir: str = ""
+    disable_model_invocation: bool = False
+    user_invocable: bool = True
+    default_active: bool = False
+    default_router: bool = False
+    default_priority: int = 100
+    market_regimes: List[str] = field(default_factory=list)
+    execution_context: str = "inline"
+    subagent_type: str = ""
+    preferred_model: str = ""
 
 
 def load_skill_from_yaml(filepath: Union[str, Path]) -> Skill:
@@ -96,8 +109,21 @@ def load_skill_from_yaml(filepath: Union[str, Path]) -> Skill:
         category=str(data.get("category", "trend")).strip(),
         core_rules=data.get("core_rules", []) or [],
         required_tools=data.get("required_tools", []) or [],
+        allowed_tools=data.get("allowed_tools", []) or [],
+        aliases=data.get("aliases", []) or [],
         enabled=False,
         source=str(filepath),
+        entrypoint=str(filepath),
+        bundle_dir=str(Path(filepath).parent),
+        disable_model_invocation=bool(data.get("disable_model_invocation", False)),
+        user_invocable=bool(data.get("user_invocable", True)),
+        default_active=bool(data.get("default_active", False)),
+        default_router=bool(data.get("default_router", False)),
+        default_priority=int(data.get("default_priority", 100)) if data.get("default_priority") is not None else 100,
+        market_regimes=data.get("market_regimes", []) or data.get("market-regimes", []) or [],
+        execution_context=str(data.get("context", "inline")).strip() or "inline",
+        subagent_type=str(data.get("agent", "")).strip(),
+        preferred_model=str(data.get("model", "")).strip(),
     )
 
 
@@ -161,11 +187,11 @@ class SkillManager:
         self._skills[skill.name] = skill
         logger.debug(f"Registered strategy: {skill.name} ({skill.display_name})")
 
-    def load_builtin_strategies(self) -> int:
-        """Load all built-in strategies from the ``strategies/`` directory.
+    def load_builtin_skills(self) -> int:
+        """Load all built-in skills from the ``strategies/`` directory.
 
         Returns:
-            Number of strategies loaded.
+            Number of skills loaded.
         """
         strategies_dir = _BUILTIN_STRATEGIES_DIR
         if not strategies_dir.is_dir():
@@ -180,10 +206,14 @@ class SkillManager:
         logger.info(f"Loaded {len(skills)} built-in strategies from {strategies_dir}")
         return len(skills)
 
-    def load_custom_strategies(self, directory: Union[str, Path, None]) -> int:
-        """Load custom strategies from a user-specified directory.
+    def load_builtin_strategies(self) -> int:
+        """Compatibility wrapper — delegates to :meth:`load_builtin_skills`."""
+        return self.load_builtin_skills()
 
-        Custom strategies override built-in ones if names conflict.
+    def load_custom_skills(self, directory: Union[str, Path, None]) -> int:
+        """Load custom skills from a user-specified directory.
+
+        Custom skills override built-in ones if names conflict.
 
         Args:
             directory: Path to the custom strategies directory.
@@ -211,6 +241,10 @@ class SkillManager:
 
         logger.info(f"Loaded {len(skills)} custom strategies from {directory}")
         return len(skills)
+
+    def load_custom_strategies(self, directory: Union[str, Path, None]) -> int:
+        """Compatibility wrapper — delegates to :meth:`load_custom_skills`."""
+        return self.load_custom_skills(directory)
 
     def get(self, name: str) -> Optional[Skill]:
         """Get a skill by name."""

@@ -151,7 +151,7 @@ class SkillAggregator:
             from src.config import get_config
 
             config = get_config()
-            return getattr(config, "agent_skill_autoweight", True)
+            return getattr(config, "agent_strategy_autoweight", True)
         except Exception:
             logger.debug("Failed to get backtest autoweight config, defaulting to True", exc_info=True)
             return True

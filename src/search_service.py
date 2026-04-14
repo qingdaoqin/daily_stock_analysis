@@ -3380,11 +3380,21 @@ class SearchService:
                     'name': 'official_announcements',
                     'query': (
                         f"(site:cninfo.com.cn OR site:sse.com.cn OR site:szse.cn) "
-                        f"{stock_name} {stock_code} 公告"
+                        f"{stock_name} {stock_code} "
+                        f"公告 OR 减持 OR 业绩预告 OR 监管函 OR 问询函"
                     ),
                     'desc': '官方公告',
                     'direct_kind': 'cn_official',
                     'engine_fallback': False,
+                },
+                {
+                    'name': 'risk_alerts',
+                    'query': (
+                        f"{stock_name} {stock_code} "
+                        f"减持 OR 立案调查 OR 退市风险 OR 监管函 OR 问询函 OR ST OR 行政处罚"
+                    ),
+                    'desc': '风险预警',
+                    'engine_fallback': True,
                 },
             ]
 
@@ -3482,7 +3492,11 @@ class SearchService:
                     'name': 'risk_check',
                     'query': (
                         f"{stock_name} 指数走势 跟踪误差 净值 表现"
-                        if is_index_etf else f"{stock_name} 减持 处罚 违规 诉讼 利空 风险"
+                        if is_index_etf else (
+                            f"{stock_name} {stock_code} "
+                            f"减持 OR 监管函 OR 问询函 OR 立案调查 OR 退市风险 OR "
+                            f"行政处罚 OR 违规 OR 诉讼 OR 大宗交易折价"
+                        )
                     ),
                     'desc': '风险排查',
                     'tavily_topic': None if is_index_etf else 'news',
@@ -3509,6 +3523,19 @@ class SearchService:
                     'strict_freshness': False,
                 },
             ]
+
+            # A 股社交舆情维度：定向检索国内投资社区
+            if not is_index_etf:
+                search_dimensions.append({
+                    'name': 'social_sentiment',
+                    'query': (
+                        f"(site:xueqiu.com OR site:guba.eastmoney.com) "
+                        f"{stock_name} {stock_code}"
+                    ),
+                    'desc': '社交舆情',
+                    'tavily_topic': None,
+                    'strict_freshness': True,
+                })
         
         search_days = self._effective_news_window_days()
         target_per_dimension = 3
@@ -3618,31 +3645,38 @@ class SearchService:
             'x_signal',
             'event_calendar',
             'risk_check',
+            'risk_alerts',
             'earnings',
             'market_analysis',
+            'social_sentiment',
             'macro_flows',
             'industry',
         ]
-        
+
+        _DIM_LABELS = {
+            'latest_news': '📰 最新消息',
+            'official_announcements': '📣 官方公告',
+            'official_filings': '📄 官方披露',
+            'china_exposure': '🇨🇳 中国暴露',
+            'x_signal': 'X 社交信号',
+            'event_calendar': '🗓️ 事件日历',
+            'market_analysis': '📈 机构分析',
+            'risk_check': '⚠️ 风险排查',
+            'risk_alerts': '🚨 风险预警',
+            'earnings': '📊 业绩预期',
+            'social_sentiment': '💬 社交舆情',
+            'macro_flows': '🌐 宏观资金',
+            'industry': '🏭 行业分析',
+        }
+
         for dim_name in display_order:
             if dim_name not in intel_results:
                 continue
-                
+
             resp = intel_results[dim_name]
-            
+
             # 获取维度描述
-            dim_desc = dim_name
-            if dim_name == 'latest_news': dim_desc = '📰 最新消息'
-            elif dim_name == 'official_announcements': dim_desc = '📣 官方公告'
-            elif dim_name == 'official_filings': dim_desc = '📄 官方披露'
-            elif dim_name == 'china_exposure': dim_desc = '🇨🇳 中国暴露'
-            elif dim_name == 'x_signal': dim_desc = 'X 社交信号'
-            elif dim_name == 'event_calendar': dim_desc = '🗓️ 事件日历'
-            elif dim_name == 'market_analysis': dim_desc = '📈 机构分析'
-            elif dim_name == 'risk_check': dim_desc = '⚠️ 风险排查'
-            elif dim_name == 'earnings': dim_desc = '📊 业绩预期'
-            elif dim_name == 'macro_flows': dim_desc = '🌐 宏观资金'
-            elif dim_name == 'industry': dim_desc = '🏭 行业分析'
+            dim_desc = _DIM_LABELS.get(dim_name, dim_name)
             
             lines.append(f"\n{dim_desc} (来源: {resp.provider}):")
             if resp.success and resp.results:

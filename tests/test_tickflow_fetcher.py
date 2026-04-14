@@ -184,7 +184,7 @@ class TestGetMainIndices:
 # ---------------------------------------------------------------------------
 
 STOCK_UP = {
-    "symbol": "600519.SH",
+    "symbol": "600519",
     "last": "1800",
     "prev_close": "1700",
     "change_ratio": "0.06",
@@ -193,7 +193,7 @@ STOCK_UP = {
     "amount": 1_000_000,
 }
 STOCK_DOWN = {
-    "symbol": "000001.SZ",
+    "symbol": "SZ000001",
     "last": "9.5",
     "prev_close": "10",
     "change_ratio": "-0.05",
@@ -232,6 +232,18 @@ class TestGetMarketStats:
         assert stats["flat_count"] == 1
         assert stats["limit_down_count"] == 1
         assert stats["limit_up_count"] == 0
+        assert stats["total_amount"] == pytest.approx(1_500_000.0)
+
+    def test_market_stats_requests_amount_fields(self):
+        f = _make_fetcher()
+        client = _mock_client(universe=[STOCK_UP])
+
+        with patch.object(f, "_get_client", return_value=client):
+            f.get_market_stats()
+
+        _, kwargs = client.universe.list.call_args
+        assert "amount" in kwargs["fields"]
+        assert "turnover" in kwargs["fields"]
 
     def test_permission_error_sets_negative_cache(self):
         f = _make_fetcher()

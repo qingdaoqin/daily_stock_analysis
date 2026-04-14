@@ -112,38 +112,74 @@ class FeishuSender:
         
         return success_count == total_chunks
     
+    @staticmethod
+    def _is_retryable_feishu_error(exc: Exception) -> bool:
+        """判断飞书请求异常是否值得重试（网络层瞬时故障）。"""
+        return isinstance(exc, (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        ))
+
     def _send_feishu_message(self, content: str) -> bool:
-        """发送单条飞书消息（优先使用 Markdown 卡片）"""
+        """发送单条飞书消息（优先使用 Markdown 卡片，网络异常自动重试）"""
+        _MAX_RETRIES = 2
+
         def _post_payload(payload: Dict[str, Any]) -> bool:
             logger.debug(f"飞书请求 URL: {self._feishu_url}")
             logger.debug(f"飞书请求 payload 长度: {len(content)} 字符")
 
-            response = requests.post(
-                self._feishu_url,
-                json=payload,
-                timeout=30,
-                verify=self._webhook_verify_ssl
-            )
-
-            logger.debug(f"飞书响应状态码: {response.status_code}")
-            logger.debug(f"飞书响应内容: {response.text}")
-
-            if response.status_code == 200:
-                result = response.json()
-                code = result.get('code') if 'code' in result else result.get('StatusCode')
-                if code == 0:
-                    logger.info("飞书消息发送成功")
-                    return True
-                else:
-                    error_msg = result.get('msg') or result.get('StatusMessage', '未知错误')
-                    error_code = result.get('code') or result.get('StatusCode', 'N/A')
-                    logger.error(f"飞书返回错误 [code={error_code}]: {error_msg}")
-                    logger.error(f"完整响应: {result}")
+            last_error = None
+            for attempt in range(_MAX_RETRIES + 1):
+                try:
+                    response = requests.post(
+                        self._feishu_url,
+                        json=payload,
+                        timeout=30,
+                        verify=self._webhook_verify_ssl
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < _MAX_RETRIES and self._is_retryable_feishu_error(exc):
+                        delay = 2 * (attempt + 1)
+                        logger.warning(f"飞书请求网络异常，{delay}s 后重试 ({attempt + 1}/{_MAX_RETRIES}): {exc}")
+                        time.sleep(delay)
+                        continue
+                    logger.error(f"飞书请求异常（已耗尽重试）: {exc}")
                     return False
-            else:
-                logger.error(f"飞书请求失败: HTTP {response.status_code}")
-                logger.error(f"响应内容: {response.text}")
-                return False
+
+                logger.debug(f"飞书响应状态码: {response.status_code}")
+                logger.debug(f"飞书响应内容: {response.text}")
+
+                # 5xx 服务端错误可重试
+                if response.status_code >= 500 and attempt < _MAX_RETRIES:
+                    delay = 2 * (attempt + 1)
+                    logger.warning(
+                        f"飞书返回 HTTP {response.status_code}，{delay}s 后重试 ({attempt + 1}/{_MAX_RETRIES})"
+                    )
+                    time.sleep(delay)
+                    continue
+
+                if response.status_code == 200:
+                    result = response.json()
+                    code = result.get('code') if 'code' in result else result.get('StatusCode')
+                    if code == 0:
+                        logger.info("飞书消息发送成功")
+                        return True
+                    else:
+                        error_msg = result.get('msg') or result.get('StatusMessage', '未知错误')
+                        error_code = result.get('code') or result.get('StatusCode', 'N/A')
+                        logger.error(f"飞书返回错误 [code={error_code}]: {error_msg}")
+                        logger.error(f"完整响应: {result}")
+                        return False
+                else:
+                    logger.error(f"飞书请求失败: HTTP {response.status_code}")
+                    logger.error(f"响应内容: {response.text}")
+                    return False
+
+            # 所有重试耗尽（理论上不会到这里，但防御性兜底）
+            logger.error(f"飞书请求最终失败: {last_error}")
+            return False
 
         # 1) 优先使用交互卡片（支持 Markdown 渲染）
         card_payload = {

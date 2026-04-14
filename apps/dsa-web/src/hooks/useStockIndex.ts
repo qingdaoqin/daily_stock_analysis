@@ -44,7 +44,8 @@ export function useStockIndex(): UseStockIndexResult {
 
       if (mounted) {
         setIndex(result.data);
-        setFallback(result.fallback);
+        // 索引加载成功但为空时同样触发 fallback，避免出现"永不弹出建议"的静默失效
+        setFallback(result.fallback || result.data.length === 0);
         if (result.error) {
           setError(result.error);
         }

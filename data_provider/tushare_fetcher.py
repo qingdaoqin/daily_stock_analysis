@@ -320,10 +320,10 @@ class TushareFetcher(BaseFetcher):
         if _is_hk_market(raw_code):
             if "." in raw_code:
                 ts_code = raw_code.upper()
-                if ts_code.endswith(".SS"):
-                    return f"{ts_code[:-3]}.SH"
                 if ts_code.endswith(".HK"):
-                    return ts_code
+                    base = ts_code[:-3]
+                    if base.isdigit() and 1 <= len(base) <= 5:
+                        return f"{base.zfill(5)}.HK"
             digits = re.sub(r"\D", "", raw_code)
             if not digits:
                 raise DataFetchError(f"无法识别港股代码 {raw_code}")

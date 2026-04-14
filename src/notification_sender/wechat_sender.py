@@ -124,28 +124,63 @@ class WechatSender:
             logger.error("企业微信图片发送异常: %s", e)
             return False
     
+    @staticmethod
+    def _is_retryable_wechat_error(exc: Exception) -> bool:
+        """判断企业微信请求异常是否值得重试（网络层瞬时故障）。"""
+        return isinstance(exc, (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        ))
+
     def _send_wechat_message(self, content: str) -> bool:
-        """发送企业微信消息"""
+        """发送企业微信消息（网络异常自动重试）"""
+        _MAX_RETRIES = 2
         payload = self._gen_wechat_payload(content)
-        
-        response = requests.post(
-            self._wechat_url,
-            json=payload,
-            timeout=10,
-            verify=self._webhook_verify_ssl
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            if result.get('errcode') == 0:
-                logger.info("企业微信消息发送成功")
-                return True
-            else:
-                logger.error(f"企业微信返回错误: {result}")
+
+        last_error = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                response = requests.post(
+                    self._wechat_url,
+                    json=payload,
+                    timeout=10,
+                    verify=self._webhook_verify_ssl
+                )
+            except Exception as exc:
+                last_error = exc
+                if attempt < _MAX_RETRIES and self._is_retryable_wechat_error(exc):
+                    delay = 2 * (attempt + 1)
+                    logger.warning(f"企业微信请求网络异常，{delay}s 后重试 ({attempt + 1}/{_MAX_RETRIES}): {exc}")
+                    time.sleep(delay)
+                    continue
+                logger.error(f"企业微信请求异常（已耗尽重试）: {exc}")
                 return False
-        else:
-            logger.error(f"企业微信请求失败: {response.status_code}")
-            return False
+
+            # 5xx 服务端错误可重试
+            if response.status_code >= 500 and attempt < _MAX_RETRIES:
+                delay = 2 * (attempt + 1)
+                logger.warning(
+                    f"企业微信返回 HTTP {response.status_code}，{delay}s 后重试 ({attempt + 1}/{_MAX_RETRIES})"
+                )
+                time.sleep(delay)
+                continue
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('errcode') == 0:
+                    logger.info("企业微信消息发送成功")
+                    return True
+                else:
+                    logger.error(f"企业微信返回错误: {result}")
+                    return False
+            else:
+                logger.error(f"企业微信请求失败: {response.status_code}")
+                return False
+
+        # 所有重试耗尽
+        logger.error(f"企业微信请求最终失败: {last_error}")
+        return False
         
     def _send_wechat_chunked(self, content: str, max_bytes: int) -> bool:
         """

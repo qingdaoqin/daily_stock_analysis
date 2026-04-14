@@ -1417,7 +1417,7 @@ class GeminiAnalyzer:
         if not response_text:
             raise _LiteLLMStreamError(
                 f"{model} stream returned empty response",
-                partial_received=False,
+                partial_received=chars_received > 0,
             )
 
         if progress_callback and chars_received > 0:
@@ -1523,6 +1523,7 @@ class GeminiAnalyzer:
                                 "[LiteLLM] %s stream request failed, falling back to non-stream: %s",
                                 model, exc,
                             )
+                            last_error = exc
 
                     # --- Non-stream path ---
                     response = self._dispatch_litellm_completion(
@@ -1575,6 +1576,10 @@ class GeminiAnalyzer:
         calling _call_litellm() directly or accessing private attributes such as
         _litellm_available, _router, _model, _use_openai, or _use_anthropic.
 
+        Uses streaming mode to avoid long idle waits on high-latency models
+        (e.g. market review with max_tokens=8192). Stream failures are
+        automatically retried in non-stream mode by ``_call_litellm``.
+
         Args:
             prompt:      Text prompt to send to the LLM.
             max_tokens:  Maximum tokens in the response (default 2048).
@@ -1587,6 +1592,7 @@ class GeminiAnalyzer:
             result = self._call_litellm(
                 prompt,
                 generation_config={"max_tokens": max_tokens, "temperature": temperature},
+                stream=True,
             )
             if isinstance(result, tuple):
                 text, model_used, usage = result

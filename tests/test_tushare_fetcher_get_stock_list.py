@@ -116,6 +116,10 @@ class TestTushareFetcherConvertHKCode(unittest.TestCase):
         f = self._make_fetcher()
         self.assertEqual(f._convert_hk_stock_code_for_tushare("00700.HK"), "00700.HK")
 
+    def test_normalize_short_dotHK_suffix_zero_padded(self) -> None:
+        f = self._make_fetcher()
+        self.assertEqual(f._convert_hk_stock_code_for_tushare("700.HK"), "00700.HK")
+
     def test_normalize_plain_5digits(self) -> None:
         f = self._make_fetcher()
         self.assertEqual(f._convert_hk_stock_code_for_tushare("00700"), "00700.HK")

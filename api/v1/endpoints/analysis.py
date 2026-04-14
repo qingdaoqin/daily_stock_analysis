@@ -170,6 +170,8 @@ def _handle_async_analysis_batch(
         report_type=request.report_type,
         force_refresh=request.force_refresh,
         notify=request.notify,
+        original_query=request.original_query,
+        selection_source=request.selection_source,
     )
 
     accepted = [
@@ -345,6 +347,8 @@ def get_task_list(
             started_at=t.started_at.isoformat() if t.started_at else None,
             completed_at=t.completed_at.isoformat() if t.completed_at else None,
             error=t.error,
+            original_query=t.original_query,
+            selection_source=t.selection_source,
         )
         for t in all_tasks
     ]
@@ -482,6 +486,8 @@ def get_analysis_status(task_id: str) -> TaskStatus:
             result=None,  # 进行中的任务没有结果
             error=task.error,
             stock_name=task.stock_name,
+            original_query=task.original_query,
+            selection_source=task.selection_source,
         )
     
     # 2. 从数据库查询已完成的记录

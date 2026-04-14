@@ -167,12 +167,11 @@ class TickFlowFetcher(BaseFetcher):
     @staticmethod
     def _is_cn_equity_symbol(symbol: str) -> bool:
         normalized = normalize_stock_code(symbol)
+        if not (normalized.isdigit() and len(normalized) == 6):
+            return False
+
         upper_symbol = (symbol or "").strip().upper()
-        return (
-            normalized.isdigit()
-            and len(normalized) == 6
-            and upper_symbol.endswith((".SH", ".SZ", ".BJ"))
-        )
+        return not (upper_symbol.startswith("HK") or upper_symbol.endswith(".HK"))
 
 
 
@@ -279,7 +278,17 @@ class TickFlowFetcher(BaseFetcher):
             # TickFlow universe.list() 返回全市场股票快照
             all_stocks = client.universe.list(
                 filter={"exchange": ["SH", "SZ"]},
-                fields=["symbol", "last", "prev_close", "change", "change_ratio", "is_limit_up", "is_limit_down"],
+                fields=[
+                    "symbol",
+                    "last",
+                    "prev_close",
+                    "change",
+                    "change_ratio",
+                    "is_limit_up",
+                    "is_limit_down",
+                    "amount",
+                    "turnover",
+                ],
             )
         except Exception as exc:
             if self._is_universe_permission_error(exc):

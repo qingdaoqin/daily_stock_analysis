@@ -224,18 +224,54 @@ class Scheduler:
 def run_with_schedule(
     task: Callable,
     schedule_time: str = "18:00",
-    run_immediately: bool = True
+    run_immediately: bool = True,
+    background_tasks: Optional[List[Dict[str, Any]]] = None,
+    schedule_time_provider: Optional[Callable[[], str]] = None,
 ):
     """
     便捷函数：使用定时调度运行任务
-    
+
     Args:
         task: 要执行的任务函数
         schedule_time: 每日执行时间
         run_immediately: 是否立即执行一次
+        background_tasks: 后台周期任务列表，每项包含:
+            - task: Callable  周期执行的函数
+            - interval_seconds: int  执行间隔（秒）
+            - run_immediately: bool  是否立即执行一次
+            - name: str  任务名称（用于日志）
+        schedule_time_provider: 可选回调，运行期间定期调用以检测定时时间变更
     """
-    scheduler = Scheduler(schedule_time=schedule_time)
+    scheduler = Scheduler(
+        schedule_time=schedule_time,
+        schedule_time_provider=schedule_time_provider,
+    )
     scheduler.set_daily_task(task, run_immediately=run_immediately)
+
+    # 注册后台周期任务
+    for bg in (background_tasks or []):
+        bg_task = bg["task"]
+        interval = bg.get("interval_seconds", 300)
+        name = bg.get("name", "background")
+        should_run_now = bg.get("run_immediately", False)
+
+        def _make_safe_bg(fn: Callable, label: str) -> Callable:
+            """Wrap background task with exception guard."""
+            def _safe():
+                try:
+                    fn()
+                except Exception as exc:
+                    logger.error("[Scheduler] 后台任务 %s 执行失败: %s", label, exc)
+            return _safe
+
+        safe_fn = _make_safe_bg(bg_task, name)
+        scheduler.schedule.every(interval).seconds.do(safe_fn)
+        logger.info("[Scheduler] 已注册后台任务: %s (间隔 %ds)", name, interval)
+
+        if should_run_now:
+            logger.info("[Scheduler] 立即执行后台任务: %s", name)
+            safe_fn()
+
     scheduler.run()
 
 

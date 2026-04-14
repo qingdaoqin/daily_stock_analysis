@@ -83,7 +83,22 @@ class MarketCommand(BotCommand):
 
             # 初始化搜索服务
             search_service = None
-            if config.bocha_api_keys or config.tavily_api_keys or config.brave_api_keys or config.serpapi_keys or config.minimax_api_keys or config.searxng_base_urls:
+            has_search_capability = (
+                config.has_search_capability_enabled()
+                if hasattr(config, "has_search_capability_enabled")
+                else bool(
+                    getattr(config, "anspire_api_keys", None)
+                    or getattr(config, "bocha_api_keys", None)
+                    or getattr(config, "minimax_api_keys", None)
+                    or getattr(config, "tavily_api_keys", None)
+                    or getattr(config, "brave_api_keys", None)
+                    or getattr(config, "serpapi_keys", None)
+                    or getattr(config, "xai_api_keys", None)
+                    or getattr(config, "searxng_base_urls", None)
+                    or getattr(config, "searxng_public_instances_enabled", False)
+                )
+            )
+            if has_search_capability:
                 search_service = SearchService(
                     bocha_keys=config.bocha_api_keys,
                     tavily_keys=config.tavily_api_keys,

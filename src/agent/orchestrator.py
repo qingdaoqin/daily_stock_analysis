@@ -264,6 +264,7 @@ class AgentOrchestrator:
 
         agents = self._build_agent_chain(ctx)
         strategy_agents_inserted = False
+        self._failed_strategy_agent_names = set()
         index = 0
 
         while index < len(agents):
@@ -302,6 +303,30 @@ class AgentOrchestrator:
 
             # Aggregate strategy opinions before the decision agent
             if agent.agent_name == "decision" and getattr(self, "_strategy_agent_names", None):
+                strategy_opinion_names = {
+                    opinion.agent_name
+                    for opinion in ctx.opinions
+                    if opinion.agent_name in self._strategy_agent_names
+                }
+                if not strategy_opinion_names:
+                    failed_names = sorted(getattr(self, "_failed_strategy_agent_names", set()))
+                    if failed_names:
+                        error = (
+                            "All strategy stages failed: "
+                            + ", ".join(failed_names)
+                        )
+                    else:
+                        error = (
+                            "Strategy mode requested but no strategy opinions were produced"
+                        )
+                    logger.error("[Orchestrator] %s", error)
+                    return OrchestratorResult(
+                        success=False,
+                        error=error,
+                        stats=stats,
+                        total_tokens=stats.total_tokens,
+                        tool_calls_log=all_tool_calls,
+                    )
                 self._aggregate_strategy_opinions(ctx)
 
             if progress_callback:
@@ -373,6 +398,8 @@ class AgentOrchestrator:
                         tool_calls_log=all_tool_calls,
                     )
                 else:
+                    if agent.agent_name.startswith("strategy_"):
+                        self._failed_strategy_agent_names.add(agent.agent_name)
                     logger.warning("[Orchestrator] stage '%s' failed (non-critical, degrading): %s", agent.agent_name, result.error)
 
             index += 1
@@ -425,6 +452,7 @@ class AgentOrchestrator:
         from src.agent.agents.risk_agent import RiskAgent
 
         self._strategy_agent_names = set()
+        self._failed_strategy_agent_names = set()
 
         common_kwargs = dict(
             tool_registry=self.tool_registry,

@@ -240,6 +240,22 @@ class TestYfinanceGetStockName(unittest.TestCase):
         self.assertEqual(name, "腾讯控股")
         mock_yf.Ticker.assert_called_once_with("0700.HK")
 
+    def test_prefers_long_name_when_short_name_is_truncated(self):
+        mock_ticker = MagicMock()
+        mock_ticker.info = {
+            "shortName": "Taiwan Semiconductor Manufactur",
+            "longName": "Taiwan Semiconductor Manufacturing Company Limited",
+        }
+        mock_yf = MagicMock()
+        mock_yf.Ticker.return_value = mock_ticker
+
+        with patch.dict("data_provider.yfinance_fetcher.STOCK_NAME_MAP", {}, clear=True):
+            with patch.dict(sys.modules, {"yfinance": mock_yf}):
+                name = self.fetcher.get_stock_name("TSM")
+
+        self.assertEqual(name, "Taiwan Semiconductor Manufacturing Company Limited")
+        mock_yf.Ticker.assert_called_once_with("TSM")
+
 
 if __name__ == '__main__':
     unittest.main()

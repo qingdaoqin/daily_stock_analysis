@@ -12,7 +12,7 @@ except ModuleNotFoundError:
 if "json_repair" not in sys.modules:
     sys.modules["json_repair"] = MagicMock()
 
-from src.analyzer import GeminiAnalyzer
+from src.analyzer import AnalysisResult, GeminiAnalyzer
 
 
 class TestAnalyzerMarketPrompt(unittest.TestCase):
@@ -140,6 +140,97 @@ class TestAnalyzerMarketPrompt(unittest.TestCase):
         self.assertNotIn("⚠️", prompt)
         self.assertNotIn("⚪", prompt)
         self.assertNotIn("❌", prompt)
+
+    def test_prompt_formats_prices_with_two_decimals(self) -> None:
+        analyzer = self._make_analyzer()
+        context = {
+            "code": "META",
+            "stock_name": "Meta Platforms, Inc.",
+            "date": "2026-04-14",
+            "today": {
+                "close": 649.339999,
+                "open": 643.0123,
+                "high": 652.45123,
+                "low": 639.36999,
+                "pct_chg": 1.756,
+                "ma5": 630.9080024414063,
+                "ma10": 602.8430026855469,
+                "ma20": 593.4319963378906,
+            },
+            "history": [
+                {
+                    "date": "2026-01-14",
+                    "open": 625.9640568168747,
+                    "high": 627.9124008742662,
+                    "low": 614.2940558608916,
+                    "close": 614.9934692382812,
+                    "pct_chg": -2.47,
+                }
+            ],
+            "market_context": {
+                "market": "us",
+                "market_label": "美股",
+                "official_source_priority": "SEC 披露、财报电话会、公司指引",
+                "analysis_focus": "先看 SEC/财报/指引，再判断政策变量。",
+                "policy_scope": "中国政策只有在存在 China exposure 时才提高权重。",
+            },
+        }
+
+        prompt = analyzer._format_prompt(context, "Meta Platforms, Inc.", news_context=None)
+
+        self.assertIn("| 收盘价 | 649.34 美元 |", prompt)
+        self.assertIn("| 开盘价 | 643.01 美元 |", prompt)
+        self.assertIn("| MA5 | 630.91 |", prompt)
+        self.assertIn("| MA10 | 602.84 |", prompt)
+        self.assertIn("| MA20 | 593.43 |", prompt)
+        self.assertIn("| 2026-01-14 | 625.96 | 627.91 | 614.29 | 614.99 | -2.47% |", prompt)
+        self.assertNotIn("630.9080024414063", prompt)
+        self.assertNotIn("625.9640568168747", prompt)
+
+    def test_analyze_logs_the_actual_model_used_after_fallback(self) -> None:
+        analyzer = self._make_analyzer()
+        analyzer._litellm_available = True
+
+        context = {
+            "code": "META",
+            "stock_name": "Meta Platforms, Inc.",
+            "date": "2026-04-14",
+            "today": {"close": 649.34},
+        }
+        parsed = AnalysisResult(
+            code="META",
+            name="Meta Platforms, Inc.",
+            sentiment_score=80,
+            trend_prediction="看多",
+            operation_advice="买入",
+        )
+
+        with patch("src.analyzer.get_config") as mock_cfg, \
+             patch.object(analyzer, "_format_prompt", return_value="prompt"), \
+             patch.object(
+                 analyzer,
+                 "_call_litellm",
+                 return_value=("response", "gemini/gemini-2.5-flash", {}),
+             ), \
+             patch.object(analyzer, "_parse_response", return_value=parsed), \
+             patch.object(analyzer, "_build_market_snapshot", return_value={}), \
+             patch("src.analyzer.persist_llm_usage"), \
+             patch("src.analyzer.logger.info") as mock_logger_info:
+            cfg = MagicMock()
+            cfg.gemini_request_delay = 0
+            cfg.report_integrity_enabled = False
+            cfg.report_integrity_retry = 0
+            cfg.llm_temperature = 0.7
+            cfg.litellm_model = "gemini/gemini-2.5-pro"
+            mock_cfg.return_value = cfg
+
+            result = analyzer.analyze(context, news_context="news")
+
+        self.assertEqual(result.model_used, "gemini/gemini-2.5-flash")
+        logged_messages = [str(call.args[0]) for call in mock_logger_info.call_args_list if call.args]
+        self.assertTrue(
+            any("[LLM返回] gemini/gemini-2.5-flash 响应成功" in message for message in logged_messages)
+        )
 
 
 if __name__ == "__main__":

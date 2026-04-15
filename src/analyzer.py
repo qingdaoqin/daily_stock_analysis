@@ -1432,6 +1432,7 @@ class GeminiAnalyzer:
         *,
         stream: bool = False,
         stream_progress_callback: Optional[Callable[[int], None]] = None,
+        system_prompt: Optional[str] = None,
     ) -> Tuple[str, str, Dict[str, Any]]:
         """Call LLM via litellm with fallback across configured models.
 
@@ -1475,12 +1476,13 @@ class GeminiAnalyzer:
             while True:
                 try:
                     model_short = model.split("/")[-1] if "/" in model else model
+                    effective_system_prompt = self.SYSTEM_PROMPT if system_prompt is None else system_prompt
+                    messages = [{"role": "user", "content": prompt}]
+                    if effective_system_prompt:
+                        messages.insert(0, {"role": "system", "content": effective_system_prompt})
                     call_kwargs: Dict[str, Any] = {
                         "model": model,
-                        "messages": [
-                            {"role": "system", "content": self.SYSTEM_PROMPT},
-                            {"role": "user", "content": prompt},
-                        ],
+                        "messages": messages,
                         "temperature": temperature,
                         "max_tokens": max_tokens,
                     }
@@ -1569,6 +1571,7 @@ class GeminiAnalyzer:
         prompt: str,
         max_tokens: int = 2048,
         temperature: float = 0.7,
+        system_prompt: Optional[str] = None,
     ) -> Optional[str]:
         """Public entry point for free-form text generation.
 
@@ -1584,15 +1587,21 @@ class GeminiAnalyzer:
             prompt:      Text prompt to send to the LLM.
             max_tokens:  Maximum tokens in the response (default 2048).
             temperature: Sampling temperature (default 0.7).
+            system_prompt: Optional system prompt override for non-dashboard tasks.
 
         Returns:
             Response text, or None if the LLM call fails (error is logged).
         """
         try:
+            call_kwargs: Dict[str, Any] = {
+                "generation_config": {"max_tokens": max_tokens, "temperature": temperature},
+                "stream": True,
+            }
+            if system_prompt is not None:
+                call_kwargs["system_prompt"] = system_prompt
             result = self._call_litellm(
                 prompt,
-                generation_config={"max_tokens": max_tokens, "temperature": temperature},
-                stream=True,
+                **call_kwargs,
             )
             if isinstance(result, tuple):
                 text, model_used, usage = result
@@ -1711,12 +1720,12 @@ class GeminiAnalyzer:
 
                 # 记录响应信息
                 logger.info(
-                    f"[LLM返回] {model_name} 响应成功, 耗时 {elapsed:.2f}s, 响应长度 {len(response_text)} 字符"
+                    f"[LLM返回] {model_used} 响应成功, 耗时 {elapsed:.2f}s, 响应长度 {len(response_text)} 字符"
                 )
                 response_preview = response_text[:300] + "..." if len(response_text) > 300 else response_text
                 logger.info(f"[LLM返回 预览]\n{response_preview}")
                 logger.debug(
-                    f"=== {model_name} 完整响应 ({len(response_text)}字符) ===\n{response_text}\n=== End Response ==="
+                    f"=== {model_used} 完整响应 ({len(response_text)}字符) ===\n{response_text}\n=== End Response ==="
                 )
 
                 # 解析响应
@@ -1825,20 +1834,20 @@ class GeminiAnalyzer:
 ### 今日行情
 | 指标 | 数值 |
 |------|------|
-| 收盘价 | {today.get('close', 'N/A')} {currency} |
-| 开盘价 | {today.get('open', 'N/A')} {currency} |
-| 最高价 | {today.get('high', 'N/A')} {currency} |
-| 最低价 | {today.get('low', 'N/A')} {currency} |
-| 涨跌幅 | {today.get('pct_chg', 'N/A')}% |
+| 收盘价 | {self._format_price(today.get('close'))} {currency} |
+| 开盘价 | {self._format_price(today.get('open'))} {currency} |
+| 最高价 | {self._format_price(today.get('high'))} {currency} |
+| 最低价 | {self._format_price(today.get('low'))} {currency} |
+| 涨跌幅 | {self._format_percent(today.get('pct_chg'))} |
 | 成交量 | {self._format_volume(today.get('volume'), market)} |
 | 成交额 | {self._format_amount(today.get('amount'), currency, market)} |
 
 ### 均线系统（关键判断指标）
 | 均线 | 数值 | 说明 |
 |------|------|------|
-| MA5 | {today.get('ma5', 'N/A')} | 短期趋势线 |
-| MA10 | {today.get('ma10', 'N/A')} | 中短期趋势线 |
-| MA20 | {today.get('ma20', 'N/A')} | 中期趋势线 |
+| MA5 | {self._format_price(today.get('ma5'))} | 短期趋势线 |
+| MA10 | {self._format_price(today.get('ma10'))} | 中短期趋势线 |
+| MA20 | {self._format_price(today.get('ma20'))} | 中期趋势线 |
 | 均线形态 | {context.get('ma_status', '未知')} | 多头/空头/缠绕 |
 """
         
@@ -1852,14 +1861,14 @@ class GeminiAnalyzer:
 
 | 指标 | 数值 | 解读 |
 |------|------|------|
-| 当前价格 | {rt.get('price', 'N/A')} {currency} | |
+| 当前价格 | {self._format_price(rt.get('price'))} {currency} | |
 | **量比** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
-| **换手率** | **{rt.get('turnover_rate', 'N/A')}%** | |
+| **换手率** | **{self._format_percent(rt.get('turnover_rate'))}** | |
 | 市盈率(动态) | {rt.get('pe_ratio', 'N/A')} | |
 | 市净率 | {rt.get('pb_ratio', 'N/A')} | |
 | 总市值 | {self._format_amount(rt.get('total_mv'), currency, market)} | |
 | 流通市值 | {self._format_amount(rt.get('circ_mv'), currency, market)} | |
-| 60日涨跌幅 | {rt.get('change_60d', 'N/A')}% | 中期表现 |
+| 60日涨跌幅 | {self._format_percent(rt.get('change_60d'))} | 中期表现 |
 """
         
         # 添加筹码分布数据
@@ -1934,7 +1943,11 @@ class GeminiAnalyzer:
             for bar in history:
                 pct = bar.get('pct_chg')
                 pct_str = f"{pct:+.2f}%" if pct is not None else "N/A"
-                prompt += f"| {bar.get('date', '')} | {bar.get('open', 'N/A')} | {bar.get('high', 'N/A')} | {bar.get('low', 'N/A')} | {bar.get('close', 'N/A')} | {pct_str} |\n"
+                prompt += (
+                    f"| {bar.get('date', '')} | {self._format_price(bar.get('open'))} "
+                    f"| {self._format_price(bar.get('high'))} | {self._format_price(bar.get('low'))} "
+                    f"| {self._format_price(bar.get('close'))} | {pct_str} |\n"
+                )
 
         # 添加新闻搜索结果（重点区域）
         prompt += """

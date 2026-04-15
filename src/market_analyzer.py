@@ -27,6 +27,13 @@ from data_provider.base import DataFetcherManager
 logger = logging.getLogger(__name__)
 
 
+MARKET_REVIEW_SYSTEM_PROMPT = (
+    "你是一位专业的大盘复盘分析师。"
+    "必须严格遵循用户给出的市场、语言、结构和输出格式要求。"
+    "除非用户明确要求，否则不要输出 JSON 或代码块。"
+)
+
+
 @dataclass
 class MarketIndex:
     """大盘指数数据"""
@@ -328,7 +335,12 @@ class MarketAnalyzer:
         
         logger.info("[大盘] 调用大模型生成复盘报告...")
         # Use the public generate_text() entry point — never access private analyzer attributes.
-        review = self.analyzer.generate_text(prompt, max_tokens=8192, temperature=0.7)
+        review = self.analyzer.generate_text(
+            prompt,
+            max_tokens=8192,
+            temperature=0.7,
+            system_prompt=MARKET_REVIEW_SYSTEM_PROMPT,
+        )
 
         if review:
             logger.info("[大盘] 复盘报告生成成功，长度: %d 字符", len(review))

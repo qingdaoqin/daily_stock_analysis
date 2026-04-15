@@ -115,6 +115,23 @@ class TestSearchIntelSources(unittest.TestCase):
         self.assertEqual(results["x_signal"].provider, "xAI X Search")
         mock_x_signal.assert_called_once()
 
+    def test_format_intel_report_surfaces_failed_x_signal_reason(self) -> None:
+        service, _ = self._create_service()
+        intel_results = {
+            "x_signal": SearchResponse(
+                query="Apple AAPL X social signal",
+                results=[],
+                provider="xAI X Search",
+                success=False,
+                error_message="HTTP 503: upstream overloaded",
+            )
+        }
+
+        report = service.format_intel_report(intel_results, "Apple")
+
+        self.assertIn("X 社交信号", report)
+        self.assertIn("搜索失败: HTTP 503: upstream overloaded", report)
+
     def test_us_intel_skips_x_signal_dimension_without_xai_configuration(self) -> None:
         service, _ = self._create_service()
 

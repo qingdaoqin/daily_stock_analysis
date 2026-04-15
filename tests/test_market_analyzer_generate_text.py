@@ -286,6 +286,29 @@ class TestMarketAnalyzerBypassFix:
         assert kwargs["max_tokens"] == 8192
         assert kwargs["temperature"] == 0.7
 
+    def test_market_review_uses_market_review_system_prompt(self):
+        """Market review should override the stock dashboard system prompt."""
+        from src.market_analyzer import MARKET_REVIEW_SYSTEM_PROMPT, MarketOverview, MarketIndex
+
+        ma = self._make_market_analyzer_with_mock_generate_text(return_value="复盘结果")
+        overview = MarketOverview(
+            date="2026-03-05",
+            indices=[
+                MarketIndex(
+                    code="000001",
+                    name="上证指数",
+                    current=3300.0,
+                    change=5.0,
+                    change_pct=0.15,
+                )
+            ],
+        )
+
+        ma.generate_market_review(overview, [])
+
+        _, kwargs = ma.analyzer.generate_text.call_args
+        assert kwargs["system_prompt"] == MARKET_REVIEW_SYSTEM_PROMPT
+
     def test_no_private_attribute_access_in_market_analyzer_source(self):
         """Static guard: market_analyzer.py must not access private analyzer attrs."""
         import ast

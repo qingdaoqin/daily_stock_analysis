@@ -250,7 +250,10 @@ class BaseSearchProvider(ABC):
                 logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
             else:
                 self._record_error(api_key)
-            
+                logger.warning(
+                    f"[{self._name}] 搜索 '{query}' 失败: {response.error_message or '未知错误'}"
+                )
+
             return response
             
         except Exception as e:
@@ -388,6 +391,9 @@ class TavilySearchProvider(BaseSearchProvider):
                 logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
             else:
                 self._record_error(api_key)
+                logger.warning(
+                    f"[{self._name}] 搜索 '{query}' 失败: {response.error_message or '未知错误'}"
+                )
 
             return response
 
@@ -3420,7 +3426,13 @@ class SearchService:
                 results[dim['name']] = response
                 logger.info(f"[情报搜索] {dim['desc']}: 获取 {len(response.results)} 条结果 (来源: {response.provider})")
             else:
-                results[dim['name']] = response if response is not None else self._build_failed_response(query, "None", "无可用情报源")
+                failed_response = response if response is not None else self._build_failed_response(query, "None", "无可用情报源")
+                results[dim['name']] = failed_response
+                logger.warning(
+                    "[情报搜索] %s: 直连失败 - %s",
+                    dim['desc'],
+                    failed_response.error_message or "未知错误",
+                )
                 if dim.get('engine_fallback', True) and query:
                     deferred_fallbacks.append(dim)
 
@@ -3623,6 +3635,16 @@ class SearchService:
         
         return results
     
+    @staticmethod
+    def _format_search_error(error_message: Optional[str], max_length: int = 160) -> str:
+        """Condense provider errors so degraded intel remains readable in prompts/logs."""
+        if not error_message:
+            return "未知错误"
+        compact = " ".join(str(error_message).split())
+        if len(compact) <= max_length:
+            return compact
+        return compact[: max_length - 3] + "..."
+
     def format_intel_report(self, intel_results: Dict[str, SearchResponse], stock_name: str) -> str:
         """
         格式化情报搜索结果为报告
@@ -3688,7 +3710,10 @@ class SearchService:
                     snippet = r.snippet[:150] if len(r.snippet) > 20 else r.snippet
                     lines.append(f"     {snippet}...")
             else:
-                lines.append("  未找到相关信息")
+                if resp.error_message:
+                    lines.append(f"  搜索失败: {self._format_search_error(resp.error_message)}")
+                else:
+                    lines.append("  未找到相关信息")
         
         return "\n".join(lines)
     

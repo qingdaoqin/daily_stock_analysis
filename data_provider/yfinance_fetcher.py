@@ -108,7 +108,7 @@ class YfinanceFetcher(BaseFetcher):
 
             ticker = yf.Ticker(self._convert_stock_code(code))
             info = ticker.info or {}
-            for field in ("shortName", "longName", "displayName"):
+            for field in ("longName", "shortName", "displayName"):
                 candidate = info.get(field, "") if isinstance(info, dict) else ""
                 if is_meaningful_stock_name(candidate, code):
                     name = str(candidate).strip()
@@ -861,7 +861,7 @@ class YfinanceFetcher(BaseFetcher):
 
             # 获取股票名称
             try:
-                info_name = ticker.info.get('shortName', '') or ticker.info.get('longName', '') or ''
+                info_name = ticker.info.get('longName', '') or ticker.info.get('shortName', '') or ''
                 if is_meaningful_stock_name(info_name, normalized_code):
                     name = info_name
                 else:

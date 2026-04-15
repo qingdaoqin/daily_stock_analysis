@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
+- [修复] LLM 分析成功日志改为记录实际生效模型；当主模型失败并切换到 fallback 模型时，日志与用量统计不再误报为主模型成功。
+- [修复] 大盘复盘链路改为使用独立的 Markdown 系统提示，不再继承个股“决策仪表盘 JSON”系统提示，避免市场复盘输出与格式要求冲突。
+- [修复] 个股分析 Prompt 中今日行情、MA5/MA10/MA20 与历史 K 线价格统一保留 2 位小数，减少原始浮点噪声对报告与模型输出的干扰。
+- [修复] 情报报告在搜索失败时保留精简错误原因；xAI X Search 等直连维度失败不再一律伪装成“未找到相关信息”。
+- [修复] YFinance 股票名称解析优先使用完整 `longName`，避免美股/港股长公司名被截断后继续污染后续搜索与报告。
+- [修复] `strategy` 模式在所有策略子 Agent 失败时改为显式报错，不再静默跳过策略评估后继续输出看似正常的最终结论。
 - [修复] `AGENT_MAX_STEPS` 在 orchestrator 多 Agent 模式下改为作为各子 Agent 的步数上限而非硬覆盖；TechnicalAgent 等高默认值 Agent 会被封顶，低默认值 Agent 保持原值，减少不必要的 LLM 调用膨胀与配额消耗。
 - [修复] **MiniMax-M2.7 模型连接测试支持** — 修复 LLM 通道连接测试在 MiniMax-M2.7 模型下返回 "Empty response" 的问题；增加了 `max_tokens` 上限（8→256）以容纳 MiniMax 思考过程，并添加 `content_blocks` 格式解析逻辑统一处理 MiniMax 响应格式差异。
 - [修复] 移除 `HistoryItem` 与 `ReportSummary` 响应 Schema 中 `sentiment_score` 的 `ge=0/le=100` 约束（fixes #942）——历史库中存储的超范围负值或大于 100 的情绪评分不再触发 Pydantic ValidationError，历史列表与详情接口恢复正常返回。

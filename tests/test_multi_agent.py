@@ -847,6 +847,38 @@ class TestOrchestratorExecution(unittest.TestCase):
         build_strategy_agents.assert_called_once()
         strategy.run.assert_called_once()
 
+    def test_strategy_mode_fails_when_all_strategy_agents_fail(self):
+        orch = self._make_orchestrator()
+        orch.mode = "strategy"
+        ctx = AgentContext(query="分析600519", stock_code="600519")
+        ctx.meta["response_mode"] = "chat"
+
+        technical = MagicMock(agent_name="technical")
+        technical.run.return_value = self._stage_result("technical")
+
+        intel = MagicMock(agent_name="intel")
+        intel.run.return_value = self._stage_result("intel")
+
+        risk = MagicMock(agent_name="risk")
+        risk.run.return_value = self._stage_result("risk")
+
+        strategy = MagicMock(agent_name="strategy_bull_trend")
+        strategy.run.return_value = self._stage_result(
+            "strategy_bull_trend",
+            StageStatus.FAILED,
+            error="strategy llm unavailable",
+        )
+
+        decision = MagicMock(agent_name="decision")
+
+        with patch.object(orch, "_build_agent_chain", return_value=[technical, intel, risk, decision]):
+            with patch.object(orch, "_build_strategy_agents", return_value=[strategy]):
+                result = orch._execute_pipeline(ctx, parse_dashboard=False)
+
+        self.assertFalse(result.success)
+        self.assertIn("All strategy stages failed", result.error)
+        decision.run.assert_not_called()
+
 
 class TestDecisionAgentChatMode(unittest.TestCase):
     """Test DecisionAgent chat-mode output path."""

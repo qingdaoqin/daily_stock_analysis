@@ -115,7 +115,13 @@ class TestSearchIntelSources(unittest.TestCase):
         self.assertEqual(results["x_signal"].provider, "xAI X Search")
         mock_x_signal.assert_called_once()
 
-    def test_format_intel_report_surfaces_failed_x_signal_reason(self) -> None:
+    def test_format_intel_report_excludes_failed_dimensions(self) -> None:
+        """Failed search dimensions should NOT appear in the LLM prompt.
+
+        When all dimensions failed, format_intel_report returns an empty
+        string so that the caller falls back to the 'no news' branch,
+        avoiding wasted LLM tokens on error messages like '余额不足'.
+        """
         service, _ = self._create_service()
         intel_results = {
             "x_signal": SearchResponse(
@@ -129,8 +135,57 @@ class TestSearchIntelSources(unittest.TestCase):
 
         report = service.format_intel_report(intel_results, "Apple")
 
-        self.assertIn("X 社交信号", report)
-        self.assertIn("搜索失败: HTTP 503: upstream overloaded", report)
+        # All dimensions failed → empty string, no error text leaked to LLM
+        self.assertEqual(report, "")
+        self.assertNotIn("搜索失败", report)
+        self.assertNotIn("HTTP 503", report)
+
+    def test_format_intel_report_includes_only_successful_dimensions(self) -> None:
+        """When some dimensions succeed and others fail, only success ones appear."""
+        service, _ = self._create_service()
+        intel_results = {
+            "latest_news": SearchResponse(
+                query="Apple latest news",
+                results=[
+                    SearchResult(
+                        title="Apple Q2 earnings beat",
+                        snippet="Apple reported strong Q2 revenue.",
+                        url="https://example.com/news",
+                        source="example.com",
+                        published_date="2026-04-10",
+                    )
+                ],
+                provider="Bocha",
+                success=True,
+            ),
+            "risk_check": SearchResponse(
+                query="Apple risk",
+                results=[],
+                provider="SerpAPI",
+                success=True,
+                error_message=None,
+            ),
+            "earnings": SearchResponse(
+                query="Apple earnings",
+                results=[],
+                provider="Bocha",
+                success=False,
+                error_message="余额不足: You do not have enough money",
+            ),
+        }
+
+        report = service.format_intel_report(intel_results, "Apple")
+
+        # Successful dimension with results should appear
+        self.assertIn("最新消息", report)
+        self.assertIn("Apple Q2 earnings beat", report)
+        # Failed/empty dimensions should NOT appear
+        self.assertNotIn("余额不足", report)
+        self.assertNotIn("搜索失败", report)
+        self.assertNotIn("未找到相关信息", report)
+        # Report should not be empty since one dimension succeeded
+        self.assertTrue(len(report) > 0)
+
 
     def test_us_intel_skips_x_signal_dimension_without_xai_configuration(self) -> None:
         service, _ = self._create_service()

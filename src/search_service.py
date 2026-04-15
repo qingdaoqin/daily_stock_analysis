@@ -3691,30 +3691,49 @@ class SearchService:
             'industry': '🏭 行业分析',
         }
 
+        # 只输出有实际结果的维度，跳过搜索失败/无结果的维度，
+        # 避免将错误信息（如 "余额不足"、"HTTP 403"）浪费 LLM token。
+        skipped_dims: List[str] = []
+
         for dim_name in display_order:
             if dim_name not in intel_results:
                 continue
 
             resp = intel_results[dim_name]
-
-            # 获取维度描述
             dim_desc = _DIM_LABELS.get(dim_name, dim_name)
-            
+
+            if not resp.success or not resp.results:
+                # 记录跳过原因用于日志，但不传给 LLM
+                reason = self._format_search_error(resp.error_message) if resp.error_message else "无结果"
+                skipped_dims.append(f"{dim_desc}({reason})")
+                continue
+
             lines.append(f"\n{dim_desc} (来源: {resp.provider}):")
-            if resp.success and resp.results:
-                # 增加显示条数
-                for i, r in enumerate(resp.results[:4], 1):
-                    date_str = f" [{r.published_date}]" if r.published_date else ""
-                    lines.append(f"  {i}. {r.title}{date_str}")
-                    # 如果摘要太短，可能信息量不足
-                    snippet = r.snippet[:150] if len(r.snippet) > 20 else r.snippet
-                    lines.append(f"     {snippet}...")
-            else:
-                if resp.error_message:
-                    lines.append(f"  搜索失败: {self._format_search_error(resp.error_message)}")
-                else:
-                    lines.append("  未找到相关信息")
-        
+            for i, r in enumerate(resp.results[:4], 1):
+                date_str = f" [{r.published_date}]" if r.published_date else ""
+                lines.append(f"  {i}. {r.title}{date_str}")
+                snippet = r.snippet[:150] if len(r.snippet) > 20 else r.snippet
+                lines.append(f"     {snippet}...")
+
+        if skipped_dims:
+            logger.info(
+                "[情报格式化] %s: 跳过无效维度 (%d/%d): %s",
+                stock_name,
+                len(skipped_dims),
+                sum(1 for d in display_order if d in intel_results),
+                "; ".join(skipped_dims),
+            )
+
+        # 如果所有维度都失败/无结果，返回空字符串，
+        # 让调用方走 "未搜索到该股票近期的相关新闻" 分支。
+        has_any_content = any(
+            intel_results.get(d) and intel_results[d].success and intel_results[d].results
+            for d in display_order
+            if d in intel_results
+        )
+        if not has_any_content:
+            return ""
+
         return "\n".join(lines)
     
     def batch_search(

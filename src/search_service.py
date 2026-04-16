@@ -49,6 +49,8 @@ from src.core.trading_calendar import get_market_for_stock
 
 logger = logging.getLogger(__name__)
 
+_BACKGROUND_SOURCE_EXCLUSIONS = "-site:wikipedia.org -site:wikiwand.com -site:wikidata.org"
+
 # Transient network errors (retryable)
 _SEARCH_TRANSIENT_EXCEPTIONS = (
     requests.exceptions.SSLError,
@@ -3477,7 +3479,10 @@ class SearchService:
                     'name': 'industry',
                     'query': (
                         f"{stock_name} {stock_code} index sector allocation holdings"
-                        if is_index_etf else f"{stock_name} industry competitors market share outlook"
+                        if is_index_etf else (
+                            f"{stock_name} industry competitors market share outlook "
+                            f"{_BACKGROUND_SOURCE_EXCLUSIONS}"
+                        )
                     ),
                     'desc': '行业分析',
                     'tavily_topic': None,
@@ -3528,7 +3533,10 @@ class SearchService:
                     'name': 'industry',
                     'query': (
                         f"{stock_name} 指数成分股 行业配置 权重"
-                        if is_index_etf else f"{stock_name} 所在行业 竞争对手 市场份额 行业前景"
+                        if is_index_etf else (
+                            f"{stock_name} 所在行业 竞争对手 市场份额 行业前景 "
+                            f"{_BACKGROUND_SOURCE_EXCLUSIONS}"
+                        )
                     ),
                     'desc': '行业分析',
                     'tavily_topic': None,
@@ -3657,6 +3665,15 @@ class SearchService:
             格式化的情报报告文本
         """
         lines = [f"【{stock_name} 情报搜索结果】"]
+        if (
+            intel_results.get("industry")
+            and intel_results["industry"].success
+            and intel_results["industry"].results
+        ):
+            lines.append(
+                "注：`行业分析` 维度可能包含百科、公司介绍或历史财务等背景资料，只能作背景参考，"
+                "不能直接当作近7日新闻、最新催化或当前业绩展望。"
+            )
         
         # 维度展示顺序
         display_order = [
@@ -3688,7 +3705,7 @@ class SearchService:
             'earnings': '📊 业绩预期',
             'social_sentiment': '💬 社交舆情',
             'macro_flows': '🌐 宏观资金',
-            'industry': '🏭 行业分析',
+            'industry': '🏭 行业分析（背景资料）',
         }
 
         # 只输出有实际结果的维度，跳过搜索失败/无结果的维度，

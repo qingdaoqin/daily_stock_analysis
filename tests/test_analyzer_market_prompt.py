@@ -187,6 +187,32 @@ class TestAnalyzerMarketPrompt(unittest.TestCase):
         self.assertNotIn("630.9080024414063", prompt)
         self.assertNotIn("625.9640568168747", prompt)
 
+    def test_prompt_distinguishes_recent_news_from_background_intel(self) -> None:
+        analyzer = self._make_analyzer()
+        context = {
+            "code": "AVGO",
+            "stock_name": "Broadcom Inc.",
+            "date": "2026-04-16",
+            "today": {"close": 396.72, "ma5": 385.10, "ma10": 359.40, "ma20": 335.46},
+            "market_context": {
+                "market": "us",
+                "market_label": "美股",
+                "official_source_priority": "SEC 披露、财报电话会、公司指引",
+                "analysis_focus": "先看 SEC/财报/指引，再判断政策变量。",
+                "policy_scope": "中国政策只有在存在 China exposure 时才提高权重。",
+            },
+        }
+        news_context = """【Broadcom Inc. 情报搜索结果】
+注：`行业分析` 维度可能包含百科、公司介绍或历史财务等背景资料，只能作背景参考，不能直接当作近7日新闻、最新催化或当前业绩展望。
+"""
+
+        prompt = analyzer._format_prompt(context, "Broadcom Inc.", news_context=news_context)
+
+        self.assertIn("近7日检索到的情报", prompt)
+        self.assertIn("请严格区分“近期事件”和“背景资料”", prompt)
+        self.assertIn("不得写成“最新消息”", prompt)
+        self.assertIn("旧财年数据只能作背景参考", prompt)
+
     def test_analyze_logs_the_actual_model_used_after_fallback(self) -> None:
         analyzer = self._make_analyzer()
         analyzer._litellm_available = True

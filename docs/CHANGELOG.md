@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 个股分析 Prompt 中今日行情、MA5/MA10/MA20 与历史 K 线价格统一保留 2 位小数，减少原始浮点噪声对报告与模型输出的干扰。
 - [修复] 情报搜索全维度失败（如“余额不足”、“HTTP 403”）时不再将错误信息传给 LLM 分析 Prompt，避免浪费 token 并误导模型；所有维度均失败时改为走“无新闻”分支，仅基于技术面分析。
 - [修复] 情报报告在搜索失败时保留精简错误原因；xAI X Search 等直连维度失败不再一律伪装成“未找到相关信息”。
+- [修复] `industry` 维度默认排除 Wikipedia/Wikidata 等背景站点，并在 Prompt 中显式区分“近期事件”和“背景资料”，避免把旧财年百科内容误写成近7日新闻或当前业绩展望。
 - [修复] YFinance 股票名称解析优先使用完整 `longName`，避免美股/港股长公司名被截断后继续污染后续搜索与报告。
 - [修复] `strategy` 模式在所有策略子 Agent 失败时改为显式报错，不再静默跳过策略评估后继续输出看似正常的最终结论。
 - [修复] `AGENT_MAX_STEPS` 在 orchestrator 多 Agent 模式下改为作为各子 Agent 的步数上限而非硬覆盖；TechnicalAgent 等高默认值 Agent 会被封顶，低默认值 Agent 保持原值，减少不必要的 LLM 调用膨胀与配额消耗。

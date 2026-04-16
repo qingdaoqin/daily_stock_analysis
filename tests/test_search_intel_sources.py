@@ -87,6 +87,20 @@ class TestSearchIntelSources(unittest.TestCase):
         self.assertIn("market_analysis", results)
         self.assertIn("industry", results)
 
+    def test_us_industry_query_excludes_wikipedia_background_sources(self) -> None:
+        service, mock_search = self._create_service()
+
+        with patch.object(service, "_direct_sec_filings", return_value=SearchResponse(query="sec", results=[], provider="SEC", success=False, error_message="fallback")), \
+                patch.object(service, "_direct_us_china_exposure", return_value=SearchResponse(query="china", results=[], provider="SEC", success=False, error_message="fallback")), \
+                patch("src.search_service.time.sleep"):
+            service.search_comprehensive_intel("AVGO", "Broadcom Inc.")
+
+        queries = [call.args[0] for call in mock_search.call_args_list]
+        industry_queries = [query for query in queries if "industry competitors market share outlook" in query]
+        self.assertTrue(industry_queries)
+        self.assertTrue(any("-site:wikipedia.org" in query for query in industry_queries))
+        self.assertTrue(any("-site:wikidata.org" in query for query in industry_queries))
+
     def test_us_intel_adds_x_signal_dimension_when_xai_configured(self) -> None:
         service = SearchService(bocha_keys=["dummy"], xai_keys=["xai-test-key"])
         mock_search = MagicMock(side_effect=lambda query, max_results=3, days=7: _fake_response(query))
@@ -185,6 +199,30 @@ class TestSearchIntelSources(unittest.TestCase):
         self.assertNotIn("未找到相关信息", report)
         # Report should not be empty since one dimension succeeded
         self.assertTrue(len(report) > 0)
+
+    def test_format_intel_report_marks_industry_as_background_reference(self) -> None:
+        service, _ = self._create_service()
+        intel_results = {
+            "industry": SearchResponse(
+                query="Broadcom industry",
+                results=[
+                    SearchResult(
+                        title="Broadcom - Wikipedia",
+                        snippet="For the fiscal year 2023, Broadcom revenue increased 7.8%.",
+                        url="https://en.wikipedia.org/wiki/Broadcom",
+                        source="wikipedia.org",
+                        published_date="2026-04-13",
+                    )
+                ],
+                provider="Brave",
+                success=True,
+            )
+        }
+
+        report = service.format_intel_report(intel_results, "Broadcom Inc.")
+
+        self.assertIn("行业分析（背景资料）", report)
+        self.assertIn("只能作背景参考", report)
 
 
     def test_us_intel_skips_x_signal_dimension_without_xai_configuration(self) -> None:

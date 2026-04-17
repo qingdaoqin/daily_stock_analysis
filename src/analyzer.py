@@ -32,6 +32,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 from src.agent.llm_adapter import get_thinking_extra_body
 from src.config import Config, get_config, get_api_keys_for_model, extra_litellm_params, get_configured_llm_models
+from src.core.llm_rate_limiter import get_llm_rate_limiter, get_rate_limit_bucket
 from src.core.trading_calendar import get_market_for_stock
 from src.storage import persist_llm_usage
 from src.data.stock_mapping import STOCK_NAME_MAP
@@ -1314,6 +1315,10 @@ class GeminiAnalyzer:
     ) -> Any:
         """Dispatch a LiteLLM completion through router or direct fallback."""
         effective_kwargs = dict(call_kwargs)
+        get_llm_rate_limiter().acquire(
+            bucket=get_rate_limit_bucket(model),
+            min_interval_seconds=getattr(config, "llm_min_interval", 0.0),
+        )
         if use_channel_router and self._router and model in router_model_names:
             return self._router.completion(**effective_kwargs)
         if self._router and model == config.litellm_model and not use_channel_router:

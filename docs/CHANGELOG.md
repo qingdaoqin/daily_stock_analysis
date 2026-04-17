@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 集成 Anspire Search 作为最高优先级搜索引擎 — `search_service.py` 新增 `AnspireSearchProvider`，`Config` 新增 `anspire_api_keys` 字段（读取 `ANSPIRE_API_KEYS`），未配置时不影响现有搜索链路
 - [新功能] **Web 股票自动补全索引** — 新增 `stocks.index.json` 离线索引支持与 `StockAutocomplete` 组件：补全 `types/stockIndex.ts`、`utils/searchStocks.ts`、`utils/stockIndexLoader.ts`、`utils/normalizeQuery.ts`、`utils/reportLanguage.ts`、`hooks/useStockIndex.ts`、`hooks/useAutocomplete.ts`、`hooks/useDashboardLifecycle.ts`、`hooks/useHomeDashboardState.ts`、`components/StockAutocomplete/`、`components/dashboard/DashboardStateBlock.tsx`、`components/dashboard/DashboardPanelHeader.tsx` 等 17 个前端模块；新增 `scripts/generate_index_from_csv.py`（CSV → 压缩索引）和 `scripts/fetch_tushare_stock_list.py`（Tushare 股票列表获取）
 - [修复] `utils/validation.ts` 补全 `isObviouslyInvalidStockQuery` 与 `looksLikeStockCode` 两个缺失的导出函数，修复 `stockPoolStore.ts` 编译报错
+- [修复] LLM 请求节奏控制补齐统一限流层：新增 `LLM_MIN_INTERVAL` 配置与线程安全的全局 LLM rate limiter，并接入传统分析链与 Agent 链的真实 LiteLLM 请求出口。
+- [修复] `StockAnalysisPipeline.run()` 中的 `ANALYSIS_DELAY` 改为作用于任务提交阶段，批量分析不再一次性将所有股票任务瞬时提交到线程池。
+- [改进] 统一传统链与 Agent 链的 provider bucket 解析逻辑，并将 batch 提交延迟优化为 `max(ANALYSIS_DELAY - LLM_MIN_INTERVAL, 0)`，减少双重等待导致的吞吐下降。
 
 ## [3.11.0] - 2026-03-27
 ## [3.12.0] - 2026-04-01

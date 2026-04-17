@@ -1372,6 +1372,8 @@ class StockAnalysisPipeline:
             report_type = ReportType.SIMPLE
         # Issue #128: 从配置读取分析间隔
         analysis_delay = getattr(self.config, 'analysis_delay', 0)
+        llm_min_interval = max(0.0, float(getattr(self.config, 'llm_min_interval', 0.0) or 0.0))
+        effective_submit_delay = max(0.0, float(analysis_delay or 0.0) - llm_min_interval)
 
         if single_stock_notify:
             logger.info(f"已启用单股推送模式：每分析完一只股票立即推送（报告类型: {report_type_str}）")
@@ -1382,20 +1384,26 @@ class StockAnalysisPipeline:
         # 注意：max_workers 设置较低（默认3）以避免触发反爬
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             # 提交任务
-            future_to_code = {
-                executor.submit(
+            future_to_code = {}
+            for idx, code in enumerate(stock_codes):
+                future = executor.submit(
                     self.process_single_stock,
                     code,
                     skip_analysis=dry_run,
                     single_stock_notify=False,
                     report_type=report_type,  # Issue #119: 传递报告类型
                     analysis_query_id=uuid.uuid4().hex,
-                ): code
-                for code in stock_codes
-            }
+                )
+                future_to_code[future] = code
+                if idx < len(stock_codes) - 1 and effective_submit_delay > 0:
+                    logger.debug(
+                        f"等待 {effective_submit_delay} 秒后提交下一只股票 "
+                        f"(analysis_delay={analysis_delay}, llm_min_interval={llm_min_interval})..."
+                    )
+                    time.sleep(effective_submit_delay)
             
             # 收集结果
-            for idx, future in enumerate(as_completed(future_to_code)):
+            for future in as_completed(future_to_code):
                 code = future_to_code[future]
                 try:
                     result = future.result()
@@ -1406,15 +1414,6 @@ class StockAnalysisPipeline:
                                 self._send_single_stock_notification(result, report_type)
                             except Exception as e:
                                 logger.error("[%s] 单股推送异常: %s", code, e)
-
-                    # Issue #128: 分析间隔 - 在个股分析和大盘分析之间添加延迟
-                    if idx < len(stock_codes) - 1 and analysis_delay > 0:
-                        # 注意：此 sleep 发生在“主线程收集 future 的循环”中，
-                        # 并不会阻止线程池中的任务同时发起网络请求。
-                        # 因此它对降低并发请求峰值的效果有限；真正的峰值主要由 max_workers 决定。
-                        # 该行为目前保留（按需求不改逻辑）。
-                        logger.debug(f"等待 {analysis_delay} 秒后继续下一只股票...")
-                        time.sleep(analysis_delay)
 
                 except Exception as e:
                     logger.error(f"[{code}] 任务执行失败: {e}")

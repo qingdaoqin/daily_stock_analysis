@@ -28,6 +28,7 @@ from src.config import (
     get_effective_agent_models_to_try,
     get_effective_agent_primary_model,
 )
+from src.core.llm_rate_limiter import get_llm_rate_limiter, get_rate_limit_bucket
 
 logger = logging.getLogger(__name__)
 
@@ -435,6 +436,11 @@ class LLMToolAdapter:
 
         if tools:
             call_kwargs["tools"] = tools
+
+        get_llm_rate_limiter().acquire(
+            bucket=get_rate_limit_bucket(model, default=self._get_model_provider(model)),
+            min_interval_seconds=getattr(self._config, "llm_min_interval", 0.0),
+        )
 
         # Use Router for primary model (multi-key), direct litellm for others
         use_channel_router = self._has_channel_config()
